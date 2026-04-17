@@ -81,7 +81,8 @@ export class DecisionService {
     confidence: number,
     visibility: Decision['visibility'] = 'hive',
     tier: string = 'free',
-    orgPiiStripTeam: boolean = false
+    orgPiiStripTeam: boolean = false,
+    sessionId: string | null = null
   ): Promise<Decision> {
     const id = uuid();
     const ts = now();
@@ -118,10 +119,10 @@ export class DecisionService {
 
     await this.db
       .prepare(`
-        INSERT INTO decisions (id, account_id, decision_type, context, outcome, confidence, visibility, context_compressed, context_raw, context_hive, impact_score, reuse_count, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+        INSERT INTO decisions (id, account_id, decision_type, context, outcome, confidence, visibility, context_compressed, context_raw, context_hive, impact_score, reuse_count, session_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
       `)
-      .bind(id, accountId, decisionType, contextStr, outcome, confidence, effectiveVisibility, isCompressed ? 1 : 0, contextRaw, contextHive, ts, ts)
+      .bind(id, accountId, decisionType, contextStr, outcome, confidence, effectiveVisibility, isCompressed ? 1 : 0, contextRaw, contextHive, sessionId, ts, ts)
       .run();
 
     // Tier 7: vector embedding

@@ -2039,6 +2039,8 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
     const authResult = await requireAuth(request, env);
     if (authResult instanceof Response) return authResult;
     const ctx = authResult as RequestContext;
+    // Read session ID early for auto-logger and downstream use
+    const reqSessionId = request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null;
     // Auto-log this API call as a decision (non-blocking, fire-and-forget)
     autoLogDecision({
       db: env.DB,
@@ -2046,8 +2048,8 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
       method: request.method,
       endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
-
       tier: ctx.tier,
+      sessionId: reqSessionId,
     }).catch(() => {});
 
     const body = await request.json() as Record<string, unknown>;
@@ -2127,6 +2129,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
         action,
         description: action,
         visibility,
+        session_id: reqSessionId,
       },
       ctx.account_id,
       ctx.tier,
@@ -2286,7 +2289,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
 
     // ── Feature 9: Cross-agent context (same account, other sessions) ──
     try {
-      const sessionId = request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || ctx.account_id;
+      const sessionId = reqSessionId || ctx.account_id;
       const teamRows = await env.DB.prepare(`
         SELECT context, outcome, outcome_success, created_at, decision_type, session_id
         FROM decisions
@@ -2521,7 +2524,7 @@ router.get('/v1/agent/suggestions', async (request: IRequest, env: Env) => {
     const authResult = await requireAuth(request, env);
     if (authResult instanceof Response) return authResult;
     const ctx = authResult as RequestContext;
-    autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/agent/suggestions', statusCode: 200, tier: ctx.tier }).catch(() => {});
+    autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/agent/suggestions', statusCode: 200, tier: ctx.tier, sessionId: request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null }).catch(() => {});
 
     const rlAllowed = await checkRateLimit(env.DB, `agent_suggestions:${ctx.account_id}`, 30, 60 * 1000);
     if (!rlAllowed) return err('Rate limited', 429);
@@ -2544,6 +2547,7 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
     const authResult = await requireAuth(request, env);
     if (authResult instanceof Response) return authResult;
     const ctx = authResult as RequestContext;
+    const commitSessionId = request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null;
     // Auto-log this API call as a decision (non-blocking, fire-and-forget)
     autoLogDecision({
       db: env.DB,
@@ -2551,8 +2555,8 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
       method: request.method,
       endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
-
       tier: ctx.tier,
+      sessionId: commitSessionId,
     }).catch(() => {});
 
     const body = await request.json() as Record<string, unknown>;
@@ -2577,6 +2581,12 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
       },
       ctx.account_id
     );
+
+    // Best-effort backfill session_id if currently NULL on the committed decision
+    if (commitSessionId) {
+      env.DB.prepare('UPDATE decisions SET session_id = ? WHERE id = ? AND account_id = ? AND session_id IS NULL')
+        .bind(commitSessionId, String(body.decision_id), ctx.account_id).run().catch(() => {});
+    }
 
     // ── Feature 6: Confirm save if this decision was flagged as a potential save ──
     if (Boolean(body.success)) {
@@ -2620,11 +2630,13 @@ router.post('/v1/workflow/before', async (request: IRequest, env: Env) => {
     }
 
     const workflow = new WorkflowService(env.DB);
+    const wfSessionId = request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null;
     const result = await workflow.before(
       {
         decision_type: String(body.decision_type || ''),
         action: String(body.action || ''),
         description: String(body.description || ''),
+        session_id: wfSessionId,
       },
       ctx.account_id,
       ctx.tier
@@ -3650,7 +3662,7 @@ router.get('/v1/dashboard', async (request: IRequest, env: Env) => {
     const authResult = await requireAuth(request, env);
     if (authResult instanceof Response) return authResult;
     const ctx = authResult as RequestContext;
-    autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/dashboard', statusCode: 200, tier: ctx.tier }).catch(() => {});
+    autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/dashboard', statusCode: 200, tier: ctx.tier, sessionId: request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null }).catch(() => {});
 
     const rlAllowed = await checkRateLimit(env.DB, `dashboard:${ctx.account_id}`, 30, 60 * 1000);
     if (!rlAllowed) return err('Rate limited', 429);
@@ -3672,7 +3684,7 @@ router.post('/v1/agent/session/end', async (request: IRequest, env: Env) => {
     const authResult = await requireAuth(request, env);
     if (authResult instanceof Response) return authResult;
     const ctx = authResult as RequestContext;
-    autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/agent/session/end', statusCode: 200, tier: ctx.tier }).catch(() => {});
+    autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/agent/session/end', statusCode: 200, tier: ctx.tier, sessionId: request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null }).catch(() => {});
 
     const rlAllowed = await checkRateLimit(env.DB, `session_end:${ctx.account_id}`, 10, 60 * 1000);
     if (!rlAllowed) return err('Rate limited', 429);
@@ -3706,7 +3718,7 @@ router.post('/v1/workflows/accept-detected', async (request: IRequest, env: Env)
     const authResult = await requireAuth(request, env);
     if (authResult instanceof Response) return authResult;
     const ctx = authResult as RequestContext;
-    autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/workflows/accept-detected', statusCode: 200, tier: ctx.tier }).catch(() => {});
+    autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/workflows/accept-detected', statusCode: 200, tier: ctx.tier, sessionId: request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null }).catch(() => {});
 
     const rlAllowed = await checkRateLimit(env.DB, `workflow_accept_detected:${ctx.account_id}`, 10, 60 * 1000);
     if (!rlAllowed) return err('Rate limited', 429);
@@ -3744,7 +3756,7 @@ router.get('/v1/digest', async (request: IRequest, env: Env) => {
     const authResult = await requireAuth(request, env);
     if (authResult instanceof Response) return authResult;
     const ctx = authResult as RequestContext;
-    autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/digest', statusCode: 200, tier: ctx.tier }).catch(() => {});
+    autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/digest', statusCode: 200, tier: ctx.tier, sessionId: request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null }).catch(() => {});
 
     const rlAllowed = await checkRateLimit(env.DB, `digest:${ctx.account_id}`, 30, 60 * 1000);
     if (!rlAllowed) return err('Rate limited', 429);

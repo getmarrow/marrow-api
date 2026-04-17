@@ -15,6 +15,7 @@ interface AutoLogEntry {
   statusCode: number;
   body?: unknown;
   tier?: string;
+  sessionId?: string | null;
 }
 
 /**
@@ -43,8 +44,8 @@ export async function autoLogDecision(entry: AutoLogEntry): Promise<void> {
         INSERT INTO decisions (
           id, account_id, decision_type, context, outcome,
           confidence, visibility, context_compressed,
-          context_hive, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          context_hive, session_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .bind(
         id,
@@ -56,6 +57,7 @@ export async function autoLogDecision(entry: AutoLogEntry): Promise<void> {
         'hive',
         0,
         null,
+        entry.sessionId || null,
         now,
         now
       )
