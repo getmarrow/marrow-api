@@ -2294,6 +2294,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
         SELECT context, outcome, outcome_success, created_at, decision_type, session_id
         FROM decisions
         WHERE account_id = ? AND session_id IS NOT NULL AND session_id != ?
+          AND decision_type NOT LIKE 'post_%' -- Excludes auto-logger entries; extend to 'get_%','put_%','delete_%' if those start writing session_id
           AND created_at > datetime('now', '-24 hours')
         ORDER BY created_at DESC LIMIT 5
       `).bind(ctx.account_id, sessionId).all<{
