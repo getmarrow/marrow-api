@@ -34,6 +34,9 @@ import { ImpactService } from './services/impact.service';
 import { DashboardService } from './services/dashboard.service';
 import { CollectiveService } from './services/collective.service';
 import { WorkflowDetectionService } from './services/workflow-detection.service';
+import { AgentService } from './services/agent.service';
+import { TemplatesService } from './services/templates.service';
+import { FleetService } from './services/fleet.service';
 import { checkRateLimit } from './utils/rate-limit';
 import { PatternEngine } from './pattern-engine';
 import { autoLogDecision } from './middleware/auto-logger';
@@ -2868,7 +2871,7 @@ router.post('/v1/org/invite', async (request: IRequest, env: Env) => {
       return err('Only org owners and admins can invite members', 403);
     }
 
-    const member = await orgSvc.inviteMember(org.id, body.account_id, role as 'admin' | 'member');
+    const member = await orgSvc.addMember(org.id, body.account_id, role as any);
     return json(member);
   } catch (e) { return err('Internal error', 500); }
 });
@@ -3843,6 +3846,424 @@ router.get('/v1/digest', async (request: IRequest, env: Env) => {
 
 
 
+// ============= V5 Phase 1: Fleet Primitives =============
+
+// ---------- Agent Registry ----------
+
+// POST /v1/agents — register a new agent
+router.post('/v1/agents', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const rlAllowed = await checkRateLimit(env.DB, `agents_create:${ctx.account_id}`, 10, 60 * 1000);
+    if (!rlAllowed) return err('Rate limited', 429);
+
+    const body = await request.json?.() as Record<string, unknown> | undefined;
+    if (!body?.name || typeof body.name !== 'string') return err('name is required', 400);
+
+    const agentSvc = new AgentService(env.DB);
+    const agent = await agentSvc.registerAgent(ctx.account_id, {
+      name: body.name as string,
+      role: typeof body.role === 'string' ? body.role : undefined,
+      specialty: typeof body.specialty === 'string' ? body.specialty : undefined,
+      avatar_url: typeof body.avatar_url === 'string' ? body.avatar_url : undefined,
+    });
+
+    return json(agent, 201);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : 'Unknown error';
+    if (msg.includes('UNIQUE')) return err('Agent name already exists in this account', 409);
+    return err(msg, 400);
+  }
+});
+
+// GET /v1/agents — list fleet agents
+router.get('/v1/agents', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const url = getUrl(request);
+    const status = url.searchParams.get('status') || 'active';
+    const limit = parseInt(url.searchParams.get('limit') || '50') || 50;
+
+    const agentSvc = new AgentService(env.DB);
+    const agents = await agentSvc.listAgents(ctx.account_id, { status, limit });
+
+    return json({ agents });
+  } catch (e: unknown) {
+    console.error('GET /v1/agents error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
+// GET /v1/agents/:id — agent card with stats
+router.get('/v1/agents/:id', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const agentId = (request as any).params.id;
+    if (!agentId) return err('Agent ID required', 400);
+
+    const agentSvc = new AgentService(env.DB);
+    const agent = await agentSvc.getAgent(agentId, ctx.account_id);
+    if (!agent) return err('Agent not found', 404);
+
+    const stats = await agentSvc.getAgentStats(agentId, ctx.account_id);
+
+    return json({ ...agent, stats });
+  } catch (e: unknown) {
+    console.error('GET /v1/agents/:id error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
+// PATCH /v1/agents/:id — update agent metadata
+router.patch('/v1/agents/:id', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const agentId = (request as any).params.id;
+    if (!agentId) return err('Agent ID required', 400);
+
+    const body = await request.json?.() as Record<string, unknown> | undefined;
+    if (!body) return err('Request body required', 400);
+
+    const agentSvc = new AgentService(env.DB);
+    const updated = await agentSvc.updateAgent(agentId, ctx.account_id, {
+      name: typeof body.name === 'string' ? body.name : undefined,
+      role: typeof body.role === 'string' ? body.role : undefined,
+      specialty: typeof body.specialty === 'string' ? body.specialty : undefined,
+      status: typeof body.status === 'string' ? body.status : undefined,
+      avatar_url: typeof body.avatar_url === 'string' ? body.avatar_url : undefined,
+    });
+
+    if (!updated) return err('Agent not found', 404);
+    return json(updated);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : 'Unknown error';
+    return err(msg, 400);
+  }
+});
+
+// DELETE /v1/agents/:id — archive agent (soft delete)
+router.delete('/v1/agents/:id', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const agentId = (request as any).params.id;
+    if (!agentId) return err('Agent ID required', 400);
+
+    const agentSvc = new AgentService(env.DB);
+    const archived = await agentSvc.archiveAgent(agentId, ctx.account_id);
+
+    if (!archived) return err('Agent not found or already archived', 404);
+    return json({ archived: true });
+  } catch (e: unknown) {
+    console.error('DELETE /v1/agents/:id error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
+// ---------- Organization Endpoints ----------
+
+// POST /v1/orgs — create organization
+router.post('/v1/orgs', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const rlAllowed = await checkRateLimit(env.DB, `orgs_create:${ctx.account_id}`, 5, 60 * 1000);
+    if (!rlAllowed) return err('Rate limited', 429);
+
+    const body = await request.json?.() as Record<string, unknown> | undefined;
+    if (!body?.name || typeof body.name !== 'string') return err('name is required', 400);
+
+    const orgSvc = new OrgService(env.DB);
+    const org = await orgSvc.createOrg(
+      body.name as string,
+      ctx.account_id,
+      typeof body.industry === 'string' ? body.industry : undefined,
+    );
+
+    return json({ id: org.id, name: org.name, slug: org.slug }, 201);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : 'Unknown error';
+    return err(msg, 400);
+  }
+});
+
+// GET /v1/orgs/:id — org details + members
+router.get('/v1/orgs/:id', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const orgId = (request as any).params.id;
+    const orgSvc = new OrgService(env.DB);
+
+    // Verify membership
+    const isMember = await orgSvc.isOrgMember(orgId, ctx.account_id);
+    if (!isMember) return err('Not a member of this organization', 403);
+
+    const result = await orgSvc.getOrgWithMembers(orgId);
+    if (!result) return err('Organization not found', 404);
+
+    return json(result);
+  } catch (e: unknown) {
+    console.error('GET /v1/orgs/:id error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
+// POST /v1/orgs/:id/members — invite a member
+router.post('/v1/orgs/:id/members', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const orgId = (request as any).params.id;
+    const orgSvc = new OrgService(env.DB);
+
+    // Require admin+ to invite
+    const hasRole = await orgSvc.hasMinRole(orgId, ctx.account_id, 'admin');
+    if (!hasRole) return err('Admin or owner role required to invite members', 403);
+
+    const body = await request.json?.() as Record<string, unknown> | undefined;
+    if (!body?.account_id || typeof body.account_id !== 'string') return err('account_id is required', 400);
+
+    const role = (typeof body.role === 'string' ? body.role : 'viewer') as any;
+    const member = await orgSvc.addMember(orgId, body.account_id as string, role);
+
+    return json(member, 201);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : 'Unknown error';
+    return err(msg, 400);
+  }
+});
+
+// DELETE /v1/orgs/:id/members/:memberId — remove member
+router.delete('/v1/orgs/:id/members/:memberId', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const orgId = (request as any).params.id;
+    const memberId = (request as any).params.memberId;
+    const orgSvc = new OrgService(env.DB);
+
+    const hasRole = await orgSvc.hasMinRole(orgId, ctx.account_id, 'admin');
+    if (!hasRole) return err('Admin or owner role required', 403);
+
+    const removed = await orgSvc.removeMember(orgId, memberId);
+    if (!removed) return err('Member not found', 404);
+
+    return json({ removed: true });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : 'Unknown error';
+    return err(msg, 400);
+  }
+});
+
+// PATCH /v1/orgs/:id/members/:memberId — update member role
+router.patch('/v1/orgs/:id/members/:memberId', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const orgId = (request as any).params.id;
+    const memberId = (request as any).params.memberId;
+    const orgSvc = new OrgService(env.DB);
+
+    const hasRole = await orgSvc.hasMinRole(orgId, ctx.account_id, 'owner');
+    if (!hasRole) return err('Owner role required to change member roles', 403);
+
+    const body = await request.json?.() as Record<string, unknown> | undefined;
+    if (!body?.role || typeof body.role !== 'string') return err('role is required', 400);
+
+    const updated = await orgSvc.updateMemberRole(orgId, memberId, body.role as any);
+    if (!updated) return err('Member not found', 404);
+
+    return json({ updated: true });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : 'Unknown error';
+    return err(msg, 400);
+  }
+});
+
+// ---------- Workflow Template Marketplace ----------
+
+// GET /v1/templates — list templates
+router.get('/v1/templates', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+
+    const url = getUrl(request);
+    const tplSvc = new TemplatesService(env.DB);
+    const templates = await tplSvc.listTemplates({
+      industry: url.searchParams.get('industry') || undefined,
+      category: url.searchParams.get('category') || undefined,
+      search: url.searchParams.get('search') || undefined,
+      limit: parseInt(url.searchParams.get('limit') || '20') || 20,
+    });
+
+    return json({ templates });
+  } catch (e: unknown) {
+    console.error('GET /v1/templates error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
+// GET /v1/templates/:slug — template details
+router.get('/v1/templates/:slug', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+
+    const slug = (request as any).params.slug;
+    const tplSvc = new TemplatesService(env.DB);
+    const template = await tplSvc.getTemplate(slug);
+
+    if (!template) return err('Template not found', 404);
+    return json(template);
+  } catch (e: unknown) {
+    console.error('GET /v1/templates/:slug error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
+// POST /v1/templates/:slug/install — install template as workflow
+router.post('/v1/templates/:slug/install', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const rlAllowed = await checkRateLimit(env.DB, `tpl_install:${ctx.account_id}`, 10, 60 * 1000);
+    if (!rlAllowed) return err('Rate limited', 429);
+
+    const slug = (request as any).params.slug;
+    const tplSvc = new TemplatesService(env.DB);
+    const result = await tplSvc.installTemplate(slug, ctx.account_id);
+
+    return json(result, 201);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : 'Unknown error';
+    return err(msg, 400);
+  }
+});
+
+// POST /v1/templates — publish a custom template (admin/team+)
+router.post('/v1/templates', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    // M2 fix: Only non-free tiers can publish templates
+    if (ctx.tier === 'free') return err('Template publishing requires a paid plan', 403);
+
+    const rlAllowed = await checkRateLimit(env.DB, `tpl_publish:${ctx.account_id}`, 5, 60 * 1000);
+    if (!rlAllowed) return err('Rate limited', 429);
+
+    const body = await request.json?.() as Record<string, unknown> | undefined;
+    if (!body?.name || !body?.steps) return err('name and steps are required', 400);
+
+    const tplSvc = new TemplatesService(env.DB);
+    const template = await tplSvc.publishTemplate({
+      name: body.name as string,
+      description: typeof body.description === 'string' ? body.description : undefined,
+      industry: typeof body.industry === 'string' ? body.industry : undefined,
+      category: typeof body.category === 'string' ? body.category : undefined,
+      steps: body.steps as unknown[],
+      tags: Array.isArray(body.tags) ? body.tags : undefined,
+    }, ctx.account_id);
+
+    return json(template, 201);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : 'Unknown error';
+    return err(msg, 400);
+  }
+});
+
+// ---------- Fleet Dashboard ----------
+
+// GET /v1/fleet — fleet status
+router.get('/v1/fleet', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const rlAllowed = await checkRateLimit(env.DB, `fleet:${ctx.account_id}`, 60, 60 * 1000);
+    if (!rlAllowed) return err('Rate limited', 429);
+
+    const fleetSvc = new FleetService(env.DB);
+    const status = await fleetSvc.getFleetStatus(ctx.account_id);
+
+    return json(status);
+  } catch (e: unknown) {
+    console.error('GET /v1/fleet error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
+// GET /v1/fleet/stream — SSE stream of fleet events
+router.get('/v1/fleet/stream', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    // M3 fix: Rate limit SSE stream
+    const rlAllowed = await checkRateLimit(env.DB, `fleet_stream:${ctx.account_id}`, 120, 60 * 1000);
+    if (!rlAllowed) return err('Rate limited', 429);
+
+    const url = getUrl(request);
+    const since = url.searchParams.get('since') || new Date(Date.now() - 60000).toISOString();
+
+    const fleetSvc = new FleetService(env.DB);
+    const events = await fleetSvc.getFleetEvents(ctx.account_id, since);
+
+    // SSE response
+    const encoder = new TextEncoder();
+    const body = new ReadableStream({
+      start(controller) {
+        for (const event of events) {
+          controller.enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`));
+        }
+        controller.close();
+      },
+    });
+
+    return new Response(body, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      },
+    });
+  } catch (e: unknown) {
+    console.error('GET /v1/fleet/stream error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
 router.all('*', () => err('Not found', 404));
 
 // ============= Export =============
@@ -3943,5 +4364,16 @@ export default {
         ).bind(crypto.randomUUID(), new Date().toISOString(), new Date().toISOString()).run();
       }
     } catch (e) { console.error('[cron] daily jobs error:', e); }
+
+    // V5: Update agent statuses (every cron run ~30s if configured, or ~6h with current schedule)
+    try {
+      const fleetSvc = new FleetService(env.DB);
+      const allFleetAccounts = await env.DB.prepare(
+        'SELECT DISTINCT account_id FROM agents WHERE status != ? LIMIT 200'
+      ).bind('archived').all<{ account_id: string }>();
+      for (const row of allFleetAccounts.results || []) {
+        await fleetSvc.updateAgentStatuses(row.account_id);
+      }
+    } catch (e) { console.error('[fleet] agent status update error:', e); }
   },
 };
