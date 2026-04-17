@@ -27,7 +27,31 @@ export class AuthService {
       .bind(keyHash)
       .first<{ id: string; account_id: string; status: string; tier: string }>();
 
-    if (!result) return null;
+    if (!result) {
+      // Fallback: check agent-scoped keys in agents table
+      if (token.startsWith('marrow_agent_')) {
+        const agentResult = await this.db
+          .prepare(`
+            SELECT ag.id as agent_id, ag.account_id, a.tier
+            FROM agents ag
+            JOIN accounts a ON ag.account_id = a.id
+            WHERE ag.api_key_hash = ? AND ag.status = 'active'
+            LIMIT 1
+          `)
+          .bind(keyHash)
+          .first<{ agent_id: string; account_id: string; tier: string }>();
+
+        if (agentResult) {
+          return {
+            account_id: agentResult.account_id,
+            tier: agentResult.tier as RequestContext['tier'],
+            api_key_id: `agent:${agentResult.agent_id}`,
+            agent_id: agentResult.agent_id,
+          };
+        }
+      }
+      return null;
+    }
 
     // Update last_used_at (non-blocking)
     this.db
@@ -36,11 +60,16 @@ export class AuthService {
       .run()
       .catch(() => {});
 
-    return {
+    const ctx: RequestContext = {
       account_id: result.account_id,
       tier: result.tier as RequestContext['tier'],
       api_key_id: result.id,
     };
+
+    // PATH 1: Auto-derive agent_id from account-scoped key + X-Marrow-Agent-Id header
+    // (agent-scoped keys are handled in the fallback above)
+
+    return ctx;
   }
 
   async createAccount(name: string, email: string, tier: 'free' | 'pro' | 'enterprise' | 'owner' = 'free'): Promise<Account> {

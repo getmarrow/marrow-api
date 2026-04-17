@@ -2044,6 +2044,19 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
     const ctx = authResult as RequestContext;
     // Read session ID early for auto-logger and downstream use
     const reqSessionId = request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null;
+
+    // Resolve agent_id: PATH 2 header > PATH 1 auth-derived
+    let reqAgentId: string | null = ctx.agent_id || null;
+    const headerAgentId = request.headers.get('X-Marrow-Agent-Id');
+    if (headerAgentId && /^[a-f0-9-]{36}$/.test(headerAgentId)) {
+      // Validate agent belongs to this account
+      const agentCheck = await env.DB
+        .prepare("SELECT id FROM agents WHERE id = ? AND account_id = ? AND status = 'active' LIMIT 1")
+        .bind(headerAgentId, ctx.account_id)
+        .first<{ id: string }>();
+      if (agentCheck) reqAgentId = agentCheck.id;
+    }
+
     // Auto-log this API call as a decision (non-blocking, fire-and-forget)
     autoLogDecision({
       db: env.DB,
@@ -2133,11 +2146,18 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
         description: action,
         visibility,
         session_id: reqSessionId,
+        agent_id: reqAgentId,
       },
       ctx.account_id,
       ctx.tier,
       orgPiiStripTeam
     );
+
+    // Update agent last_active_at on think (non-blocking)
+    if (reqAgentId) {
+      env.DB.prepare("UPDATE agents SET last_active_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND account_id = ?")
+        .bind(reqAgentId, ctx.account_id).run().catch(() => {});
+    }
 
     // ── STEP 3: Pattern Engine — clustering, failure detection, workflow gaps ──
     const patternEngine = new PatternEngine(env.DB);
@@ -2552,6 +2572,18 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
     if (authResult instanceof Response) return authResult;
     const ctx = authResult as RequestContext;
     const commitSessionId = request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null;
+
+    // Resolve agent_id: PATH 2 header > PATH 1 auth-derived
+    let commitAgentId: string | null = ctx.agent_id || null;
+    const commitHeaderAgentId = request.headers.get('X-Marrow-Agent-Id');
+    if (commitHeaderAgentId && /^[a-f0-9-]{36}$/.test(commitHeaderAgentId)) {
+      const agentCheck = await env.DB
+        .prepare("SELECT id FROM agents WHERE id = ? AND account_id = ? AND status = 'active' LIMIT 1")
+        .bind(commitHeaderAgentId, ctx.account_id)
+        .first<{ id: string }>();
+      if (agentCheck) commitAgentId = agentCheck.id;
+    }
+
     // Auto-log this API call as a decision (non-blocking, fire-and-forget)
     autoLogDecision({
       db: env.DB,
@@ -2590,6 +2622,15 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
     if (commitSessionId) {
       env.DB.prepare('UPDATE decisions SET session_id = ? WHERE id = ? AND account_id = ? AND session_id IS NULL')
         .bind(commitSessionId, String(body.decision_id), ctx.account_id).run().catch(() => {});
+    }
+
+    // PATH 3: Backfill agent_id + update agent stats on commit
+    if (commitAgentId) {
+      env.DB.prepare('UPDATE decisions SET agent_id = ? WHERE id = ? AND account_id = ? AND agent_id IS NULL')
+        .bind(commitAgentId, String(body.decision_id), ctx.account_id).run().catch(() => {});
+      // Update agent stats: last_active_at + total_decisions
+      env.DB.prepare("UPDATE agents SET last_active_at = datetime('now'), total_decisions = total_decisions + 1, updated_at = datetime('now') WHERE id = ? AND account_id = ?")
+        .bind(commitAgentId, ctx.account_id).run().catch(() => {});
     }
 
     // ── Feature 6: Confirm save if this decision was flagged as a potential save ──

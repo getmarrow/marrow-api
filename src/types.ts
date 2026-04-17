@@ -62,6 +62,7 @@ export interface RequestContext {
   account_id: string;
   tier: 'free' | 'pro' | 'enterprise' | 'owner';
   api_key_id: string;
+  agent_id?: string; // Set when auth token is an agent-scoped key (marrow_agent_*)
 }
 
 // ============= Decisions (Tiers 2-3) =============

@@ -30,6 +30,7 @@ export interface WorkflowBeforeInput {
   description: string;
   visibility?: 'private' | 'shared' | 'hive' | 'team';
   session_id?: string | null;
+  agent_id?: string | null;
 }
 
 export interface WorkflowBeforeOutput {
@@ -108,7 +109,8 @@ export class WorkflowService {
         input.visibility || 'hive',
         tier,
         orgPiiStripTeam,
-        input.session_id || null
+        input.session_id || null,
+        input.agent_id || null
       );
       const decision_id = decision.id;
 

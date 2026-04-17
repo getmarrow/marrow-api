@@ -352,9 +352,9 @@ export class FleetService {
    */
   async updateAgentStatuses(accountId: string): Promise<void> {
     const now5m = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-    const now1h = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const now30m = new Date(Date.now() - 30 * 60 * 1000).toISOString();
 
-    // Mark active agents
+    // Mark active agents (<5min since last activity)
     await this.db
       .prepare(
         `UPDATE agents SET status = 'active', updated_at = datetime('now')
@@ -363,15 +363,24 @@ export class FleetService {
       .bind(accountId, now5m)
       .run();
 
-    // Mark inactive agents (active within last hour but not last 5min)
+    // Mark idle agents (5-30min since last activity)
     await this.db
       .prepare(
         `UPDATE agents SET status = 'inactive', updated_at = datetime('now')
          WHERE account_id = ? AND status != 'archived'
-         AND (last_active_at < ? OR last_active_at IS NULL)
-         AND (last_active_at >= ? OR last_active_at IS NULL)`
+         AND last_active_at < ? AND last_active_at >= ?`
       )
-      .bind(accountId, now5m, now1h)
+      .bind(accountId, now5m, now30m)
+      .run();
+
+    // Mark stalled agents (>30min since last activity or never active)
+    await this.db
+      .prepare(
+        `UPDATE agents SET status = 'inactive', updated_at = datetime('now')
+         WHERE account_id = ? AND status != 'archived'
+         AND (last_active_at < ? OR last_active_at IS NULL)`
+      )
+      .bind(accountId, now30m)
       .run();
   }
 }
