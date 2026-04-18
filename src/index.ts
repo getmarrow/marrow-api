@@ -2051,7 +2051,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
     if (headerAgentId && /^[a-f0-9-]{36}$/.test(headerAgentId)) {
       // Validate agent belongs to this account
       const agentCheck = await env.DB
-        .prepare("SELECT id FROM agents WHERE id = ? AND account_id = ? AND status = 'active' LIMIT 1")
+        .prepare("SELECT id FROM agents WHERE id = ? AND account_id = ? AND status != 'archived' LIMIT 1")
         .bind(headerAgentId, ctx.account_id)
         .first<{ id: string }>();
       if (agentCheck) reqAgentId = agentCheck.id;
@@ -2578,7 +2578,7 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
     const commitHeaderAgentId = request.headers.get('X-Marrow-Agent-Id');
     if (commitHeaderAgentId && /^[a-f0-9-]{36}$/.test(commitHeaderAgentId)) {
       const agentCheck = await env.DB
-        .prepare("SELECT id FROM agents WHERE id = ? AND account_id = ? AND status = 'active' LIMIT 1")
+        .prepare("SELECT id FROM agents WHERE id = ? AND account_id = ? AND status != 'archived' LIMIT 1")
         .bind(commitHeaderAgentId, ctx.account_id)
         .first<{ id: string }>();
       if (agentCheck) commitAgentId = agentCheck.id;
@@ -3820,14 +3820,14 @@ router.get('/v1/digest', async (request: IRequest, env: Env) => {
                SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) as successful,
                SUM(CASE WHEN outcome_success = 0 THEN 1 ELSE 0 END) as failed
         FROM decisions
-        WHERE account_id = ? AND created_at > datetime('now', ?) AND outcome_recorded_at IS NOT NULL
+        WHERE account_id = ? AND created_at > datetime('now', ?) AND outcome_recorded_at IS NOT NULL AND outcome_success IS NOT NULL
       `).bind(ctx.account_id, `-${days} days`).first<{ total: number; successful: number; failed: number }>(),
       env.DB.prepare(`
         SELECT COUNT(*) as total,
                SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) as successful,
                SUM(CASE WHEN outcome_success = 0 THEN 1 ELSE 0 END) as failed
         FROM decisions
-        WHERE account_id = ? AND created_at > datetime('now', ?) AND created_at <= datetime('now', ?) AND outcome_recorded_at IS NOT NULL
+        WHERE account_id = ? AND created_at > datetime('now', ?) AND created_at <= datetime('now', ?) AND outcome_recorded_at IS NOT NULL AND outcome_success IS NOT NULL
       `).bind(ctx.account_id, `-${days * 2} days`, `-${days} days`).first<{ total: number; successful: number; failed: number }>(),
       dashboard.getDashboard(ctx.account_id),
       impact.getSavesCount(ctx.account_id),
