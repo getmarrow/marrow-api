@@ -35,7 +35,7 @@ export class AuthService {
             SELECT ag.id as agent_id, ag.account_id, a.tier
             FROM agents ag
             JOIN accounts a ON ag.account_id = a.id
-            WHERE ag.api_key_hash = ? AND ag.status = 'active'
+            WHERE ag.api_key_hash = ? AND ag.status != 'archived'
             LIMIT 1
           `)
           .bind(keyHash)

@@ -1,4 +1,5 @@
 import { VelocityService } from './velocity.service';
+import { BaselineService } from './baseline.service';
 
 /**
  * Feature 1: Operator Dashboard API
@@ -14,6 +15,7 @@ export class DashboardService {
    */
   async getDashboard(accountId: string): Promise<Record<string, unknown>> {
     const velocityService = new VelocityService(this.db);
+    const baselineService = new BaselineService(this.db);
     const [
       accountInfo,
       health,
@@ -24,6 +26,7 @@ export class DashboardService {
       attemptsPerSuccess,
       timeToSuccess,
       driftRate,
+      improvement,
     ] = await Promise.all([
       this.getAccountInfo(accountId),
       this.getHealth(accountId),
@@ -34,6 +37,7 @@ export class DashboardService {
       velocityService.getAttemptsPerSuccess(accountId),
       velocityService.getTimeToSuccess(accountId),
       velocityService.getDriftRate(accountId),
+      baselineService.getAccountImprovement(accountId),
     ]);
 
     return {
@@ -47,6 +51,7 @@ export class DashboardService {
         time_to_success_seconds: timeToSuccess,
         drift_rate: driftRate,
       },
+      improvement: improvement,
       recent_decisions: recentDecisions,
     };
   }

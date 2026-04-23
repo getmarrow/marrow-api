@@ -16,6 +16,7 @@ import { AnalyticsService } from './services/analytics.service';
 import { CollaborationService } from './services/collaboration.service';
 import { CausalityService } from './services/causality.service';
 import { ConsensusService } from './services/consensus.service';
+import { BaselineService } from './services/baseline.service';
 import { SnapshotService } from './services/snapshot.service';
 import { VersionService } from './services/version.service';
 import { MarketplaceService } from './services/marketplace.service';
@@ -50,6 +51,7 @@ export interface WorkflowAfterInput {
   success: boolean;
   outcome: string;
   related_decision_id?: string;
+  agent_id?: string;
 }
 
 export interface WorkflowAfterOutput {
@@ -259,6 +261,13 @@ export class WorkflowService {
         .recordOutcome(input.decision_id, account_id, input.success, input.outcome)
         .then(() => true)
         .catch(() => false);
+
+      // V6.5: Capture baseline snapshot (fire-and-forget, idempotent)
+      const baseline = new BaselineService(this.db);
+      baseline.captureAccountBaselineIfEligible(account_id).catch(() => {});
+      if (input.agent_id) {
+        baseline.captureAgentBaselineIfEligible(account_id, input.agent_id).catch(() => {});
+      }
 
       // T12: Self-vote for consensus
       const voteResult = await services.consensus

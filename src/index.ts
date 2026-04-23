@@ -38,6 +38,8 @@ import { AgentService } from './services/agent.service';
 import { TemplatesService } from './services/templates.service';
 import { FleetService } from './services/fleet.service';
 import type { VelocityMetric } from './services/velocity.service';
+import type { ImprovementResult } from './services/baseline.service';
+import { BaselineService } from './services/baseline.service';
 import { checkRateLimit } from './utils/rate-limit';
 import { PatternEngine } from './pattern-engine';
 import { autoLogDecision } from './middleware/auto-logger';
@@ -2105,6 +2107,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
             success: previousSuccess,
             outcome: previousOutcome,
             related_decision_id: previousCausedBy ?? undefined,
+            agent_id: reqAgentId ?? undefined,
           },
           ctx.account_id
         );
@@ -2615,6 +2618,7 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
         success: Boolean(body.success),
         outcome: String(body.outcome),
         related_decision_id: body.caused_by ? String(body.caused_by) : undefined,
+        agent_id: commitAgentId ?? undefined,
       },
       ctx.account_id
     );
@@ -2718,12 +2722,14 @@ router.post('/v1/workflow/after', async (request: IRequest, env: Env) => {
     }
 
     const workflow = new WorkflowService(env.DB);
+    const workflowAfterAgentId = request.headers.get('X-Marrow-Agent-Id');
     const result = await workflow.after(
       {
         decision_id: String(body.decision_id || ''),
         success: Boolean(body.success),
         outcome: String(body.outcome || ''),
         related_decision_id: body.related_decision_id ? String(body.related_decision_id) : undefined,
+        agent_id: workflowAfterAgentId || undefined,
       },
       ctx.account_id
     );
@@ -3813,9 +3819,10 @@ router.get('/v1/digest', async (request: IRequest, env: Env) => {
 
     const dashboard = new DashboardService(env.DB);
     const impact = new ImpactService(env.DB);
+    const baseline = new BaselineService(env.DB);
 
     // P4 fix: Query decisions directly instead of relying on daily_stats (which may be empty)
-    const [currentPeriod, previousPeriod, dashboardData, savesCount] = await Promise.all([
+    const [currentPeriod, previousPeriod, dashboardData, savesCount, improvementData] = await Promise.all([
       env.DB.prepare(`
         SELECT COUNT(*) as total,
                SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) as successful,
@@ -3832,6 +3839,7 @@ router.get('/v1/digest', async (request: IRequest, env: Env) => {
       `).bind(ctx.account_id, `-${days * 2} days`, `-${days} days`).first<{ total: number; successful: number; failed: number }>(),
       dashboard.getDashboard(ctx.account_id),
       impact.getSavesCount(ctx.account_id),
+      baseline.getAccountImprovement(ctx.account_id),
     ]);
 
     const totalDecisions = currentPeriod?.total || 0;
@@ -3863,7 +3871,20 @@ router.get('/v1/digest', async (request: IRequest, env: Env) => {
       drift_rate: { current: 0, previous: 0, delta_pct: 0, direction: 'stable' as const },
     };
 
-    const summary = `${totalDecisions} decisions this period, ${Math.round(currentRate * 100)}% success rate (${direction}). ${savesCount.thisWeek} failures prevented by pattern matching. Agents completed tasks in ${velocity.time_to_success_seconds.current}s median (${velocity.time_to_success_seconds.direction} vs prior), with ${velocity.attempts_per_success.current} attempts per success on average.`;
+    const improvement = (improvementData as ImprovementResult) || {
+      status: 'onboarding' as const,
+      days_elapsed: 0,
+      decisions_elapsed: 0,
+      days_until_time_trigger: 7,
+      decisions_until_volume_trigger: 20,
+      reason: 'Baseline captures on day 7 or after 20 decisions, whichever comes first.',
+    };
+
+    const improvementSentence = improvement.status === 'active'
+      ? `Since onboarding ${improvement.days_since_baseline} days ago, your agents are ${Math.abs(improvement.time_to_success_seconds.delta_pct)}% faster and make ${Math.abs(improvement.attempts_per_success.delta_pct)}% ${improvement.attempts_per_success.delta_pct >= 0 ? 'more' : 'fewer'} attempts per success. That's ${improvement.decisions_since_baseline} decisions of compounding.`
+      : `Currently onboarding — baseline snapshot takes at day 7 or 20 decisions (whichever first). ${improvement.days_until_time_trigger} days / ${improvement.decisions_until_volume_trigger} decisions to go.`;
+
+    const summary = `${totalDecisions} decisions this period, ${Math.round(currentRate * 100)}% success rate (${direction}). ${savesCount.thisWeek} failures prevented by pattern matching. Agents completed tasks in ${velocity.time_to_success_seconds.current}s median (${velocity.time_to_success_seconds.direction} vs prior), with ${velocity.attempts_per_success.current} attempts per success on average. ${improvementSentence}`;
 
     return json({
       period: `${startDate} to ${endDate}`,
@@ -3888,6 +3909,7 @@ router.get('/v1/digest', async (request: IRequest, env: Env) => {
       top_risks: topRisks,
       workflows_completed: wfStatus.completed_this_week,
       workflows_stalled: wfStatus.stalled,
+      improvement,
     });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : 'Unknown error';
