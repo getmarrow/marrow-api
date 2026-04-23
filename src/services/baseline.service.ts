@@ -10,6 +10,7 @@
  */
 
 import type { D1Database } from '@cloudflare/workers-types';
+import { VelocityService } from './velocity.service';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -125,7 +126,8 @@ export class BaselineService {
 
     const capturedAt = new Date().toISOString();
     const daysInWindow = Math.min(daysElapsed, 7);
-    const metrics = await this.computeBaselineMetrics(accountId, firstAt, capturedAt);
+    const baselineEndTs = this.baselineWindowEnd(firstAt);
+    const metrics = await this.computeBaselineMetrics(accountId, firstAt, baselineEndTs);
 
     await this.db
       .prepare(`
@@ -167,7 +169,7 @@ export class BaselineService {
 
     const firstRow = await this.db
       .prepare(
-        'SELECT MIN(created_at) AS first_at FROM decisions WHERE account_id = ? AND session_id = ? LIMIT 1'
+        'SELECT MIN(created_at) AS first_at FROM decisions WHERE account_id = ? AND COALESCE(agent_id, session_id) = ? LIMIT 1'
       )
       .bind(accountId, agentId)
       .first<{ first_at: string | null }>();
@@ -178,7 +180,7 @@ export class BaselineService {
     const countRow = await this.db
       .prepare(`
         SELECT COUNT(*) AS c FROM decisions
-        WHERE account_id = ? AND session_id = ?
+        WHERE account_id = ? AND COALESCE(agent_id, session_id) = ?
           AND created_at >= ?
           AND created_at <= datetime(?, '+7 days')
       `)
@@ -200,7 +202,8 @@ export class BaselineService {
 
     const capturedAt = new Date().toISOString();
     const daysInWindow = Math.min(daysElapsed, 7);
-    const metrics = await this.computeBaselineMetrics(accountId, firstAt, capturedAt, agentId);
+    const baselineEndTs = this.baselineWindowEnd(firstAt);
+    const metrics = await this.computeBaselineMetrics(accountId, firstAt, baselineEndTs, agentId);
 
     await this.db
       .prepare(`
@@ -208,7 +211,7 @@ export class BaselineService {
           (id, account_id, agent_id, captured_at, first_decision_at, days_in_window,
            decisions_in_window, attempts_per_success, time_to_success_seconds,
            drift_rate, success_rate, trigger_reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .bind(
         crypto.randomUUID(),
@@ -250,9 +253,12 @@ export class BaselineService {
       return this.buildOnboardingBlock(accountId);
     }
 
-    const capturedAt = new Date(baseline.captured_at);
-    const daysSinceBaseline = this.daysBetween(capturedAt, new Date());
-    const now = new Date();
+    // days_since_baseline = days since the baseline WINDOW ended, not since the row was inserted.
+    const windowEnd = new Date(
+      new Date(baseline.first_decision_at).getTime() +
+        baseline.days_in_window * 86400000
+    );
+    const daysSinceBaseline = Math.max(0, this.daysBetween(windowEnd, new Date()));
 
     // Decisions since baseline: total - decisions_in_window
     const totalDecisions = await this.db
@@ -261,12 +267,14 @@ export class BaselineService {
       .first<{ c: number }>();
     const decisionsSinceBaseline = Math.max(0, (totalDecisions?.c || 0) - baseline.decisions_in_window);
 
-    // Current rolling 7-day metrics (reuse VelocityService)
-    const current = await this.computeBaselineMetrics(
-      accountId,
-      new Date(Date.now() - 7 * 86400000).toISOString(),
-      now.toISOString()
-    );
+    // Current values come from VelocityService so they match the dashboard's velocity block exactly.
+    const velocity = new VelocityService(this.db);
+    const [aps, tts, drift, currentSuccessRate] = await Promise.all([
+      velocity.getAttemptsPerSuccess(accountId, 7),
+      velocity.getTimeToSuccess(accountId, 7),
+      velocity.getDriftRate(accountId, 7),
+      this.queryCurrentSuccessRate(accountId),
+    ]);
 
     return {
       status: 'active',
@@ -274,26 +282,10 @@ export class BaselineService {
       decisions_since_baseline: decisionsSinceBaseline,
       baseline_captured_at: baseline.captured_at,
       trigger_reason: baseline.trigger_reason,
-      attempts_per_success: buildMetricDelta(
-        baseline.attempts_per_success,
-        current.attempts_per_success,
-        true
-      ),
-      time_to_success_seconds: buildMetricDelta(
-        baseline.time_to_success_seconds,
-        current.time_to_success_seconds,
-        true
-      ),
-      drift_rate: buildMetricDelta(
-        baseline.drift_rate,
-        current.drift_rate,
-        true
-      ),
-      success_rate: buildMetricDelta(
-        baseline.success_rate,
-        current.success_rate,
-        false
-      ),
+      attempts_per_success: buildMetricDelta(baseline.attempts_per_success, aps.current, true),
+      time_to_success_seconds: buildMetricDelta(baseline.time_to_success_seconds, tts.current, true),
+      drift_rate: buildMetricDelta(baseline.drift_rate, drift.current, true),
+      success_rate: buildMetricDelta(baseline.success_rate, currentSuccessRate, false),
     };
   }
 
@@ -312,6 +304,7 @@ export class BaselineService {
         id: string;
         captured_at: string;
         first_decision_at: string;
+        days_in_window: number;
         decisions_in_window: number;
         attempts_per_success: number;
         time_to_success_seconds: number;
@@ -324,15 +317,15 @@ export class BaselineService {
       return this.buildOnboardingBlock(accountId, agentId);
     }
 
-    const daysSinceBaseline = this.daysBetween(
-      new Date(baseline.captured_at),
-      new Date()
+    const windowEnd = new Date(
+      new Date(baseline.first_decision_at).getTime() +
+        baseline.days_in_window * 86400000
     );
-    const now = new Date();
+    const daysSinceBaseline = Math.max(0, this.daysBetween(windowEnd, new Date()));
 
     const totalDecisions = await this.db
       .prepare(
-        'SELECT COUNT(*) AS c FROM decisions WHERE account_id = ? AND session_id = ?'
+        'SELECT COUNT(*) AS c FROM decisions WHERE account_id = ? AND COALESCE(agent_id, session_id) = ?'
       )
       .bind(accountId, agentId)
       .first<{ c: number }>();
@@ -341,12 +334,13 @@ export class BaselineService {
       (totalDecisions?.c || 0) - baseline.decisions_in_window
     );
 
-    const current = await this.computeBaselineMetrics(
-      accountId,
-      new Date(Date.now() - 7 * 86400000).toISOString(),
-      now.toISOString(),
-      agentId
-    );
+    const velocity = new VelocityService(this.db);
+    const [aps, tts, drift, currentSuccessRate] = await Promise.all([
+      velocity.getAttemptsPerSuccess(accountId, 7, agentId),
+      velocity.getTimeToSuccess(accountId, 7, agentId),
+      velocity.getDriftRate(accountId, 7, agentId),
+      this.queryCurrentSuccessRate(accountId, agentId),
+    ]);
 
     return {
       status: 'active',
@@ -356,22 +350,22 @@ export class BaselineService {
       trigger_reason: baseline.trigger_reason,
       attempts_per_success: buildMetricDelta(
         baseline.attempts_per_success,
-        current.attempts_per_success,
+        aps.current,
         true
       ),
       time_to_success_seconds: buildMetricDelta(
         baseline.time_to_success_seconds,
-        current.time_to_success_seconds,
+        tts.current,
         true
       ),
       drift_rate: buildMetricDelta(
         baseline.drift_rate,
-        current.drift_rate,
+        drift.current,
         true
       ),
       success_rate: buildMetricDelta(
         baseline.success_rate,
-        current.success_rate,
+        currentSuccessRate,
         false
       ),
     };
@@ -396,8 +390,8 @@ export class BaselineService {
     if (firstRow?.first_at) {
       const firstAt = firstRow.first_at;
       const capturedAt = new Date().toISOString();
+      const baselineEndTs = this.baselineWindowEnd(firstAt);
 
-      // Check window size
       const countRow = await this.db
         .prepare(`
           SELECT COUNT(*) AS c FROM decisions
@@ -412,12 +406,8 @@ export class BaselineService {
       if (decisionsInWindow > 0) {
         const daysElapsed = this.daysBetween(new Date(firstAt), new Date());
         const triggerReason: 'time_7d' | 'volume_20' =
-          decisionsInWindow >= 20 || daysElapsed >= 7 ? 'time_7d' : 'volume_20';
-        const metrics = await this.computeBaselineMetrics(
-          accountId,
-          firstAt,
-          capturedAt
-        );
+          daysElapsed >= 7 ? 'time_7d' : 'volume_20';
+        const metrics = await this.computeBaselineMetrics(accountId, firstAt, baselineEndTs);
 
         try {
           await this.db
@@ -443,42 +433,52 @@ export class BaselineService {
             )
             .run();
           accountBackfilled = true;
-        } catch {
-          // UNIQUE constraint — already exists, treat as success
-          accountBackfilled = true;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (msg.includes('UNIQUE constraint')) {
+            accountBackfilled = true;  // already existed
+          } else {
+            throw e;  // real failure — don't hide it
+          }
         }
       }
     }
 
-    // Per-agent backfills
+    // Per-agent backfills (prefer agent_id; fall back to session_id for historical data)
     const agentRows = await this.db
-      .prepare(
-        'SELECT DISTINCT session_id FROM decisions WHERE account_id = ? AND session_id IS NOT NULL'
-      )
+      .prepare(`
+        SELECT DISTINCT COALESCE(agent_id, session_id) AS agent_key
+        FROM decisions
+        WHERE account_id = ?
+          AND (agent_id IS NOT NULL OR session_id IS NOT NULL)
+      `)
       .bind(accountId)
-      .all<{ session_id: string }>();
+      .all<{ agent_key: string }>();
 
     const backfilledAgents: string[] = [];
     for (const row of agentRows.results || []) {
-      const agentId = row.session_id;
+      const agentKey = row.agent_key;
+      if (!agentKey) continue;
+
       const agentFirstRow = await this.db
         .prepare(
-          'SELECT MIN(created_at) AS first_at FROM decisions WHERE account_id = ? AND session_id = ? LIMIT 1'
+          'SELECT MIN(created_at) AS first_at FROM decisions WHERE account_id = ? AND COALESCE(agent_id, session_id) = ? LIMIT 1'
         )
-        .bind(accountId, agentId)
+        .bind(accountId, agentKey)
         .first<{ first_at: string | null }>();
       if (!agentFirstRow?.first_at) continue;
 
       const firstAt = agentFirstRow.first_at;
       const capturedAt = new Date().toISOString();
+      const baselineEndTs = this.baselineWindowEnd(firstAt);
       const agentCountRow = await this.db
         .prepare(`
           SELECT COUNT(*) AS c FROM decisions
-          WHERE account_id = ? AND session_id = ?
+          WHERE account_id = ? AND COALESCE(agent_id, session_id) = ?
             AND created_at >= ?
             AND created_at <= datetime(?, '+7 days')
         `)
-        .bind(accountId, agentId, firstAt, firstAt)
+        .bind(accountId, agentKey, firstAt, firstAt)
         .first<{ c: number }>();
       const decisionsInWindow = agentCountRow?.c || 0;
 
@@ -486,13 +486,8 @@ export class BaselineService {
 
       const daysElapsed = this.daysBetween(new Date(firstAt), new Date());
       const triggerReason: 'time_7d' | 'volume_20' =
-        decisionsInWindow >= 20 || daysElapsed >= 7 ? 'time_7d' : 'volume_20';
-      const metrics = await this.computeBaselineMetrics(
-        accountId,
-        firstAt,
-        capturedAt,
-        agentId
-      );
+        daysElapsed >= 7 ? 'time_7d' : 'volume_20';
+      const metrics = await this.computeBaselineMetrics(accountId, firstAt, baselineEndTs, agentKey);
 
       try {
         await this.db
@@ -501,12 +496,12 @@ export class BaselineService {
               (id, account_id, agent_id, captured_at, first_decision_at, days_in_window,
                decisions_in_window, attempts_per_success, time_to_success_seconds,
                drift_rate, success_rate, trigger_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `)
           .bind(
             crypto.randomUUID(),
             accountId,
-            agentId,
+            agentKey,
             capturedAt,
             firstAt,
             Math.min(daysElapsed, 7),
@@ -518,10 +513,14 @@ export class BaselineService {
             triggerReason
           )
           .run();
-        backfilledAgents.push(agentId);
-      } catch {
-        // UNIQUE constraint — already exists
-        backfilledAgents.push(agentId);
+        backfilledAgents.push(agentKey);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (msg.includes('UNIQUE constraint')) {
+          backfilledAgents.push(agentKey);  // already existed
+        } else {
+          throw e;  // real failure — don't hide it
+        }
       }
     }
 
@@ -532,7 +531,7 @@ export class BaselineService {
 
   /**
    * Compute all four metrics over [fromTs, toTs].
-   * When agentId is provided, scope to that agent (session_id).
+   * When agentId is provided, scope to that agent via COALESCE(agent_id, session_id).
    */
   private async computeBaselineMetrics(
     accountId: string,
@@ -541,8 +540,9 @@ export class BaselineService {
     agentId?: string
   ): Promise<BaselineMetrics> {
     const agentFilter = agentId
-      ? ' AND session_id = ? '
+      ? ' AND COALESCE(agent_id, session_id) = ? '
       : ' ';
+    const groupKey = agentId ? 'COALESCE(agent_id, session_id)' : 'session_id';
     const agentBindings: string[] = agentId ? [agentId] : [];
 
     const baseBindings = [accountId, fromTs, toTs, ...agentBindings];
@@ -552,14 +552,14 @@ export class BaselineService {
       .prepare(`
         SELECT AVG(CAST(total AS REAL) / successes) AS avg_attempts
         FROM (
-          SELECT session_id, COUNT(*) AS total,
+          SELECT ${groupKey} AS entity_key, COUNT(*) AS total,
                  SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) AS successes
           FROM decisions
           WHERE account_id = ?
             AND created_at >= datetime(?)
             AND created_at <= datetime(?)
             ${agentFilter}
-          GROUP BY session_id
+          GROUP BY ${groupKey}
           HAVING successes > 0
         )
       `)
@@ -648,19 +648,21 @@ export class BaselineService {
     accountId: string,
     agentId?: string
   ): Promise<OnboardingBlock> {
-    const sessionFilter = agentId ? ' AND session_id = ? ' : ' ';
+    const agentFilter = agentId
+      ? ' AND COALESCE(agent_id, session_id) = ? '
+      : ' ';
     const bindings = agentId ? [accountId, agentId] : [accountId];
 
     const firstRow = await this.db
       .prepare(
-        `SELECT MIN(created_at) AS first_at FROM decisions WHERE account_id = ?${sessionFilter} LIMIT 1`
+        `SELECT MIN(created_at) AS first_at FROM decisions WHERE account_id = ?${agentFilter} LIMIT 1`
       )
       .bind(...bindings)
       .first<{ first_at: string | null }>();
 
     const totalRow = await this.db
       .prepare(
-        `SELECT COUNT(*) AS c FROM decisions WHERE account_id = ?${sessionFilter}`
+        `SELECT COUNT(*) AS c FROM decisions WHERE account_id = ?${agentFilter}`
       )
       .bind(...bindings)
       .first<{ c: number }>();
@@ -689,5 +691,48 @@ export class BaselineService {
     return Math.round(
       (to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24)
     );
+  }
+
+  /**
+   * Baseline window ends at firstAt + 7 days (or now, if earlier — for accounts
+   * that haven't been active a full week yet). Returns an ISO string to pass to
+   * computeBaselineMetrics as toTs, ensuring the baseline only reflects the
+   * first-7-days activity, not the entire account history.
+   */
+  private baselineWindowEnd(firstAt: string): string {
+    const endByTime = new Date(new Date(firstAt).getTime() + 7 * 86400000);
+    const now = new Date();
+    return (endByTime < now ? endByTime : now).toISOString();
+  }
+
+  /**
+   * Current rolling 7-day success rate using the same datetime('now', '-7 days')
+   * anchor as VelocityService, so improvement.current.success_rate matches the
+   * dashboard's velocity window exactly.
+   */
+  private async queryCurrentSuccessRate(
+    accountId: string,
+    agentId?: string
+  ): Promise<number> {
+    const agentFilter = agentId
+      ? ' AND COALESCE(agent_id, session_id) = ? '
+      : ' ';
+    const bindings = agentId ? [accountId, agentId] : [accountId];
+
+    const row = await this.db
+      .prepare(`
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) AS successes
+        FROM decisions
+        WHERE account_id = ?
+          AND outcome_recorded_at IS NOT NULL
+          AND created_at > datetime('now', '-7 days')
+          ${agentFilter}
+      `)
+      .bind(...bindings)
+      .first<{ total: number; successes: number | null }>();
+    const total = row?.total || 0;
+    const successes = row?.successes || 0;
+    return total > 0 ? successes / total : 0;
   }
 }

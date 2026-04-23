@@ -10,28 +10,40 @@ export interface VelocityMetric {
 export class VelocityService {
   constructor(private db: D1Database) {}
 
-  async getAttemptsPerSuccess(accountId: string, periodDays = 7): Promise<VelocityMetric> {
+  async getAttemptsPerSuccess(
+    accountId: string,
+    periodDays = 7,
+    agentKey?: string
+  ): Promise<VelocityMetric> {
     const [current, previous] = await Promise.all([
-      this.queryAttemptsPerSuccess(accountId, periodDays),
-      this.queryAttemptsPerSuccess(accountId, periodDays, periodDays),
+      this.queryAttemptsPerSuccess(accountId, periodDays, 0, agentKey),
+      this.queryAttemptsPerSuccess(accountId, periodDays, periodDays, agentKey),
     ]);
 
     return this.buildMetric(current, previous, true);
   }
 
-  async getTimeToSuccess(accountId: string, periodDays = 7): Promise<VelocityMetric> {
+  async getTimeToSuccess(
+    accountId: string,
+    periodDays = 7,
+    agentKey?: string
+  ): Promise<VelocityMetric> {
     const [current, previous] = await Promise.all([
-      this.queryMedianTimeToSuccess(accountId, periodDays),
-      this.queryMedianTimeToSuccess(accountId, periodDays, periodDays),
+      this.queryMedianTimeToSuccess(accountId, periodDays, 0, agentKey),
+      this.queryMedianTimeToSuccess(accountId, periodDays, periodDays, agentKey),
     ]);
 
     return this.buildMetric(current, previous, true);
   }
 
-  async getDriftRate(accountId: string, periodDays = 7): Promise<VelocityMetric> {
+  async getDriftRate(
+    accountId: string,
+    periodDays = 7,
+    agentKey?: string
+  ): Promise<VelocityMetric> {
     const [current, previous] = await Promise.all([
-      this.queryDriftRate(accountId, periodDays),
-      this.queryDriftRate(accountId, periodDays, periodDays),
+      this.queryDriftRate(accountId, periodDays, 0, agentKey),
+      this.queryDriftRate(accountId, periodDays, periodDays, agentKey),
     ]);
 
     return this.buildMetric(current, previous, true);
@@ -60,23 +72,32 @@ export class VelocityService {
     };
   }
 
-  private async queryAttemptsPerSuccess(accountId: string, periodDays: number, previousOffsetDays = 0): Promise<number> {
+  private async queryAttemptsPerSuccess(
+    accountId: string,
+    periodDays: number,
+    previousOffsetDays = 0,
+    agentKey?: string
+  ): Promise<number> {
     const bindings: (string | number)[] = [accountId, `-${periodDays + previousOffsetDays} days`];
     const endClause = previousOffsetDays > 0 ? ` AND created_at <= datetime('now', ?)` : '';
+    const agentClause = agentKey ? ' AND COALESCE(agent_id, session_id) = ?' : '';
+    const groupKey = agentKey ? 'COALESCE(agent_id, session_id)' : 'session_id';
     if (previousOffsetDays > 0) bindings.push(`-${previousOffsetDays} days`);
+    if (agentKey) bindings.push(agentKey);
 
     const row = await this.db.prepare(`
       SELECT AVG(CAST(total AS REAL) / successes) AS avg_attempts
       FROM (
         SELECT
-          session_id,
+          ${groupKey} AS entity_key,
           COUNT(*) AS total,
           SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) AS successes
         FROM decisions
         WHERE account_id = ?
           AND created_at > datetime('now', ?)
           ${endClause}
-        GROUP BY session_id
+          ${agentClause}
+        GROUP BY ${groupKey}
         HAVING successes > 0
       )
     `).bind(...bindings).first<{ avg_attempts: number | null }>();
@@ -84,10 +105,17 @@ export class VelocityService {
     return row?.avg_attempts ? Number(row.avg_attempts) : 0;
   }
 
-  private async queryMedianTimeToSuccess(accountId: string, periodDays: number, previousOffsetDays = 0): Promise<number> {
+  private async queryMedianTimeToSuccess(
+    accountId: string,
+    periodDays: number,
+    previousOffsetDays = 0,
+    agentKey?: string
+  ): Promise<number> {
     const countBindings: (string | number)[] = [accountId, `-${periodDays + previousOffsetDays} days`];
     const endClause = previousOffsetDays > 0 ? ` AND created_at <= datetime('now', ?)` : '';
+    const agentClause = agentKey ? ' AND COALESCE(agent_id, session_id) = ?' : '';
     if (previousOffsetDays > 0) countBindings.push(`-${previousOffsetDays} days`);
+    if (agentKey) countBindings.push(agentKey);
 
     const countRow = await this.db.prepare(`
       SELECT COUNT(*) AS total
@@ -98,6 +126,7 @@ export class VelocityService {
         AND created_at IS NOT NULL
         AND created_at > datetime('now', ?)
         ${endClause}
+        ${agentClause}
     `).bind(...countBindings).first<{ total: number }>();
 
     const total = countRow?.total || 0;
@@ -105,6 +134,7 @@ export class VelocityService {
 
     const medianBindings: (string | number)[] = [accountId, `-${periodDays + previousOffsetDays} days`];
     if (previousOffsetDays > 0) medianBindings.push(`-${previousOffsetDays} days`);
+    if (agentKey) medianBindings.push(agentKey);
     medianBindings.push(Math.floor(total / 2));
 
     const row = await this.db.prepare(`
@@ -116,6 +146,7 @@ export class VelocityService {
         AND created_at IS NOT NULL
         AND created_at > datetime('now', ?)
         ${endClause}
+        ${agentClause}
       ORDER BY delta_seconds
       LIMIT 1 OFFSET ?
     `).bind(...medianBindings).first<{ delta_seconds: number | null }>();
@@ -123,10 +154,17 @@ export class VelocityService {
     return row?.delta_seconds ? Number(row.delta_seconds) : 0;
   }
 
-  private async queryDriftRate(accountId: string, periodDays: number, previousOffsetDays = 0): Promise<number> {
+  private async queryDriftRate(
+    accountId: string,
+    periodDays: number,
+    previousOffsetDays = 0,
+    agentKey?: string
+  ): Promise<number> {
     const bindings: (string | number)[] = [accountId, `-${periodDays + previousOffsetDays} days`];
     const endClause = previousOffsetDays > 0 ? ` AND created_at <= datetime('now', ?)` : '';
+    const agentClause = agentKey ? ' AND COALESCE(agent_id, session_id) = ?' : '';
     if (previousOffsetDays > 0) bindings.push(`-${previousOffsetDays} days`);
+    if (agentKey) bindings.push(agentKey);
 
     const row = await this.db.prepare(`
       SELECT
@@ -136,6 +174,7 @@ export class VelocityService {
       WHERE account_id = ?
         AND created_at > datetime('now', ?)
         ${endClause}
+        ${agentClause}
     `).bind(...bindings).first<{ total: number; drift_count: number | null }>();
 
     const total = row?.total || 0;
