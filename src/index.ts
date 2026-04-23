@@ -37,6 +37,7 @@ import { WorkflowDetectionService } from './services/workflow-detection.service'
 import { AgentService } from './services/agent.service';
 import { TemplatesService } from './services/templates.service';
 import { FleetService } from './services/fleet.service';
+import type { VelocityMetric } from './services/velocity.service';
 import { checkRateLimit } from './utils/rate-limit';
 import { PatternEngine } from './pattern-engine';
 import { autoLogDecision } from './middleware/auto-logger';
@@ -3852,8 +3853,17 @@ router.get('/v1/digest', async (request: IRequest, env: Env) => {
     const topRisks = topFailureTypes.map(f => `${f.decision_type} has ${Math.round(f.failure_rate * 100)}% failure rate (${f.count} failures)`);
 
     const wfStatus = dashboardData.workflow_status as { completed_this_week: number; stalled: number };
+    const velocity = (dashboardData.velocity as {
+      attempts_per_success: VelocityMetric;
+      time_to_success_seconds: VelocityMetric;
+      drift_rate: VelocityMetric;
+    }) || {
+      attempts_per_success: { current: 0, previous: 0, delta_pct: 0, direction: 'stable' as const },
+      time_to_success_seconds: { current: 0, previous: 0, delta_pct: 0, direction: 'stable' as const },
+      drift_rate: { current: 0, previous: 0, delta_pct: 0, direction: 'stable' as const },
+    };
 
-    const summary = `${totalDecisions} decisions this period, ${Math.round(currentRate * 100)}% success rate (${direction}). ${savesCount.thisWeek} failures prevented by pattern matching.`;
+    const summary = `${totalDecisions} decisions this period, ${Math.round(currentRate * 100)}% success rate (${direction}). ${savesCount.thisWeek} failures prevented by pattern matching. Agents completed tasks in ${velocity.time_to_success_seconds.current}s median (${velocity.time_to_success_seconds.direction} vs prior), with ${velocity.attempts_per_success.current} attempts per success on average.`;
 
     return json({
       period: `${startDate} to ${endDate}`,
@@ -3873,6 +3883,7 @@ router.get('/v1/digest', async (request: IRequest, env: Env) => {
         count: savesCount.thisWeek,
         details: [],
       },
+      velocity,
       top_improvements: [],
       top_risks: topRisks,
       workflows_completed: wfStatus.completed_this_week,
@@ -3886,6 +3897,56 @@ router.get('/v1/digest', async (request: IRequest, env: Env) => {
 });
 
 
+
+// GET /v1/agent/status — quick health check for SDK quickStatus()
+router.get('/v1/agent/status', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const rlAllowed = await checkRateLimit(env.DB, `agent_status:${ctx.account_id}`, 60, 60 * 1000);
+    if (!rlAllowed) return err('Rate limited', 429);
+
+    autoLogDecision({
+      db: env.DB, accountId: ctx.account_id, method: request.method,
+      endpoint: '/v1/agent/status', statusCode: 200, tier: ctx.tier,
+      sessionId: request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null,
+    }).catch(() => {});
+
+    const row = await env.DB.prepare(`
+      SELECT COUNT(*) as total,
+             SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) as succ,
+             SUM(CASE WHEN outcome_success = 0 THEN 1 ELSE 0 END) as fail
+      FROM decisions
+      WHERE account_id = ? AND outcome_success IS NOT NULL
+    `).bind(ctx.account_id).first<{ total: number; succ: number; fail: number }>();
+
+    const total = row?.total || 0;
+    const succ = row?.succ || 0;
+    const fail = row?.fail || 0;
+    const successRate = (succ + fail) > 0 ? succ / (succ + fail) : null;
+    const health = fail > succ * 0.5 ? 'degraded' : 'healthy';
+    const message = total === 0
+      ? 'Welcome to Marrow! Log your first decision with think() to get started.'
+      : total < 10
+      ? `Getting started — ${total} decision${total === 1 ? '' : 's'} logged. Keep going for pattern detection.`
+      : `${total} decisions tracked. Success rate: ${Math.round((successRate || 0) * 100)}%.`;
+
+    return json({
+      ok: true,
+      health,
+      message,
+      has_memory: total > 0,
+      low_history: total < 10,
+      decision_count: total,
+      success_rate: successRate,
+    });
+  } catch (e: unknown) {
+    console.error('GET /v1/agent/status error:', e);
+    return err('Internal server error', 500);
+  }
+});
 
 // ============= V5 Phase 1: Fleet Primitives =============
 

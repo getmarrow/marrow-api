@@ -1,3 +1,5 @@
+import { VelocityService } from './velocity.service';
+
 /**
  * Feature 1: Operator Dashboard API
  * Single endpoint showing everything about agents' health, performance, and Marrow's impact.
@@ -11,6 +13,7 @@ export class DashboardService {
    * getDashboard: Build the full dashboard response.
    */
   async getDashboard(accountId: string): Promise<Record<string, unknown>> {
+    const velocityService = new VelocityService(this.db);
     const [
       accountInfo,
       health,
@@ -18,6 +21,9 @@ export class DashboardService {
       workflowStatus,
       recentDecisions,
       savesInfo,
+      attemptsPerSuccess,
+      timeToSuccess,
+      driftRate,
     ] = await Promise.all([
       this.getAccountInfo(accountId),
       this.getHealth(accountId),
@@ -25,6 +31,9 @@ export class DashboardService {
       this.getWorkflowStatus(accountId),
       this.getRecentDecisions(accountId),
       this.getSavesInfo(accountId),
+      velocityService.getAttemptsPerSuccess(accountId),
+      velocityService.getTimeToSuccess(accountId),
+      velocityService.getDriftRate(accountId),
     ]);
 
     return {
@@ -33,6 +42,11 @@ export class DashboardService {
       top_failures: topFailures,
       workflow_status: workflowStatus,
       impact: savesInfo,
+      velocity: {
+        attempts_per_success: attemptsPerSuccess,
+        time_to_success_seconds: timeToSuccess,
+        drift_rate: driftRate,
+      },
       recent_decisions: recentDecisions,
     };
   }
@@ -106,6 +120,7 @@ export class DashboardService {
       WHERE account_id = ?
         AND created_at > datetime('now', ?)
         AND outcome_recorded_at IS NOT NULL
+        AND outcome_success IS NOT NULL
     `).bind(accountId, `-${days} days`).first<{ total: number; success: number }>();
 
     if (!row || row.total === 0) return 0;
@@ -129,6 +144,7 @@ export class DashboardService {
       WHERE account_id = ?
         AND created_at > datetime('now', '-7 days')
         AND outcome_recorded_at IS NOT NULL
+        AND outcome_success IS NOT NULL
       GROUP BY decision_type
       HAVING failures > 0
       ORDER BY failures DESC
