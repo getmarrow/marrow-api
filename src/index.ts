@@ -131,14 +131,6 @@ async function requireInternalKey(request: IRequest, env: Env): Promise<Response
   return timingSafeSecretMatch(key, env.INTERNAL_KEY, 'internal');
 }
 
-async function requireAdminToken(request: IRequest, env: Env): Promise<Response | null> {
-  const token = request.headers.get('X-Admin-Token');
-  if (!env.MARROW_ADMIN_TOKEN || !token) {
-    return err('Unauthorized', 401);
-  }
-  return timingSafeSecretMatch(token, env.MARROW_ADMIN_TOKEN, 'admin');
-}
-
 // ---------- Email Helpers ----------
 function emailCard(title: string, body: string): string {
   return `<!DOCTYPE html>
@@ -3084,56 +3076,10 @@ router.put('/v1/admin/accounts/:accountId/tier', async (request: IRequest, env: 
   } catch (e) { return err('Internal error', 500); }
 });
 
-// ============= ADMIN: Catch-up Email Batch (temporary) =============
-
-router.post('/v1/admin/catchup-batch', async (request: IRequest, env: Env) => {
-  try {
-    const adminErr = await requireAdminToken(request, env);
-    if (adminErr) return adminErr;
-
-    const accounts = await env.DB
-      .prepare(`
-        SELECT a.id, a.email
-        FROM accounts a
-        WHERE a.created_at < ?
-          AND a.email IS NOT NULL
-          AND a.email != ''
-          AND NOT EXISTS (
-            SELECT 1 FROM emails_sent e
-            WHERE e.account_id = a.id AND e.template_name = 'catchup_v1'
-          )
-        ORDER BY a.created_at ASC
-        LIMIT 50
-      `)
-      .bind('2026-04-24T00:00:00.000Z')
-      .all<{ id: string; email: string }>();
-
-    let batched = 0;
-    let skipped = 0;
-    const emailService = new EmailService(env.DB, env);
-
-    // Do NOT mint new API keys for existing users — they already have one.
-    // The template instructs them to supply their existing key via env var.
-    for (const account of accounts.results || []) {
-      const allowed = await emailService.canSendTemplate(account.id, 'catchup_v1');
-      if (!allowed.ok) {
-        skipped++;
-        continue;
-      }
-
-      const result = await emailService.sendTemplate(account.id, account.email, 'catchup_v1', {
-        email: account.email,
-      });
-      if (result.success && !result.reason) batched++;
-      else skipped++;
-    }
-
-    return json({ batched, skipped });
-  } catch (e) {
-    console.error('POST /v1/admin/catchup-batch error:', e);
-    return err('Internal error', 500);
-  }
-});
+// Catch-up batch route removed 2026-04-24 after one-shot use (33 users batched).
+// Was a temporary admin-token-gated POST /v1/admin/catchup-batch route that
+// fired catchup_v1 template to all existing users pre-2026-04-24. Sent cleanly,
+// route is gone, MARROW_ADMIN_TOKEN secret deleted from prod worker.
 
 // ============= ADMIN: Password Auth (public — no API key needed) =============
 

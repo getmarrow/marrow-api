@@ -8,7 +8,6 @@ export interface Env {
   ADMIN_DASHBOARD_PASSWORD?: string;
   ADMIN_OWNER_KEY?: string;
   INTERNAL_KEY?: string;
-  MARROW_ADMIN_TOKEN?: string;
   RESEND_API_KEY_PRIMARY?: string;
 }
 
