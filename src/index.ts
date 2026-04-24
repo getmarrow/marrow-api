@@ -37,6 +37,7 @@ import { WorkflowDetectionService } from './services/workflow-detection.service'
 import { AgentService } from './services/agent.service';
 import { TemplatesService } from './services/templates.service';
 import { FleetService } from './services/fleet.service';
+import { NarrativeService } from './services/narrative.service';
 import type { VelocityMetric } from './services/velocity.service';
 import type { ImprovementResult } from './services/baseline.service';
 import { BaselineService } from './services/baseline.service';
@@ -2644,10 +2645,15 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
       await impact.confirmSave(ctx.account_id, String(body.decision_id), true).catch(() => {});
     }
 
+    const narrative = await new NarrativeService(env.DB)
+      .getNarrativeForCommit(ctx.account_id, commitAgentId ?? undefined)
+      .catch(() => null);
+
     return json({
       committed: true,
       success_rate: result.new_success_rate ?? 0.75,
       insight: null,
+      narrative,
     });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : 'Unknown error';
