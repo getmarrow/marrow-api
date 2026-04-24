@@ -80,24 +80,36 @@ export class EmailService {
         return { success: false, reason: 'unresolved_placeholders' };
       }
 
+      // List-Unsubscribe headers are load-bearing for bulk compliance BUT act as
+      // a bulk signal for spam filters. Catchup is positioned as a personal
+      // founder note — we omit the headers so receivers like ProtonMail don't
+      // classify it as a mailing list. The template still includes an in-body
+      // Unsubscribe link, and users can always reply to buu@getmarrow.ai.
+      // Transactional templates (welcome/day3/milestone) keep full compliance.
+      const bulkHeaders = templateName === 'catchup_v1'
+        ? undefined
+        : {
+            'List-Unsubscribe': `<mailto:buu@getmarrow.ai?subject=unsubscribe>, <${unsubscribeUrl}>`,
+            'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+          };
+
+      const resendPayload: Record<string, unknown> = {
+        from: 'Buu <buu@mail.getmarrow.ai>',
+        to: normalizedEmail,
+        subject: rendered.subject,
+        html: rendered.html,
+        text: rendered.text,
+        reply_to: 'buu@getmarrow.ai',
+      };
+      if (bulkHeaders) resendPayload.headers = bulkHeaders;
+
       const resendRes = await fetch('https://api.resend.com/emails', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${this.env.RESEND_API_KEY}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          from: 'Buu <buu@mail.getmarrow.ai>',
-          to: normalizedEmail,
-          subject: rendered.subject,
-          html: rendered.html,
-          text: rendered.text,
-          reply_to: 'buu@getmarrow.ai',
-          headers: {
-            'List-Unsubscribe': `<mailto:buu@getmarrow.ai?subject=unsubscribe>, <${unsubscribeUrl}>`,
-            'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
-          },
-        }),
+        body: JSON.stringify(resendPayload),
       });
 
       if (!resendRes.ok) {
