@@ -70,6 +70,16 @@ export class EmailService {
         unsubscribe_url: unsubscribeUrl,
       });
 
+      // Guard against shipping half-rendered templates. If any {{...}} placeholder
+      // remains after substitution, we have a missing variable — don't send.
+      const combined = `${rendered.subject}\n${rendered.preheader}\n${rendered.html}\n${rendered.text}`;
+      const unresolved = combined.match(/\{\{[a-zA-Z_][a-zA-Z_0-9]*\}\}/g);
+      if (unresolved && unresolved.length > 0) {
+        const missing = Array.from(new Set(unresolved));
+        console.error(`[email] ${templateName}: unresolved placeholders:`, missing.join(', '));
+        return { success: false, reason: 'unresolved_placeholders' };
+      }
+
       const resendRes = await fetch('https://api.resend.com/emails', {
         method: 'POST',
         headers: {

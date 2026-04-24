@@ -2688,6 +2688,14 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
         const baseline = await new BaselineService(env.DB).getAccountImprovement(ctx.account_id).catch(() => null);
         if (!baseline || baseline.status !== 'active') return;
 
+        // Only fire the milestone email if the user has actually improved.
+        // time_to_success_seconds.delta_pct is negative when faster — positive means regressed or flat.
+        const rawDelta = baseline.time_to_success_seconds.delta_pct;
+        if (rawDelta >= 0) return;
+
+        // Absolute value, rounded to 1 decimal, for the "{{improvement_pct}}% faster" copy.
+        const improvement_pct = Math.abs(Math.round(rawDelta * 10) / 10);
+
         const account = await env.DB
           .prepare('SELECT email FROM accounts WHERE id = ? LIMIT 1')
           .bind(ctx.account_id)
@@ -2697,7 +2705,7 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
         const emailService = new EmailService(env.DB, env);
         await emailService.sendTemplate(ctx.account_id, account.email, 'milestone_100', {
           email: account.email,
-          improvement_pct: baseline.time_to_success_seconds.delta_pct,
+          improvement_pct,
           decisions_count: totalCommits,
         });
       })
@@ -3102,9 +3110,10 @@ router.post('/v1/admin/catchup-batch', async (request: IRequest, env: Env) => {
 
     let batched = 0;
     let skipped = 0;
-    const authService = new AuthService(env.DB);
     const emailService = new EmailService(env.DB, env);
 
+    // Do NOT mint new API keys for existing users — they already have one.
+    // The template instructs them to supply their existing key via env var.
     for (const account of accounts.results || []) {
       const allowed = await emailService.canSendTemplate(account.id, 'catchup_v1');
       if (!allowed.ok) {
@@ -3112,9 +3121,7 @@ router.post('/v1/admin/catchup-batch', async (request: IRequest, env: Env) => {
         continue;
       }
 
-      const created = await authService.createApiKey(account.id).catch(() => null);
       const result = await emailService.sendTemplate(account.id, account.email, 'catchup_v1', {
-        api_key: created?.key || '',
         email: account.email,
       });
       if (result.success && !result.reason) batched++;
@@ -4586,12 +4593,14 @@ export default {
           if (!allowed.ok) continue;
 
           const created = await authService.createApiKey(account.id);
-          await emailService.sendTemplate(account.id, account.email, 'day3_nudge', {
+          // Fire-and-forget: never let a single send failure break the loop or
+          // bubble up to abort the cron. Matches the pattern used by welcome + milestone triggers.
+          emailService.sendTemplate(account.id, account.email, 'day3_nudge', {
             api_key: created.key,
             email: account.email,
-          });
+          }).catch((err) => console.error('[email] day3_nudge send error:', account.id, err));
         } catch (e) {
-          console.error('[email] day3_nudge error:', e);
+          console.error('[email] day3_nudge prep error:', e);
         }
       }
     } catch (e) { console.error('[email] day3_nudge cron error:', e); }
