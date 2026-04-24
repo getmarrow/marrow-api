@@ -80,13 +80,17 @@ export class EmailService {
         return { success: false, reason: 'unresolved_placeholders' };
       }
 
-      // List-Unsubscribe headers are load-bearing for bulk compliance BUT act as
-      // a bulk signal for spam filters. Catchup is positioned as a personal
-      // founder note — we omit the headers so receivers like ProtonMail don't
-      // classify it as a mailing list. The template still includes an in-body
-      // Unsubscribe link, and users can always reply to buu@getmarrow.ai.
-      // Transactional templates (welcome/day3/milestone) keep full compliance.
-      const bulkHeaders = templateName === 'catchup_v1'
+      // Catchup is positioned as a personal founder email — ships from primary
+      // domain (buu@getmarrow.ai) with no List-Unsubscribe headers so receivers
+      // don't classify it as a mailing list. In-body Unsubscribe link still present.
+      // Automated transactional templates (welcome/day3/milestone) stay on the
+      // isolated subdomain with full compliance headers so any reputation hit
+      // stays away from primary.
+      const isCatchup = templateName === 'catchup_v1';
+      const fromAddress = isCatchup
+        ? 'Buu <buu@getmarrow.ai>'
+        : 'Buu <buu@mail.getmarrow.ai>';
+      const bulkHeaders = isCatchup
         ? undefined
         : {
             'List-Unsubscribe': `<mailto:buu@getmarrow.ai?subject=unsubscribe>, <${unsubscribeUrl}>`,
@@ -94,7 +98,7 @@ export class EmailService {
           };
 
       const resendPayload: Record<string, unknown> = {
-        from: 'Buu <buu@mail.getmarrow.ai>',
+        from: fromAddress,
         to: normalizedEmail,
         subject: rendered.subject,
         html: rendered.html,
