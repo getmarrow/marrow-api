@@ -11,13 +11,13 @@ interface AccountBaselineRow {
   time_to_success_seconds: number;
 }
 
-interface DeltaRow {
-  decision_type: string;
+interface WeeklyDeltaRow {
   delta_seconds: number;
+  recorded_at_ms: number;
 }
 
 const MILESTONES = new Set([100, 500, 1000, 5000]);
-const ONE_MINUTE_MS = 60_000;
+const BASELINE_CAPTURE_WINDOW_MS = 5_000;
 const ONE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
 export class NarrativeService {
@@ -40,7 +40,7 @@ export class NarrativeService {
     await baselineService.captureAccountBaselineIfEligible(accountId).catch(() => {});
 
     const baseline = await this.getAccountBaseline(accountId);
-    if (baseline && this.wasCapturedNearCommit(baseline.captured_at, latestCommit.outcome_recorded_at)) {
+    if (baseline && this.wasCapturedByThisCommit(baseline.captured_at, latestCommit.outcome_recorded_at)) {
       return `Baseline captured. Your first-week averages: ${this.formatNumber(baseline.time_to_success_seconds)}s per task, ${this.formatNumber(baseline.attempts_per_success)} attempts per success. I'll compare future decisions against this.`;
     }
 
@@ -103,11 +103,11 @@ export class NarrativeService {
       .first<AccountBaselineRow>();
   }
 
-  private wasCapturedNearCommit(capturedAt: string, commitAt: string): boolean {
+  private wasCapturedByThisCommit(capturedAt: string, commitAt: string): boolean {
     const capturedMs = Date.parse(capturedAt);
     const commitMs = Date.parse(commitAt);
     if (Number.isNaN(capturedMs) || Number.isNaN(commitMs)) return false;
-    return Math.abs(capturedMs - commitMs) <= ONE_MINUTE_MS;
+    return capturedMs >= commitMs - BASELINE_CAPTURE_WINDOW_MS && capturedMs <= commitMs;
   }
 
   private async buildWeeklyRecap(accountId: string, commitAt: string): Promise<string | null> {
@@ -143,13 +143,9 @@ export class NarrativeService {
     const deltaPct = Number((((lastWeekMedian - priorWeekMedian) / priorWeekMedian) * 100).toFixed(2));
     if (Math.abs(deltaPct) < 5) return null;
 
-    const topCategory = this.getTopCategory(priorWeekRows, lastWeekRows, deltaPct);
-    if (!topCategory) return null;
-
     const fasterOrSlower = deltaPct <= 0 ? 'faster' : 'slower';
-    const gainOrDrift = deltaPct <= 0 ? 'gain' : 'drift';
 
-    return `Last week: ${lastWeekDecisionCount} decisions, time-to-success ${this.formatNumber(Math.abs(deltaPct))}% ${fasterOrSlower} vs prior week. Top ${gainOrDrift} category: ${topCategory}.`;
+    return `Last week: ${lastWeekDecisionCount} decisions, time-to-success ${this.formatNumber(Math.abs(deltaPct))}% ${fasterOrSlower} vs prior week.`;
   }
 
   private async countCommitsBetween(accountId: string, start: Date, end: Date): Promise<number> {
@@ -168,11 +164,10 @@ export class NarrativeService {
     return row?.c || 0;
   }
 
-  private async getSuccessfulDeltasBetween(accountId: string, start: Date, end: Date): Promise<Array<DeltaRow & { recorded_at_ms: number }>> {
+  private async getSuccessfulDeltasBetween(accountId: string, start: Date, end: Date): Promise<WeeklyDeltaRow[]> {
     const rows = await this.db
       .prepare(`
         SELECT
-          decision_type,
           CAST((julianday(outcome_recorded_at) - julianday(created_at)) * 86400 AS INTEGER) AS delta_seconds,
           outcome_recorded_at
         FROM decisions
@@ -184,61 +179,14 @@ export class NarrativeService {
           AND outcome_recorded_at < ?
       `)
       .bind(accountId, start.toISOString(), end.toISOString())
-      .all<{ decision_type: string; delta_seconds: number; outcome_recorded_at: string }>();
+      .all<{ delta_seconds: number; outcome_recorded_at: string }>();
 
     return (rows.results || [])
       .map((row) => ({
-        decision_type: String(row.decision_type || 'general'),
         delta_seconds: Number(row.delta_seconds || 0),
         recorded_at_ms: Date.parse(String(row.outcome_recorded_at)),
       }))
       .filter((row) => !Number.isNaN(row.recorded_at_ms) && row.delta_seconds > 0);
-  }
-
-  private getTopCategory(
-    priorWeekRows: Array<DeltaRow>,
-    lastWeekRows: Array<DeltaRow>,
-    overallDeltaPct: number
-  ): string | null {
-    const priorMap = this.groupByDecisionType(priorWeekRows);
-    const lastMap = this.groupByDecisionType(lastWeekRows);
-
-    const candidates: Array<{ decisionType: string; deltaPct: number }> = [];
-    for (const [decisionType, priorValues] of priorMap.entries()) {
-      const lastValues = lastMap.get(decisionType);
-      if (!lastValues?.length || !priorValues.length) continue;
-
-      const priorMedian = this.median(priorValues);
-      const lastMedian = this.median(lastValues);
-      if (priorMedian <= 0 || lastMedian <= 0) continue;
-
-      const deltaPct = Number((((lastMedian - priorMedian) / priorMedian) * 100).toFixed(2));
-      candidates.push({ decisionType, deltaPct });
-    }
-
-    if (candidates.length === 0) return null;
-
-    const directionMatched = candidates.filter((candidate) =>
-      overallDeltaPct <= 0 ? candidate.deltaPct <= 0 : candidate.deltaPct >= 0
-    );
-    const ranked = directionMatched.length > 0 ? directionMatched : candidates;
-
-    ranked.sort((a, b) => {
-      if (overallDeltaPct <= 0) return a.deltaPct - b.deltaPct;
-      return b.deltaPct - a.deltaPct;
-    });
-
-    return ranked[0]?.decisionType || null;
-  }
-
-  private groupByDecisionType(rows: Array<DeltaRow>): Map<string, number[]> {
-    const map = new Map<string, number[]>();
-    for (const row of rows) {
-      const bucket = map.get(row.decision_type) || [];
-      bucket.push(row.delta_seconds);
-      map.set(row.decision_type, bucket);
-    }
-    return map;
   }
 
   private median(values: number[]): number {
