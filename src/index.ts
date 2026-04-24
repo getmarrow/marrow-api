@@ -38,6 +38,7 @@ import { AgentService } from './services/agent.service';
 import { TemplatesService } from './services/templates.service';
 import { FleetService } from './services/fleet.service';
 import { NarrativeService } from './services/narrative.service';
+import { EmailService } from './services/email.service';
 import type { VelocityMetric } from './services/velocity.service';
 import type { ImprovementResult } from './services/baseline.service';
 import { BaselineService } from './services/baseline.service';
@@ -106,25 +107,36 @@ async function requireAuth(request: IRequest, env: Env): Promise<RequestContext 
 }
 
 // ---------- Internal Auth Helper ----------
+async function timingSafeSecretMatch(candidate: string, expected: string, label: string): Promise<Response | null> {
+  const encoder = new TextEncoder();
+  const aBytes = encoder.encode(candidate);
+  const bBytes = encoder.encode(expected);
+  if (aBytes.length !== bBytes.length) return err('Unauthorized', 401, { label });
+  const aKey = await crypto.subtle.importKey('raw', aBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const bKey = await crypto.subtle.importKey('raw', bBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const msg = encoder.encode(`marrow-${label}`);
+  const aHmac = await crypto.subtle.sign('HMAC', aKey, msg);
+  const bHmac = await crypto.subtle.sign('HMAC', bKey, msg);
+  const aHex = Array.from(new Uint8Array(aHmac)).map(b => b.toString(16).padStart(2, '0')).join('');
+  const bHex = Array.from(new Uint8Array(bHmac)).map(b => b.toString(16).padStart(2, '0')).join('');
+  if (aHex !== bHex) return err('Unauthorized', 401, { label });
+  return null;
+}
+
 async function requireInternalKey(request: IRequest, env: Env): Promise<Response | null> {
   const key = request.headers.get('X-Internal-Key');
   if (!env.INTERNAL_KEY || !key) {
     return err('Unauthorized', 401);
   }
-  // H1 fix: timing-safe compare via HMAC to prevent timing attacks
-  const encoder = new TextEncoder();
-  const aBytes = encoder.encode(key);
-  const bBytes = encoder.encode(env.INTERNAL_KEY);
-  if (aBytes.length !== bBytes.length) return err('Unauthorized', 401);
-  const aKey = await crypto.subtle.importKey('raw', aBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const bKey = await crypto.subtle.importKey('raw', bBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const msg = encoder.encode('marrow-internal');
-  const aHmac = await crypto.subtle.sign('HMAC', aKey, msg);
-  const bHmac = await crypto.subtle.sign('HMAC', bKey, msg);
-  const aHex = Array.from(new Uint8Array(aHmac)).map(b => b.toString(16).padStart(2, '0')).join('');
-  const bHex = Array.from(new Uint8Array(bHmac)).map(b => b.toString(16).padStart(2, '0')).join('');
-  if (aHex !== bHex) return err('Unauthorized', 401);
-  return null;
+  return timingSafeSecretMatch(key, env.INTERNAL_KEY, 'internal');
+}
+
+async function requireAdminToken(request: IRequest, env: Env): Promise<Response | null> {
+  const token = request.headers.get('X-Admin-Token');
+  if (!env.MARROW_ADMIN_TOKEN || !token) {
+    return err('Unauthorized', 401);
+  }
+  return timingSafeSecretMatch(token, env.MARROW_ADMIN_TOKEN, 'admin');
 }
 
 // ---------- Email Helpers ----------
@@ -191,6 +203,34 @@ router.options('*', (request: IRequest) => {
 // ---------- Public Endpoints (no auth) ----------
 router.get('/health', () => json({ status: 'ok', timestamp: new Date().toISOString(), version: MARROW_API_VERSION, sdk_latest: { js: MARROW_SDK_LATEST, mcp: MARROW_MCP_LATEST } }));
 router.get('/version', () => json({ version: '1.0.0', build: 'marrow-20-tier', tiers: 20 }));
+router.get('/v1/email/unsubscribe', async (request: IRequest, env: Env) => {
+  try {
+    const token = getUrl(request).searchParams.get('token') || '';
+    if (!token) {
+      return new Response('<!doctype html><html><body><h1>Not found</h1></body></html>', {
+        status: 404,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
+    }
+
+    const emailService = new EmailService(env.DB, env);
+    const ok = await emailService.unsubscribe(token);
+    if (!ok) {
+      return new Response('<!doctype html><html><body><h1>Not found</h1></body></html>', {
+        status: 404,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
+    }
+
+    return new Response(`<!doctype html><html><body><p>You've been unsubscribed. Reply to buu@getmarrow.ai if you change your mind.</p></body></html>`, {
+      status: 200,
+      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    });
+  } catch (e) {
+    console.error('GET /v1/email/unsubscribe error:', e);
+    return err('Internal error', 500);
+  }
+});
 
 // ============= KEY REQUEST / VERIFY (Public signup flow) =============
 
@@ -334,27 +374,10 @@ router.post('/v1/keys/verify', async (request: IRequest, env: Env) => {
     const created = await authService.createApiKey(accountId);
     const apiKey = created.key;
 
-    // Send welcome email (non-blocking)
-    const welcomeHtml = emailCard('Your Marrow key is live.', `
-          <p style="margin:0 0 20px;font-size:14px;color:#999999;line-height:1.6;">Your key is active. The faster you log your first decision, the faster the hive starts working for you.</p>
-          <pre style="font-family:'Courier New',Courier,monospace;background:#111111;color:#e5e5e5;border:1px solid #222222;padding:16px;border-radius:6px;font-size:13px;display:block;margin:0 0 20px;white-space:pre-wrap;word-break:break-all;"><code>import MarrowClient from '@getmarrow/sdk'
-
-const marrow = new MarrowClient('YOUR_API_KEY')
-
-const { decisionId } = await marrow.think({
-  action: 'your first decision',
-  type: 'general'
-})
-
-await marrow.commit({
-  success: true,
-  outcome: 'it works'
-})</code></pre>
-          <p style="margin:0 0 20px;font-size:14px;color:#999999;line-height:1.6;">That's it. You just logged a decision. Marrow will start building a model from here.</p>
-          <p style="margin:0 0 20px;font-size:14px;color:#999;">Retrieve your key securely at <a href="https://getmarrow.ai/dashboard" style="color:#ffffff;font-weight:600;">getmarrow.ai/dashboard</a></p>
-          <a href="https://getmarrow.ai/docs" style="display:inline-block;padding:10px 24px;background:#ffffff;color:#0a0a0a;text-decoration:none;border-radius:0px;font-size:13px;font-weight:600;">Read the docs →</a>
-    `);
-    sendEmail(env, email, 'Your Marrow key is live. Make your first decision.', welcomeHtml).catch(() => {});
+    const emailService = new EmailService(env.DB, env);
+    emailService
+      .sendTemplate(accountId, email, 'welcome', { api_key: apiKey, email })
+      .catch(() => {});
 
     return new Response(JSON.stringify({ apiKey }), {
       status: 200,
@@ -381,6 +404,10 @@ router.post('/v1/auth/accounts', async (request: IRequest, env: Env) => {
       String(body.name || ''), String(body.email || ''), 'free'  // H2 fix: always free, never trust client-supplied tier
     );
     const { key, keyId } = await authService.createApiKey(account.id);
+    const emailService = new EmailService(env.DB, env);
+    emailService
+      .sendTemplate(account.id, account.email, 'welcome', { api_key: key, email: account.email })
+      .catch(() => {});
     return json({ account, api_key: key, key_id: keyId }, 201);
   } catch (e: unknown) { return err('Internal error'); }
 });
@@ -2649,6 +2676,33 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
       .getNarrativeForCommit(ctx.account_id, commitAgentId ?? undefined)
       .catch(() => null);
 
+    env.DB.prepare(
+      `SELECT COUNT(*) AS c FROM decisions WHERE account_id = ? AND outcome_recorded_at IS NOT NULL`
+    )
+      .bind(ctx.account_id)
+      .first<{ c: number }>()
+      .then(async (countRow) => {
+        const totalCommits = countRow?.c || 0;
+        if (totalCommits !== 100) return;
+
+        const baseline = await new BaselineService(env.DB).getAccountImprovement(ctx.account_id).catch(() => null);
+        if (!baseline || baseline.status !== 'active') return;
+
+        const account = await env.DB
+          .prepare('SELECT email FROM accounts WHERE id = ? LIMIT 1')
+          .bind(ctx.account_id)
+          .first<{ email: string }>();
+        if (!account?.email) return;
+
+        const emailService = new EmailService(env.DB, env);
+        await emailService.sendTemplate(ctx.account_id, account.email, 'milestone_100', {
+          email: account.email,
+          improvement_pct: baseline.time_to_success_seconds.delta_pct,
+          decisions_count: totalCommits,
+        });
+      })
+      .catch(() => {});
+
     return json({
       committed: true,
       success_rate: result.new_success_rate ?? 0.75,
@@ -3020,6 +3074,58 @@ router.put('/v1/admin/accounts/:accountId/tier', async (request: IRequest, env: 
     if (!updated) return err('Account not found', 404);
     return json(updated);
   } catch (e) { return err('Internal error', 500); }
+});
+
+// ============= ADMIN: Catch-up Email Batch (temporary) =============
+
+router.post('/v1/admin/catchup-batch', async (request: IRequest, env: Env) => {
+  try {
+    const adminErr = await requireAdminToken(request, env);
+    if (adminErr) return adminErr;
+
+    const accounts = await env.DB
+      .prepare(`
+        SELECT a.id, a.email
+        FROM accounts a
+        WHERE a.created_at < ?
+          AND a.email IS NOT NULL
+          AND a.email != ''
+          AND NOT EXISTS (
+            SELECT 1 FROM emails_sent e
+            WHERE e.account_id = a.id AND e.template_name = 'catchup_v1'
+          )
+        ORDER BY a.created_at ASC
+        LIMIT 50
+      `)
+      .bind('2026-04-24T00:00:00.000Z')
+      .all<{ id: string; email: string }>();
+
+    let batched = 0;
+    let skipped = 0;
+    const authService = new AuthService(env.DB);
+    const emailService = new EmailService(env.DB, env);
+
+    for (const account of accounts.results || []) {
+      const allowed = await emailService.canSendTemplate(account.id, 'catchup_v1');
+      if (!allowed.ok) {
+        skipped++;
+        continue;
+      }
+
+      const created = await authService.createApiKey(account.id).catch(() => null);
+      const result = await emailService.sendTemplate(account.id, account.email, 'catchup_v1', {
+        api_key: created?.key || '',
+        email: account.email,
+      });
+      if (result.success && !result.reason) batched++;
+      else skipped++;
+    }
+
+    return json({ batched, skipped });
+  } catch (e) {
+    console.error('POST /v1/admin/catchup-batch error:', e);
+    return err('Internal error', 500);
+  }
 });
 
 // ============= ADMIN: Password Auth (public — no API key needed) =============
@@ -4447,6 +4553,48 @@ export default {
       const committed = await sessionSvc.autoCommitStale();
       if (committed > 0) console.log(`[session] auto-committed ${committed} stale decisions`);
     } catch (e) { console.error('[session] auto-commit error:', e); }
+
+    // V6.7: Day-3 nudge email batch (up to 100 per run, fire-and-forget)
+    try {
+      const now = Date.now();
+      const newerThan = new Date(now - 96 * 60 * 60 * 1000).toISOString();
+      const olderThan = new Date(now - 72 * 60 * 60 * 1000).toISOString();
+      const eligible = await env.DB
+        .prepare(`
+          SELECT a.id, a.email
+          FROM accounts a
+          WHERE a.created_at >= ?
+            AND a.created_at < ?
+            AND a.email IS NOT NULL
+            AND a.email != ''
+            AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.account_id = a.id)
+            AND NOT EXISTS (
+              SELECT 1 FROM emails_sent e
+              WHERE e.account_id = a.id AND e.template_name = 'day3_nudge'
+            )
+          ORDER BY a.created_at ASC
+          LIMIT 100
+        `)
+        .bind(newerThan, olderThan)
+        .all<{ id: string; email: string }>();
+
+      const authService = new AuthService(env.DB);
+      const emailService = new EmailService(env.DB, env);
+      for (const account of eligible.results || []) {
+        try {
+          const allowed = await emailService.canSendTemplate(account.id, 'day3_nudge');
+          if (!allowed.ok) continue;
+
+          const created = await authService.createApiKey(account.id);
+          await emailService.sendTemplate(account.id, account.email, 'day3_nudge', {
+            api_key: created.key,
+            email: account.email,
+          });
+        } catch (e) {
+          console.error('[email] day3_nudge error:', e);
+        }
+      }
+    } catch (e) { console.error('[email] day3_nudge cron error:', e); }
 
     // L1 fix: Cleanup orphaned saves older than 7 days (unconfirmed potential saves)
     try {
