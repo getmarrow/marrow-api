@@ -82,14 +82,23 @@ export class EmailService {
 
       // Catchup is positioned as a personal founder email — ships from primary
       // domain (buu@getmarrow.ai) with no List-Unsubscribe headers so receivers
-      // don't classify it as a mailing list. In-body Unsubscribe link still present.
+      // don't classify it as a mailing list. Uses RESEND_API_KEY_PRIMARY which
+      // is scoped to the primary domain. In-body Unsubscribe link still present.
+      //
       // Automated transactional templates (welcome/day3/milestone) stay on the
       // isolated subdomain with full compliance headers so any reputation hit
-      // stays away from primary.
+      // stays away from primary — uses RESEND_API_KEY (scoped to subdomain).
       const isCatchup = templateName === 'catchup_v1';
       const fromAddress = isCatchup
         ? 'Buu <buu@getmarrow.ai>'
         : 'Buu <buu@mail.getmarrow.ai>';
+      const apiKey = isCatchup
+        ? (this.env.RESEND_API_KEY_PRIMARY || this.env.RESEND_API_KEY)
+        : this.env.RESEND_API_KEY;
+      if (!apiKey) {
+        console.error(`[email] ${templateName}: no Resend API key available for domain`);
+        return { success: false, reason: 'missing_resend_api_key' };
+      }
       const bulkHeaders = isCatchup
         ? undefined
         : {
@@ -110,7 +119,7 @@ export class EmailService {
       const resendRes = await fetch('https://api.resend.com/emails', {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${this.env.RESEND_API_KEY}`,
+          Authorization: `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(resendPayload),

@@ -9,6 +9,7 @@ export interface Env {
   ADMIN_OWNER_KEY?: string;
   INTERNAL_KEY?: string;
   MARROW_ADMIN_TOKEN?: string;
+  RESEND_API_KEY_PRIMARY?: string;
 }
 
 export interface Org {
