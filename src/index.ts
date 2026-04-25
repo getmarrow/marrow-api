@@ -2436,6 +2436,33 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
 
     response.api_version = MARROW_API_VERSION;
 
+    // V6.7: marrow_contributed — what Marrow just gave the agent for this decision.
+    // Agent uses this to narrate Marrow's contribution to the user in plain English.
+    // Only includes signals that are non-zero / non-empty; agent decides whether to mention.
+    const intel = (response.intelligence as Record<string, unknown> | undefined) || {};
+    const warnings_count = Array.isArray(response.warnings) ? response.warnings.length : 0;
+    const loop_warnings_count = Array.isArray(response.loop_warnings) ? response.loop_warnings.length : 0;
+    const hive_patterns = typeof intel.patterns_count === 'number' ? intel.patterns_count : 0;
+    const similar_decisions = typeof intel.similar_count === 'number' ? intel.similar_count : 0;
+    const templates_available = Array.isArray(intel.templates) ? intel.templates.length : 0;
+    const has_collective_insight = typeof intel.insight === 'string' && (intel.insight as string).length > 0;
+    const collective_intelligence = (intel.collective && typeof intel.collective === 'object') ? intel.collective : null;
+    const team_context = (intel.team_context && typeof intel.team_context === 'object') ? intel.team_context : null;
+
+    response.marrow_contributed = {
+      warnings_consulted: warnings_count,
+      hive_patterns_surfaced: hive_patterns,
+      similar_decisions_found: similar_decisions,
+      workflow_templates_available: templates_available,
+      loop_detected: loop_warnings_count > 0,
+      collective_intelligence: collective_intelligence ? true : false,
+      team_context_present: team_context ? true : false,
+      // True when Marrow gave the agent *something* materially useful to act on.
+      has_signal: warnings_count > 0 || hive_patterns > 0 || similar_decisions > 0
+                  || templates_available > 0 || loop_warnings_count > 0
+                  || has_collective_insight,
+    };
+
     const clientSdkVersion = request.headers.get('X-SDK-Version');
     const sdkUpdateAvailable = clientSdkVersion && clientSdkVersion !== MARROW_SDK_LATEST
       ? { latest: MARROW_SDK_LATEST, current: clientSdkVersion, message: `Update available: npm install @getmarrow/sdk@${MARROW_SDK_LATEST}` }
@@ -2709,11 +2736,50 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
       })
       .catch(() => {});
 
+    // V6.7: marrow_contributed — concrete signals the agent can narrate to the user.
+    // Looks up the just-committed decision's signals (cluster match = pattern reuse,
+    // workflow link = enforced workflow followed). Save attribution comes from
+    // Boolean(body.success) + this account having recent warnings on similar tasks.
+    const committedDecision = await env.DB
+      .prepare(
+        `SELECT cluster_id, related_decision_id FROM decisions WHERE id = ? AND account_id = ? LIMIT 1`
+      )
+      .bind(String(body.decision_id), ctx.account_id)
+      .first<{ cluster_id: string | null; related_decision_id: string | null }>()
+      .catch(() => null);
+
+    const pattern_reused = Boolean(committedDecision?.cluster_id);
+    const linked_to_prior = Boolean(committedDecision?.related_decision_id);
+
+    // A "save" is when the user's previous decision had a warning AND this commit succeeded.
+    // ImpactService.confirmSave already records this above when success=true, so we can
+    // detect it by checking if a save row was just created for this decision.
+    let warning_avoided = false;
+    if (Boolean(body.success)) {
+      const saveRow = await env.DB
+        .prepare(
+          `SELECT id FROM saves WHERE account_id = ? AND decision_id = ? AND confirmed_save = 1 LIMIT 1`
+        )
+        .bind(ctx.account_id, String(body.decision_id))
+        .first<{ id: string }>()
+        .catch(() => null);
+      warning_avoided = Boolean(saveRow);
+    }
+
+    const marrow_contributed = {
+      success: Boolean(body.success),
+      pattern_reused,
+      linked_to_prior_decision: linked_to_prior,
+      warning_avoided,
+      has_signal: pattern_reused || warning_avoided || linked_to_prior,
+    };
+
     return json({
       committed: true,
       success_rate: result.new_success_rate ?? 0.75,
       insight: null,
       narrative,
+      marrow_contributed,
     });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : 'Unknown error';
@@ -3827,7 +3893,64 @@ router.post('/v1/agent/session/end', async (request: IRequest, env: Env) => {
       console.warn('[session/end] auto-committed open decision on explicit caller request', { accountId: ctx.account_id, sessionId, openDecisionId: result.openDecisionId });
     }
 
-    return json({ session_id: sessionId, committed: result.committed, open_decision_id: result.openDecisionId });
+    // V6.7: session_summary — what Marrow contributed across this session.
+    // Counts are facts pulled from the decisions + saves tables for this session_id.
+    // Agent uses session_summary.narrative when wrapping up to surface Marrow's contribution.
+    const summaryRow = await env.DB
+      .prepare(
+        `SELECT
+           COUNT(*) AS decisions_total,
+           SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) AS successes,
+           SUM(CASE WHEN outcome_success = 0 THEN 1 ELSE 0 END) AS failures,
+           SUM(CASE WHEN cluster_id IS NOT NULL THEN 1 ELSE 0 END) AS pattern_reuses
+         FROM decisions
+         WHERE account_id = ? AND session_id = ?`
+      )
+      .bind(ctx.account_id, sessionId)
+      .first<{ decisions_total: number; successes: number; failures: number; pattern_reuses: number }>()
+      .catch(() => null);
+
+    const savesRow = await env.DB
+      .prepare(
+        `SELECT COUNT(*) AS saves
+         FROM saves s
+         JOIN decisions d ON d.id = s.decision_id
+         WHERE d.account_id = ? AND d.session_id = ? AND s.confirmed_save = 1`
+      )
+      .bind(ctx.account_id, sessionId)
+      .first<{ saves: number }>()
+      .catch(() => null);
+
+    const decisions_total = summaryRow?.decisions_total || 0;
+    const successes = summaryRow?.successes || 0;
+    const failures = summaryRow?.failures || 0;
+    const pattern_reuses = summaryRow?.pattern_reuses || 0;
+    const warnings_acted_on = savesRow?.saves || 0;
+
+    // Build a one-line narrative of what Marrow did this session — only mentions
+    // the meaningful contributions, not zeros.
+    const fragments: string[] = [];
+    if (decisions_total > 0) fragments.push(`${decisions_total} decisions logged`);
+    if (warnings_acted_on > 0) fragments.push(`${warnings_acted_on} retr${warnings_acted_on === 1 ? 'y' : 'ies'} avoided via Marrow warnings`);
+    if (pattern_reuses > 0) fragments.push(`${pattern_reuses} pattern reuse${pattern_reuses === 1 ? '' : 's'} from your history`);
+    const narrative = fragments.length > 0 ? fragments.join(', ') + '.' : null;
+
+    const session_summary = {
+      decisions_total,
+      successes,
+      failures,
+      pattern_reuses,
+      warnings_acted_on,
+      narrative,
+      has_signal: decisions_total > 0 && (warnings_acted_on > 0 || pattern_reuses > 0),
+    };
+
+    return json({
+      session_id: sessionId,
+      committed: result.committed,
+      open_decision_id: result.openDecisionId,
+      session_summary,
+    });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : 'Unknown error';
     console.error('POST /v1/agent/session/end error:', msg);
