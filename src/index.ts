@@ -23,6 +23,7 @@ import { VersionService } from './services/version.service';
 import { MarketplaceService } from './services/marketplace.service';
 import { WorkflowService } from './workflow';
 import { OtpService } from './services/otp.service';
+import { log } from './utils/logger';
 import { WebhookService } from './services/webhook.service';
 import { OrgService } from './services/org.service';
 import { RetentionService } from './services/retention.service';
@@ -367,8 +368,11 @@ router.post('/v1/keys/verify', async (request: IRequest, env: Env) => {
     const apiKey = created.key;
 
     const emailService = new EmailService(env.DB, env);
+    // SECURITY: never include api_key in email vars — emails are not a secure channel.
+    // The user receives their key in the JSON response below; this email confirms
+    // signup and points them at the install command using an env-var pattern.
     emailService
-      .sendTemplate(accountId, email, 'welcome', { api_key: apiKey, email })
+      .sendTemplate(accountId, email, 'welcome', { email })
       .catch(() => {});
 
     return new Response(JSON.stringify({ apiKey }), {
@@ -397,8 +401,10 @@ router.post('/v1/auth/accounts', async (request: IRequest, env: Env) => {
     );
     const { key, keyId } = await authService.createApiKey(account.id);
     const emailService = new EmailService(env.DB, env);
+    // SECURITY: api_key intentionally NOT passed to template — emails never carry secrets.
+    // User receives the key in the JSON response below.
     emailService
-      .sendTemplate(account.id, account.email, 'welcome', { api_key: key, email: account.email })
+      .sendTemplate(account.id, account.email, 'welcome', { email: account.email })
       .catch(() => {});
     return json({ account, api_key: key, key_id: keyId }, 201);
   } catch (e: unknown) { return err('Internal error'); }
@@ -4477,10 +4483,14 @@ export default {
       newHeaders.set('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'");
       return new Response(res.body, { status: res.status, headers: newHeaders });
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Unknown error';
-      const stack = e instanceof Error ? e.stack : '';
-      console.error('Unhandled fetch error:', msg, stack);
-      console.error('Unhandled error:', msg, stack);
+      // Structured log so the failure is queryable in Cloudflare Workers
+      // Observability — captures the request shape that caused the unhandled error.
+      const url = new URL(request.url);
+      log.error('unhandled_fetch_error', e, {
+        component: 'worker.fetch',
+        route: `${request.method} ${url.pathname}`,
+        request_id: request.headers.get('cf-ray') || undefined,
+      });
       return new Response(JSON.stringify({ error: 'Internal server error' }), {
         status: 500,
         headers: { 'Content-Type': 'application/json' },
@@ -4531,18 +4541,17 @@ export default {
         .bind(newerThan, olderThan)
         .all<{ id: string; email: string }>();
 
-      const authService = new AuthService(env.DB);
       const emailService = new EmailService(env.DB, env);
       for (const account of eligible.results || []) {
         try {
           const allowed = await emailService.canSendTemplate(account.id, 'day3_nudge');
           if (!allowed.ok) continue;
 
-          const created = await authService.createApiKey(account.id);
-          // Fire-and-forget: never let a single send failure break the loop or
-          // bubble up to abort the cron. Matches the pattern used by welcome + milestone triggers.
+          // SECURITY: never mint or email API keys here. The user already has
+          // their original key from the signup verification response. The
+          // template directs them to use it via MARROW_API_KEY=<your-key> pattern.
+          // Fire-and-forget: a single send failure never aborts the cron loop.
           emailService.sendTemplate(account.id, account.email, 'day3_nudge', {
-            api_key: created.key,
             email: account.email,
           }).catch((err) => console.error('[email] day3_nudge send error:', account.id, err));
         } catch (e) {
