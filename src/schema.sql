@@ -124,6 +124,55 @@ CREATE TABLE IF NOT EXISTS lessons (
   FOREIGN KEY (account_id) REFERENCES accounts(id)
 );
 
+
+-- Persistent Memory
+CREATE TABLE IF NOT EXISTS memories (
+  id TEXT PRIMARY KEY CHECK (length(id) > 0 AND length(id) < 128),
+  account_id TEXT NOT NULL CHECK (length(account_id) > 0 AND length(account_id) < 200),
+  text TEXT NOT NULL CHECK (length(text) > 0 AND length(text) < 50000),
+  source TEXT,
+  tags TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags) AND json_type(tags) = 'array'),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'outdated', 'superseded', 'deleted')),
+  supersedes TEXT REFERENCES memories(id),
+  superseded_by TEXT REFERENCES memories(id),
+  deleted_at TEXT,
+  audit TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(audit) AND json_type(audit) = 'array'),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (account_id) REFERENCES accounts(id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_shares (
+  id TEXT PRIMARY KEY,
+  memory_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (account_id) REFERENCES accounts(id),
+  FOREIGN KEY (memory_id) REFERENCES memories(id),
+  UNIQUE (memory_id, account_id, agent_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS memory_shares_account_match_insert
+BEFORE INSERT ON memory_shares
+FOR EACH ROW
+WHEN NOT EXISTS (
+  SELECT 1 FROM memories WHERE id = NEW.memory_id AND account_id = NEW.account_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'memory_shares account mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_shares_account_match_update
+BEFORE UPDATE OF memory_id, account_id ON memory_shares
+FOR EACH ROW
+WHEN NOT EXISTS (
+  SELECT 1 FROM memories WHERE id = NEW.memory_id AND account_id = NEW.account_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'memory_shares account mismatch');
+END;
+
 -- Tier 10: Priority Queue
 CREATE TABLE IF NOT EXISTS priority_queue (
   id TEXT PRIMARY KEY,
@@ -247,6 +296,12 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash);
 CREATE INDEX IF NOT EXISTS idx_api_keys_account_id ON api_keys(account_id);
 CREATE INDEX IF NOT EXISTS idx_lessons_account_id ON lessons(account_id);
 CREATE INDEX IF NOT EXISTS idx_lessons_is_published ON lessons(is_published);
+CREATE INDEX IF NOT EXISTS idx_memories_account_status ON memories(account_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_account_updated_at ON memories(account_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_account_created ON memories(account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source);
+CREATE INDEX IF NOT EXISTS idx_memory_shares_account_agent ON memory_shares(account_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_memory_shares_memory_id ON memory_shares(memory_id);
 CREATE INDEX IF NOT EXISTS idx_patterns_account_id ON patterns(account_id);
 CREATE INDEX IF NOT EXISTS idx_patterns_decision_type ON patterns(decision_type);
 CREATE INDEX IF NOT EXISTS idx_analytics_snapshots_metric_name ON analytics_snapshots(metric_name);

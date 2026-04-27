@@ -123,7 +123,7 @@ export class AuthService {
   /** Tier 11: Verify resource belongs to account */
   private static readonly ALLOWED_TABLES = new Set([
     'decisions', 'patterns', 'analytics', 'webhooks', 'orgs', 'org_members',
-    'lessons', 'snapshots', 'api_keys', 'priority_queue', 'audit_log',
+    'lessons', 'memories', 'snapshots', 'api_keys', 'priority_queue', 'audit_log',
   ]);
 
   async checkIsolation(accountId: string, resourceId: string, table: string): Promise<boolean> {

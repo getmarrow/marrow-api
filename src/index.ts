@@ -40,6 +40,7 @@ import { TemplatesService } from './services/templates.service';
 import { FleetService } from './services/fleet.service';
 import { NarrativeService } from './services/narrative.service';
 import { EmailService } from './services/email.service';
+import { MemoryService } from './services/memory.service';
 import type { VelocityMetric } from './services/velocity.service';
 import type { ImprovementResult } from './services/baseline.service';
 import { BaselineService } from './services/baseline.service';
@@ -4522,6 +4523,282 @@ router.post('/v1/templates', async (request: IRequest, env: Env) => {
 // ---------- Fleet Dashboard ----------
 
 // GET /v1/fleet — fleet status
+// ============= Memories =============
+
+router.get('/v1/memories/retrieve', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const url = getUrl(request);
+    const statusParam = url.searchParams.get('status');
+    const query = url.searchParams.get('q') || '';
+    const accessAgentId = ctx.agent_id || undefined;
+    const memoryService = new MemoryService(env.DB);
+    const result = await memoryService.retrieveMemories(ctx.account_id, query, {
+      limit: Number(url.searchParams.get('limit') || 20),
+      includeStale: url.searchParams.get('includeStale') === 'true',
+      from: url.searchParams.get('from') || undefined,
+      to: url.searchParams.get('to') || undefined,
+      tags: url.searchParams.get('tags') || undefined,
+      source: url.searchParams.get('source') || undefined,
+      status: statusParam === 'active' || statusParam === 'outdated' || statusParam === 'superseded' || statusParam === 'deleted'
+        ? statusParam
+        : undefined,
+      shared: url.searchParams.get('shared') === null
+        ? undefined
+        : url.searchParams.get('shared') === 'true',
+      agentId: accessAgentId,
+    });
+
+    return json(result);
+  } catch (e: unknown) {
+    console.error('GET /v1/memories/retrieve error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
+router.get('/v1/memories/export', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const url = getUrl(request);
+    const statusParam = url.searchParams.get('status');
+    const tags = (url.searchParams.get('tags') || '')
+      .split(',')
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+
+    const memoryService = new MemoryService(env.DB);
+    const result = await memoryService.exportMemories(ctx.account_id, {
+      format: url.searchParams.get('format') === 'csv' ? 'csv' : 'json',
+      status: statusParam === 'all' || statusParam === 'active' || statusParam === 'outdated' || statusParam === 'superseded' || statusParam === 'deleted'
+        ? statusParam as 'all' | 'active' | 'outdated' | 'superseded' | 'deleted'
+        : undefined,
+      tags,
+      agentId: ctx.agent_id || undefined,
+    });
+
+    return json(result);
+  } catch (e: unknown) {
+    console.error('GET /v1/memories/export error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
+router.post('/v1/memories/import', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+    if (ctx.agent_id) return err('Agent-scoped tokens cannot import memories', 403);
+
+    const body = await request.json() as {
+      memories?: Array<{ text?: string; source?: string; tags?: string[]; sharedWith?: string[]; shared_with?: string[] }>;
+      mode?: 'merge' | 'replace';
+    };
+
+    const memoryService = new MemoryService(env.DB);
+    const result = await memoryService.importMemories(
+      ctx.account_id,
+      (body.memories || []).map((memory) => ({
+        text: memory.text,
+        source: memory.source,
+        tags: memory.tags,
+        sharedWith: memory.sharedWith || memory.shared_with,
+      })),
+      body.mode === 'replace' ? 'replace' : 'merge'
+    );
+
+    return json(result);
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : 'Internal server error';
+    if (message.includes('Import validation failed')) return err(message, 400);
+    console.error('POST /v1/memories/import error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
+router.get('/v1/memories', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const url = getUrl(request);
+    const statusParam = url.searchParams.get('status');
+    const memoryService = new MemoryService(env.DB);
+    const memories = await memoryService.listMemories(ctx.account_id, {
+      status: statusParam === 'active' || statusParam === 'outdated' || statusParam === 'superseded' || statusParam === 'deleted'
+        ? statusParam
+        : undefined,
+      query: url.searchParams.get('query') || undefined,
+      includeDeleted: url.searchParams.get('includeDeleted') === 'true',
+      limit: Number(url.searchParams.get('limit') || 20),
+      agentId: ctx.agent_id || url.searchParams.get('agent_id') || undefined,
+    });
+
+    return json({ memories, count: memories.length });
+  } catch (e: unknown) {
+    console.error('GET /v1/memories error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
+router.get('/v1/memories/:id', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const memoryService = new MemoryService(env.DB);
+    const memory = await memoryService.getMemory(String(request.params?.id), ctx.account_id, {
+      includeDeleted: getUrl(request).searchParams.get('includeDeleted') === 'true',
+      accessAgentId: ctx.agent_id || undefined,
+    });
+
+    if (!memory) {
+      return err('Memory not found', 404, { id: String(request.params?.id) });
+    }
+
+    return json({ memory });
+  } catch (e: unknown) {
+    console.error('GET /v1/memories/:id error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
+router.patch('/v1/memories/:id', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+    const body = await request.json() as { text?: string; source?: string | null; tags?: string[]; actor?: string; note?: string };
+
+    const memoryService = new MemoryService(env.DB);
+    const memory = await memoryService.updateMemory(String(request.params?.id), ctx.account_id, body, {
+      accessAgentId: ctx.agent_id || undefined,
+    });
+    if (!memory) {
+      return err('Memory not found', 404, { id: String(request.params?.id) });
+    }
+
+    return json({ memory });
+  } catch (e: unknown) {
+    console.error('PATCH /v1/memories/:id error:', e);
+    const message = e instanceof Error ? e.message : 'Internal server error';
+    if (message.includes('required')) return err(message, 400);
+    return err('Internal server error', 500);
+  }
+});
+
+router.delete('/v1/memories/:id', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+    const body = await request.json().catch(() => ({})) as { actor?: string; note?: string };
+
+    const memoryService = new MemoryService(env.DB);
+    const memory = await memoryService.deleteMemory(String(request.params?.id), ctx.account_id, body, {
+      accessAgentId: ctx.agent_id || undefined,
+    });
+    if (!memory) {
+      return err('Memory not found', 404, { id: String(request.params?.id) });
+    }
+
+    return json({ memory });
+  } catch (e: unknown) {
+    console.error('DELETE /v1/memories/:id error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
+router.post('/v1/memories/:id/outdated', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+    const body = await request.json().catch(() => ({})) as { actor?: string; note?: string };
+
+    const memoryService = new MemoryService(env.DB);
+    const memory = await memoryService.markOutdated(String(request.params?.id), ctx.account_id, body, {
+      accessAgentId: ctx.agent_id || undefined,
+    });
+    if (!memory) {
+      return err('Memory not found', 404, { id: String(request.params?.id) });
+    }
+
+    return json({ memory });
+  } catch (e: unknown) {
+    console.error('POST /v1/memories/:id/outdated error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
+router.post('/v1/memories/:id/supersede', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+    const body = await request.json() as { text?: string; source?: string; tags?: string[]; actor?: string; note?: string };
+    if (!body.text || !String(body.text).trim()) {
+      return err('Replacement memory text is required', 400);
+    }
+
+    const memoryService = new MemoryService(env.DB);
+    const result = await memoryService.supersedeMemory(String(request.params?.id), ctx.account_id, {
+      text: body.text,
+      source: body.source,
+      tags: body.tags,
+      actor: body.actor,
+      note: body.note,
+    }, {
+      accessAgentId: ctx.agent_id || undefined,
+    });
+    if (!result) {
+      return err('Memory not found', 404, { id: String(request.params?.id) });
+    }
+
+    return json(result);
+  } catch (e: unknown) {
+    console.error('POST /v1/memories/:id/supersede error:', e);
+    const message = e instanceof Error ? e.message : 'Internal server error';
+    if (message.includes('required')) return err(message, 400);
+    return err('Internal server error', 500);
+  }
+});
+
+router.post('/v1/memories/:id/share', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+    if (ctx.agent_id) return err('Agent-scoped tokens cannot share memories', 403);
+
+    const body = await request.json().catch(() => ({})) as { agent_ids?: string[]; agentIds?: string[]; actor?: string };
+
+    const memoryService = new MemoryService(env.DB);
+    const memory = await memoryService.shareMemory(
+      String(request.params?.id),
+      ctx.account_id,
+      body.agent_ids || body.agentIds || [],
+      body.actor
+    );
+    if (!memory) {
+      return err('Memory not found', 404, { id: String(request.params?.id) });
+    }
+
+    return json({ memory });
+  } catch (e: unknown) {
+    console.error('POST /v1/memories/:id/share error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
 router.get('/v1/fleet', async (request: IRequest, env: Env) => {
   try {
     const authResult = await requireAuth(request, env);
@@ -4582,7 +4859,7 @@ router.get('/v1/fleet/stream', async (request: IRequest, env: Env) => {
   }
 });
 
-router.all('*', () => err('Not found', 404));
+router.all('*', (request: IRequest) => err('Route not found', 404, { path: getUrl(request).pathname, method: request.method }));
 
 // ============= Export =============
 

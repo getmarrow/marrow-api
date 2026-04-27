@@ -153,6 +153,41 @@ export interface Lesson {
   updated_at: string;
 }
 
+// ============= Persistent Memory =============
+export type MemoryStatus = 'active' | 'outdated' | 'superseded' | 'deleted';
+
+export type MemoryAuditAction =
+  | 'created'
+  | 'edited'
+  | 'deleted'
+  | 'marked_outdated'
+  | 'superseded'
+  | 'created_as_replacement'
+  | 'bootstrapped';
+
+export interface MemoryAuditEntry {
+  action: MemoryAuditAction;
+  timestamp: string;
+  actor: string;
+  note: string;
+  [key: string]: unknown;
+}
+
+export interface Memory {
+  id: string;
+  account_id: string;
+  text: string;
+  status: MemoryStatus;
+  created_at: string;
+  updated_at: string;
+  source: string | null;
+  tags: string[];
+  supersedes: string | null;
+  superseded_by: string | null;
+  deleted_at: string | null;
+  audit: MemoryAuditEntry[];
+}
+
 // ============= Priority (Tier 10) =============
 export interface PriorityQueueEntry {
   id: string;
