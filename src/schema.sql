@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS decisions (
   outcome_recorded_at TEXT,
   outcome_success INTEGER,
   outcome_details TEXT,
+  quality TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY (account_id) REFERENCES accounts(id),

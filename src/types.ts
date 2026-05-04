@@ -9,6 +9,7 @@ export interface Env {
   ADMIN_OWNER_KEY?: string;
   INTERNAL_KEY?: string;
   RESEND_API_KEY_PRIMARY?: string;
+  EXECUTION_CONTEXT?: ExecutionContext;
 }
 
 export interface Org {
@@ -132,6 +133,8 @@ export interface RequestContext {
 }
 
 // ============= Decisions (Tiers 2-3) =============
+export type DecisionQuality = 'trivial';
+
 export interface Decision {
   id: string;
   account_id: string;
@@ -139,6 +142,7 @@ export interface Decision {
   context: Record<string, unknown>;
   outcome: string;
   confidence: number;
+  quality?: DecisionQuality | null;
   visibility: 'private' | 'shared' | 'hive' | 'team';
   context_compressed: boolean;
   context_hive?: Record<string, unknown> | null;

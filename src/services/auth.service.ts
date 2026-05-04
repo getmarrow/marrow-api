@@ -52,6 +52,7 @@ export class AuthServiceError extends Error {
 interface AuthMeta {
   ip?: string | null;
   userAgent?: string | null;
+  ctx?: ExecutionContext | null;
 }
 
 interface CreateApiKeyInput {
@@ -167,12 +168,7 @@ export class AuthService {
       return null;
     }
 
-    // Update usage stats (awaited — ~1ms, prevents Workers runtime cancellation)
-    await this.db
-      .prepare('UPDATE api_keys SET last_used_at = ?, last_used_ip = ?, usage_count = COALESCE(usage_count, 0) + 1 WHERE id = ?')
-      .bind(now(), meta.ip || null, result.id)
-      .run()
-      .catch((e: unknown) => { console.error('[auth] usage_count update failed', (e as Error)?.message || e); });
+    await this.trackKeyUsage(result.id, meta.ip || null, meta.ctx || null);
 
     await this.recordKeyAudit(result.account_id, result.id, 'auth_success', 'system', {
       ...meta,
@@ -187,6 +183,23 @@ export class AuthService {
       scopes: this.parseScopes(result.scopes),
       agent_ids: this.parseAgentIds(result.agent_ids),
     };
+  }
+
+  private async trackKeyUsage(keyId: string, ip: string | null, ctx: ExecutionContext | null = null): Promise<void> {
+    const usageUpdate = this.db
+      .prepare('UPDATE api_keys SET last_used_at = ?, last_used_ip = ?, usage_count = COALESCE(usage_count, 0) + 1 WHERE id = ?')
+      .bind(now(), ip, keyId)
+      .run()
+      .catch((e: unknown) => {
+        console.error('[auth] usage_count update failed', (e as Error)?.message || e);
+      });
+
+    if (ctx) {
+      ctx.waitUntil(usageUpdate);
+      return;
+    }
+
+    await usageUpdate;
   }
 
   async createAccount(name: string, email: string, tier: AccountTier = 'free'): Promise<Account> {

@@ -2,8 +2,9 @@
  * Tier 1: Authentication & Routing
  */
 import { describe, it, expect, beforeEach } from 'vitest';
+import worker from '../index';
 import { AuthRateLimitError, AuthService, AuthServiceError } from '../services/auth.service';
-import { createMockD1, REAL_API_KEY, REAL_ACCOUNT_ID } from './helpers';
+import { createMockD1, REAL_API_KEY, REAL_ACCOUNT_ID, TEST_ENCRYPTION_KEY } from './helpers';
 
 describe('Tier 1: Authentication & Routing', () => {
   let db: D1Database;
@@ -172,6 +173,52 @@ describe('Tier 1: Authentication & Routing', () => {
     const stored = await auth.getKey(created.keyId, account.id);
     expect(stored!.status).toBe('revoked');
     expect(stored!.revoked_at).toBeTruthy();
+  });
+
+  it('increments usage_count and tracks last_used_ip on successful auth', async () => {
+    const account = await auth.createAccount('Usage Test', 'usage@test.com', 'pro');
+    const created = await auth.createApiKey(account.id, { name: 'Usage Key' });
+
+    const ctx = await auth.validateToken(`Bearer ${created.key}`, { ip: '1.2.3.4' });
+    expect(ctx).not.toBeNull();
+
+    const stored = await auth.getKey(created.keyId, account.id);
+    expect(stored?.usage_count).toBe(1);
+    expect(stored?.last_used_ip).toBe('1.2.3.4');
+    expect(stored?.last_used_at).toBeTruthy();
+  });
+
+  it('persists usage_count updates scheduled via worker waitUntil', async () => {
+    const waitUntilPromises: Promise<unknown>[] = [];
+    const request = new Request('https://api.getmarrow.ai/v1/auth/account', {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${REAL_API_KEY}`,
+        'cf-connecting-ip': '9.8.7.6',
+      },
+    });
+
+    const response = await worker.fetch(
+      request,
+      {
+        DB: db,
+        ENCRYPTION_KEY: TEST_ENCRYPTION_KEY,
+        ENVIRONMENT: 'test',
+      } as any,
+      {
+        waitUntil(promise: Promise<unknown>) {
+          waitUntilPromises.push(promise);
+        },
+        passThroughOnException() {},
+      } as ExecutionContext
+    );
+
+    expect(response.status).toBe(200);
+    await Promise.all(waitUntilPromises);
+
+    const stored = await auth.getKey('key-prod-001', REAL_ACCOUNT_ID);
+    expect(stored?.usage_count).toBe(1);
+    expect(stored?.last_used_ip).toBe('9.8.7.6');
   });
 
   it('logs audit events for create, auth success, revoke, rotate, and auth failure', async () => {

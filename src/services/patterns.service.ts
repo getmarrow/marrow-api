@@ -24,7 +24,9 @@ export class PatternsService {
     const vectors = await this.db.prepare(`
       SELECT dv.*, d.confidence, d.outcome, d.outcome_success FROM decision_vectors dv
       JOIN decisions d ON dv.decision_id = d.id
-      WHERE d.decision_type = ? AND (d.visibility = 'hive' OR d.visibility = 'shared')
+      WHERE d.decision_type = ?
+        AND (d.visibility = 'hive' OR d.visibility = 'shared')
+        AND (d.quality IS NULL OR d.quality != 'trivial')
       LIMIT 100
     `).bind(decisionType).all<Record<string, unknown>>();
 
@@ -65,6 +67,7 @@ export class PatternsService {
       outcome, outcome_success, created_at FROM decisions
       WHERE (account_id = ? OR visibility = 'hive')
       AND (decision_type = ? OR ? = 'all')
+      AND (quality IS NULL OR quality != 'trivial')
       AND created_at > datetime('now', '-30 days')
       ORDER BY created_at DESC
       LIMIT 500
@@ -181,7 +184,9 @@ export class PatternsService {
     const res = await this.db.prepare(`
       SELECT d.*, pq.priority_score FROM decisions d
       LEFT JOIN priority_queue pq ON d.id = pq.decision_id
-      WHERE d.decision_type = ? AND (d.visibility = 'hive' OR d.visibility = 'shared')
+      WHERE d.decision_type = ?
+        AND (d.visibility = 'hive' OR d.visibility = 'shared')
+        AND (d.quality IS NULL OR d.quality != 'trivial')
       ORDER BY COALESCE(pq.priority_score, 0) DESC LIMIT ?
     `).bind(decisionType, limit).all<Record<string, unknown>>();
 
@@ -307,6 +312,7 @@ export class PatternsService {
       JOIN decisions d ON dv.decision_id = d.id
       WHERE d.decision_type = ? AND d.account_id IN (${placeholders})
         AND (d.visibility = 'hive' OR d.visibility = 'shared' OR d.visibility = 'team')
+        AND (d.quality IS NULL OR d.quality != 'trivial')
       LIMIT 100
     `).bind(decisionType, ...memberIds).all<Record<string, unknown>>();
 
@@ -356,6 +362,7 @@ export class PatternsService {
       outcome, outcome_success, created_at FROM decisions
       WHERE account_id IN (${placeholders})
       AND (decision_type = ? OR ? = 'all')
+      AND (quality IS NULL OR quality != 'trivial')
       AND created_at > datetime('now', '-30 days')
       ORDER BY created_at DESC
       LIMIT 500

@@ -1,3 +1,5 @@
+import type { DecisionQuality } from '../types';
+
 /**
  * Auto-Logging Middleware
  * 
@@ -16,6 +18,39 @@ interface AutoLogEntry {
   body?: unknown;
   tier?: string;
   sessionId?: string | null;
+}
+
+export const TRIVIAL_ACTIONS = [
+  /^session (stable|active|check|end|final|summary)(?:[\s.!:,-]*)$/i,
+  /^standing ?by(?:[\s.!:,-]*)$/i,
+  /^all systems(?:[\s.!:,-]*(?:healthy|green|nominal|ok))?$/i,
+  /^(confirmed|acknowledged|noted)(?:[\s.!:,-]*)$/i,
+  /^(ready|waiting|monitoring)(?:[\s.!:,-]*)$/i,
+  /^no (updates?|changes?|issues?)(?:[\s.!:,-]*)$/i,
+  /^(heartbeat|pulse)(?:[\s.!:,-]*)$/i,
+];
+
+const ACTION_VERBS = /\b(?:add|analyze|audit|build|check|clean|commit|create|debug|deploy|draft|fix|implement|install|investigate|log|migrate|monitor|patch|publish|record|refactor|remove|repair|restart|review|run|ship|sync|test|triage|update|verify|write)\b/i;
+
+export function classifyDecisionQuality(action: string): {
+  quality: DecisionQuality | null;
+  filtered: boolean;
+  reason?: 'trivial_action';
+} {
+  const normalized = action.trim().replace(/\s+/g, ' ');
+  if (!normalized) {
+    return { quality: 'trivial', filtered: true, reason: 'trivial_action' };
+  }
+
+  if (TRIVIAL_ACTIONS.some((pattern) => pattern.test(normalized))) {
+    return { quality: 'trivial', filtered: true, reason: 'trivial_action' };
+  }
+
+  if (normalized.length < 15 && !ACTION_VERBS.test(normalized)) {
+    return { quality: 'trivial', filtered: true, reason: 'trivial_action' };
+  }
+
+  return { quality: null, filtered: false };
 }
 
 /**

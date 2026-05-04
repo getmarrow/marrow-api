@@ -4,7 +4,7 @@
  * Tier 7: Vector embedding on insert
  * Tier 13: Audit logging on mutations
  */
-import { Decision } from '../types';
+import { Decision, DecisionQuality } from '../types';
 import { uuid, now } from '../utils/crypto';
 import { compress, decompress } from '../utils/compression';
 import { computeEmbedding } from '../utils/vectors';
@@ -59,7 +59,9 @@ export class DecisionService {
    * Generate and store a semantic embedding for a decision.
    * Fire-and-forget — embedding failure must never block decision creation.
    */
-  private async storeEmbedding(decisionId: string, decisionType: string, outcome: string): Promise<void> {
+  private async storeEmbedding(decisionId: string, decisionType: string, outcome: string, quality: DecisionQuality | null = null): Promise<void> {
+    if (quality === 'trivial') return;
+
     try {
       const sanitizedOutcome = this.pii.stripString(outcome);
       const embedding = await computeEmbedding(this.ai, `${decisionType}: ${sanitizedOutcome}`);
@@ -107,7 +109,8 @@ export class DecisionService {
     tier: string = 'free',
     orgPiiStripTeam: boolean = false,
     sessionId: string | null = null,
-    agentId: string | null = null
+    agentId: string | null = null,
+    quality: DecisionQuality | null = null
   ): Promise<Decision> {
     const id = uuid();
     const ts = now();
@@ -144,20 +147,20 @@ export class DecisionService {
 
     await this.db
       .prepare(`
-        INSERT INTO decisions (id, account_id, decision_type, context, outcome, confidence, visibility, context_compressed, context_raw, context_hive, impact_score, reuse_count, session_id, agent_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
+        INSERT INTO decisions (id, account_id, decision_type, context, outcome, confidence, quality, visibility, context_compressed, context_raw, context_hive, impact_score, reuse_count, session_id, agent_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
       `)
-      .bind(id, accountId, decisionType, contextStr, outcome, confidence, effectiveVisibility, isCompressed ? 1 : 0, contextRaw, contextHive, sessionId, agentId, ts, ts)
+      .bind(id, accountId, decisionType, contextStr, outcome, confidence, quality, effectiveVisibility, isCompressed ? 1 : 0, contextRaw, contextHive, sessionId, agentId, ts, ts)
       .run();
 
     // Tier 7: semantic vector embedding (async, fire-and-forget)
-    this.storeEmbedding(id, decisionType, outcome).catch(() => {});
+    this.storeEmbedding(id, decisionType, outcome, quality).catch(() => {});
 
     // Tier 13: audit
     await this.audit.log(accountId, 'CREATE', 'decision', id, { decision_type: decisionType, confidence, visibility: effectiveVisibility });
 
     return {
-      id, account_id: accountId, decision_type: decisionType, context, outcome, confidence,
+      id, account_id: accountId, decision_type: decisionType, context, outcome, confidence, quality,
       visibility: effectiveVisibility, context_compressed: isCompressed,
       context_hive: contextHive ? JSON.parse(contextHive) : null,
       impact_score: 0, reuse_count: 0,
@@ -229,6 +232,7 @@ export class DecisionService {
       context: ctx,
       outcome: String(row.outcome),
       confidence: Number(row.confidence),
+      quality: row.quality ? String(row.quality) as DecisionQuality : null,
       visibility: String(row.visibility) as Decision['visibility'],
       context_compressed: Boolean(row.context_compressed),
       context_hive: row.context_hive ? JSON.parse(String(row.context_hive)) : null,

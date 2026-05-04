@@ -614,6 +614,21 @@ function evalCondition(row: Record<string, unknown>, cond: string, params: unkno
     return true;
   }
 
+  // Handle != ?
+  const neqParamMatch = trimCond.match(/(\w+(?:\.\w+)?)\s*(?:!=|<>)\s*\?/);
+  if (neqParamMatch) {
+    const col = neqParamMatch[1].split('.').pop()!;
+    const val = params[startIdx];
+    return row[col] != val && String(row[col]) !== String(val);
+  }
+
+  // Handle != 'value'
+  const neqStrMatch = trimCond.match(/(\w+(?:\.\w+)?)\s*(?:!=|<>)\s*'([^']+)'/);
+  if (neqStrMatch) {
+    const col = neqStrMatch[1].split('.').pop()!;
+    return String(row[col]) !== neqStrMatch[2];
+  }
+
   // Handle = ?
   const eqMatch = trimCond.match(/(\w+(?:\.\w+)?)\s*=\s*\?/);
   if (eqMatch) {

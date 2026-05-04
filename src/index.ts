@@ -46,7 +46,7 @@ import type { ImprovementResult } from './services/baseline.service';
 import { BaselineService } from './services/baseline.service';
 import { checkRateLimit } from './utils/rate-limit';
 import { PatternEngine } from './pattern-engine';
-import { autoLogDecision } from './middleware/auto-logger';
+import { autoLogDecision, classifyDecisionQuality } from './middleware/auto-logger';
 
 // ============= Helpers =============
 
@@ -168,6 +168,7 @@ async function requireAuth(request: IRequest, env: Env): Promise<RequestContext 
     const ctx = await authService.validateToken(authHeader, {
       ip: request.headers.get('cf-connecting-ip'),
       userAgent: request.headers.get('user-agent'),
+      ctx: env.EXECUTION_CONTEXT,
     });
     if (!ctx) {
       return err('Unauthorized', 401);
@@ -2332,6 +2333,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
     }
 
     const action = String(body.action);
+    const actionQuality = classifyDecisionQuality(action);
     const type = String(body.type || 'general');
     if (type.length > 50) return err('type max 50 characters', 400);
     let visibility = body.visibility ? String(body.visibility) as 'private' | 'shared' | 'hive' | 'team' : undefined;
@@ -2406,6 +2408,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
         visibility,
         session_id: reqSessionId,
         agent_id: reqAgentId,
+        quality: actionQuality.quality,
       },
       ctx.account_id,
       ctx.tier,
@@ -2420,7 +2423,9 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
 
     // ── STEP 3: Pattern Engine — clustering, failure detection, workflow gaps ──
     const patternEngine = new PatternEngine(env.DB, env.AI);
-    const engineResult = await patternEngine.analyze(ctx.account_id, action, type, result.decision_id).catch(() => ({ insights: [], clusterId: null }));
+    const engineResult = actionQuality.filtered
+      ? { insights: [], clusterId: null }
+      : await patternEngine.analyze(ctx.account_id, action, type, result.decision_id).catch(() => ({ insights: [], clusterId: null }));
 
     // T20: Stream URL for live updates
     const streamUrl = `/v1/stream?decision_type=${encodeURIComponent(type)}&format=sse`;
@@ -2551,6 +2556,12 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
       },
       stream_url: streamUrl,
     };
+
+    if (actionQuality.filtered) {
+      response.filtered = true;
+      response.reason = actionQuality.reason;
+      response.quality = 'trivial';
+    }
 
     // ── Feature 7: Smart onboarding hint ──
     try {
@@ -5183,7 +5194,8 @@ router.all('*', (request: IRequest) => err('Route not found', 404, { path: getUr
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
-      const response = await router.handle(request, env, ctx);
+      const runtimeEnv = { ...env, EXECUTION_CONTEXT: ctx };
+      const response = await router.handle(request, runtimeEnv, ctx);
       const res = response || err('Not found', 404);
       // Inject CORS headers on all responses
       const origin = request.headers.get('Origin') || '';

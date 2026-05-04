@@ -23,7 +23,7 @@ import { MarketplaceService } from './services/marketplace.service';
 import { AuditService } from './services/audit.service';
 import { PatternRecognitionService } from './services/pattern-recognition.service';
 import { OrgService } from './services/org.service';
-import { WorkflowWarning, LearnedTemplate } from './types';
+import { WorkflowWarning, LearnedTemplate, DecisionQuality } from './types';
 import { D1Database } from '@cloudflare/workers-types';
 
 export interface WorkflowBeforeInput {
@@ -33,6 +33,7 @@ export interface WorkflowBeforeInput {
   visibility?: 'private' | 'shared' | 'hive' | 'team';
   session_id?: string | null;
   agent_id?: string | null;
+  quality?: DecisionQuality | null;
 }
 
 export interface WorkflowBeforeOutput {
@@ -114,9 +115,29 @@ export class WorkflowService {
         tier,
         orgPiiStripTeam,
         input.session_id || null,
-        input.agent_id || null
+        input.agent_id || null,
+        input.quality || null
       );
       const decision_id = decision.id;
+
+      if (input.quality === 'trivial') {
+        return {
+          decision_id,
+          similar_decisions: [],
+          risk_score: null,
+          bootstrap_templates: [],
+          patterns: [],
+          shared_context: [],
+          current_success_rate: 0.75,
+          priority_score: 0,
+          causal_context: null,
+          warnings: [{
+            severity: 'LOW',
+            message: 'Trivial action logged for audit only and excluded from pattern training. Send a more specific action next time.',
+            pattern: 'trivial_action',
+          }],
+        };
+      }
 
       // Parallel calls to other tiers (don't block on each other)
       const [
