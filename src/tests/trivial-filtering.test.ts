@@ -26,13 +26,24 @@ describe('Trivial action filtering', () => {
     });
   });
 
-  it('flags short non-actionable text but keeps short verb-led actions', () => {
+  it('flags short non-actionable text but keeps meaningful verb-led actions', () => {
     expect(classifyDecisionQuality('all good')).toEqual({
       quality: 'trivial',
       filtered: true,
       reason: 'trivial_action',
     });
-    expect(classifyDecisionQuality('fix auth')).toEqual({
+    expect(classifyDecisionQuality('implement auth fix for prod')).toEqual({
+      quality: null,
+      filtered: false,
+    });
+  });
+
+  it('does not false-positive longer legitimate actions that start with status words', () => {
+    expect(classifyDecisionQuality('session check websocket retries after deploy')).toEqual({
+      quality: null,
+      filtered: false,
+    });
+    expect(classifyDecisionQuality('no issues reproducing the invoice race after patch')).toEqual({
       quality: null,
       filtered: false,
     });

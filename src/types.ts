@@ -10,6 +10,7 @@ export interface Env {
   INTERNAL_KEY?: string;
   RESEND_API_KEY_PRIMARY?: string;
   EXECUTION_CONTEXT?: ExecutionContext;
+  MARROW_STRICT_QUALITY?: string;
 }
 
 export interface Org {

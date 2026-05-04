@@ -4,6 +4,7 @@
  */
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
+import { clearDedupCache } from '../middleware/dedup-cache';
 
 export const REAL_API_KEY = process.env.TEST_API_KEY || 'mrw_empirebuu_test_real_api_key_abcdefghijklmnopqrstuvwxyz1234567890';
 export const REAL_ACCOUNT_ID = 'empirebuu';
@@ -95,6 +96,7 @@ class InMemoryDB {
  * This implements the D1 prepare/bind/run/first/all interface
  */
 export function createMockD1(): D1Database {
+  clearDedupCache();
   const db = new InMemoryDB();
 
   // Seed the real API key

@@ -1,4 +1,4 @@
-import type { DecisionQuality } from '../types';
+import { classifyDecisionQuality, validateActionQuality } from './action-validator';
 
 /**
  * Auto-Logging Middleware
@@ -20,38 +20,7 @@ interface AutoLogEntry {
   sessionId?: string | null;
 }
 
-export const TRIVIAL_ACTIONS = [
-  /^session (stable|active|check|end|final|summary)(?:[\s.!:,-]*)$/i,
-  /^standing ?by(?:[\s.!:,-]*)$/i,
-  /^all systems(?:[\s.!:,-]*(?:healthy|green|nominal|ok))?$/i,
-  /^(confirmed|acknowledged|noted)(?:[\s.!:,-]*)$/i,
-  /^(ready|waiting|monitoring)(?:[\s.!:,-]*)$/i,
-  /^no (updates?|changes?|issues?)(?:[\s.!:,-]*)$/i,
-  /^(heartbeat|pulse)(?:[\s.!:,-]*)$/i,
-];
-
-const ACTION_VERBS = /\b(?:add|analyze|audit|build|check|clean|commit|create|debug|deploy|draft|fix|implement|install|investigate|log|migrate|monitor|patch|publish|record|refactor|remove|repair|restart|review|run|ship|sync|test|triage|update|verify|write)\b/i;
-
-export function classifyDecisionQuality(action: string): {
-  quality: DecisionQuality | null;
-  filtered: boolean;
-  reason?: 'trivial_action';
-} {
-  const normalized = action.trim().replace(/\s+/g, ' ');
-  if (!normalized) {
-    return { quality: 'trivial', filtered: true, reason: 'trivial_action' };
-  }
-
-  if (TRIVIAL_ACTIONS.some((pattern) => pattern.test(normalized))) {
-    return { quality: 'trivial', filtered: true, reason: 'trivial_action' };
-  }
-
-  if (normalized.length < 15 && !ACTION_VERBS.test(normalized)) {
-    return { quality: 'trivial', filtered: true, reason: 'trivial_action' };
-  }
-
-  return { quality: null, filtered: false };
-}
+export { classifyDecisionQuality };
 
 /**
  * Auto-log an API call as a decision — non-blocking, fire-and-forget.
@@ -59,15 +28,16 @@ export function classifyDecisionQuality(action: string): {
  */
 export async function autoLogDecision(entry: AutoLogEntry): Promise<void> {
   try {
+    const candidateAction = extractActionCandidate(entry.method, entry.endpoint, entry.body);
+    if (!validateActionQuality(candidateAction).valid) {
+      return;
+    }
+
     const now = new Date().toISOString();
     const id = crypto.randomUUID();
     const decisionType = deriveDecisionType(entry.method, entry.endpoint);
 
-    const context = {
-      method: entry.method,
-      endpoint: entry.endpoint,
-      body: entry.body ? summarizeBody(entry.body) : undefined,
-    };
+    const context = buildAutoLogContext(entry);
 
     // If auth passed, request was valid — log as success (200). Actual status tracked in analytics.
     const statusCode = entry.statusCode > 0 ? entry.statusCode : 200;
@@ -90,7 +60,7 @@ export async function autoLogDecision(entry: AutoLogEntry): Promise<void> {
         outcome,
         confidence,
         'hive',
-        0,
+        1,
         null,
         entry.sessionId || null,
         now,
@@ -111,18 +81,51 @@ function deriveDecisionType(method: string, endpoint: string): string {
   return `${method.toLowerCase()}_${path || 'root'}`;
 }
 
+function extractActionCandidate(method: string, endpoint: string, body: unknown): string {
+  if (body && typeof body === 'object') {
+    const obj = body as Record<string, unknown>;
+    const candidates = [obj.action, obj.description, obj.query, obj.name]
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (candidates.length > 0) return candidates[0];
+  }
+
+  return `${method.toUpperCase()} ${endpoint}`;
+}
+
 /**
  * Summarize request body for logging (strip sensitive data, keep it short).
  */
-function summarizeBody(body: unknown): Record<string, unknown> {
-  if (!body || typeof body !== 'object') return { raw: String(body) };
-  const summary: Record<string, unknown> = {};
+function buildAutoLogContext(entry: AutoLogEntry): Record<string, unknown> {
+  const context: Record<string, unknown> = {
+    method: entry.method,
+    endpoint: entry.endpoint,
+    statusCode: entry.statusCode > 0 ? entry.statusCode : 200,
+  };
+
+  const action = extractMeaningfulBodyAction(entry.body);
+  if (action) {
+    context.action = action;
+  }
+
+  return context;
+}
+
+function extractMeaningfulBodyAction(body: unknown): string | undefined {
+  if (!body || typeof body !== 'object') return undefined;
+
   const obj = body as Record<string, unknown>;
-  const safeFields = ['action', 'type', 'query', 'name', 'description', 'step', 'workflow_id', 'agent_id'];
-  for (const field of safeFields) {
-    if (obj[field] !== undefined) {
-      summary[field] = typeof obj[field] === 'string' ? String(obj[field]).slice(0, 200) : obj[field];
+  const candidates = [obj.action, obj.description, obj.query, obj.name]
+    .filter((value): value is string => typeof value === 'string')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  for (const candidate of candidates) {
+    if (validateActionQuality(candidate).valid) {
+      return candidate.slice(0, 200);
     }
   }
-  return Object.keys(summary).length > 0 ? summary : { body_type: typeof body };
+
+  return undefined;
 }

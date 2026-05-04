@@ -47,6 +47,8 @@ import { BaselineService } from './services/baseline.service';
 import { checkRateLimit } from './utils/rate-limit';
 import { PatternEngine } from './pattern-engine';
 import { autoLogDecision, classifyDecisionQuality } from './middleware/auto-logger';
+import { actionQualityWarning, isStrictQualityMode, validateActionQuality } from './middleware/action-validator';
+import { getDedupedResponse, storeDedupedResponse } from './middleware/dedup-cache';
 
 // ============= Helpers =============
 
@@ -83,6 +85,17 @@ function err(error: string, status = 500, details?: Record<string, string>): Res
 
 function getUrl(request: IRequest): URL {
   return new URL(request.url);
+}
+
+function actionQualityError(result: Exclude<ReturnType<typeof validateActionQuality>, { valid: true }>): Response {
+  return new Response(JSON.stringify({
+    error: result.code,
+    message: result.message,
+    ...(result.hint ? { hint: result.hint } : {}),
+  }), {
+    status: 400,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
 function hasAnyScope(ctx: RequestContext, scopes: ApiKeyScope[]): boolean {
@@ -2316,27 +2329,24 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
       if (agentCheck) reqAgentId = agentCheck.id;
     }
 
-    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
-    autoLogDecision({
-      db: env.DB,
-      accountId: ctx.account_id,
-      method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
-      statusCode: 200,
-      tier: ctx.tier,
-      sessionId: reqSessionId,
-    }).catch(() => {});
-
     const body = await request.json() as Record<string, unknown>;
     if (!body.action || typeof body.action !== 'string' || body.action.length > 1000) {
       return err('action is required and must be under 1000 characters', 400);
     }
 
     const action = String(body.action);
-    const actionQuality = classifyDecisionQuality(action);
     const type = String(body.type || 'general');
     if (type.length > 50) return err('type max 50 characters', 400);
     let visibility = body.visibility ? String(body.visibility) as 'private' | 'shared' | 'hive' | 'team' : undefined;
+
+    const qualityValidation = validateActionQuality(action);
+    const strictQualityMode = isStrictQualityMode(env, ctx);
+    if (!qualityValidation.valid && strictQualityMode) {
+      return actionQualityError(qualityValidation);
+    }
+    const actionQuality = qualityValidation.valid
+      ? classifyDecisionQuality(action)
+      : { quality: 'trivial' as const, filtered: true, reason: 'trivial_action' as const };
 
     // Gap 4: Detect if PII was stripped
     const piiService = new PiiService();
@@ -2348,7 +2358,35 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
     const previousSuccess = body.previous_success !== undefined ? Boolean(body.previous_success) : null;
     const previousOutcome = body.previous_outcome ? String(body.previous_outcome) : null;
     if (previousOutcome && previousOutcome.length > 2000) return err('previous_outcome max 2000 characters', 400);
+    if (previousOutcome) {
+      const previousOutcomeQuality = validateActionQuality(previousOutcome);
+      if (!previousOutcomeQuality.valid && strictQualityMode) {
+        return actionQualityError(previousOutcomeQuality);
+      }
+    }
     const previousCausedBy = body.previous_caused_by ? String(body.previous_caused_by) : null;
+
+    const dedupActorKey = `${ctx.account_id}:${reqAgentId || reqSessionId || ctx.api_key_id || 'account'}`;
+    const dedupFingerprint = `${type}:${action}`;
+    const canDedupThink = !previousDecisionId && previousSuccess === null && previousOutcome === null && !previousCausedBy;
+    if (canDedupThink) {
+      const cached = getDedupedResponse<Record<string, unknown>>('think', dedupActorKey, dedupFingerprint);
+      if (cached) {
+        return json({ ...cached, deduped: true });
+      }
+    }
+
+    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
+    autoLogDecision({
+      db: env.DB,
+      accountId: ctx.account_id,
+      method: request.method,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      statusCode: 200,
+      tier: ctx.tier,
+      sessionId: reqSessionId,
+      body,
+    }).catch(() => {});
 
     const workflow = new WorkflowService(env.DB, env.AI);
     let previousCommitted = false;
@@ -2526,10 +2564,14 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
       }
     }
 
+    const responseWarnings = (!qualityValidation.valid && !strictQualityMode)
+      ? [actionQualityWarning(qualityValidation)]
+      : (result.warnings || []);
+
     const response: Record<string, unknown> = {
       decision_id: result.decision_id,
       sanitized,
-      warnings: result.warnings || [],
+      warnings: responseWarnings,
       intelligence: {
         similar: (result.similar_decisions || []).map((d: Record<string, unknown>) => ({
           outcome: d.outcome || d.description || '',
@@ -2709,6 +2751,10 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
       ? { latest: MARROW_SDK_LATEST, current: clientSdkVersion, message: `Update available: npm install @getmarrow/sdk@${MARROW_SDK_LATEST}` }
       : undefined;
     if (sdkUpdateAvailable) response.sdk_update = sdkUpdateAvailable;
+
+    if (canDedupThink) {
+      storeDedupedResponse('think', dedupActorKey, dedupFingerprint, response);
+    }
 
     // Phase 3: Auto-learn templates (fire-and-forget with 15-min throttle)
     checkRateLimit(env.DB, 'learn_templates_throttle', 1, 15 * 60 * 1000).then(allowed => {
@@ -2890,17 +2936,6 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
       if (agentCheck) commitAgentId = agentCheck.id;
     }
 
-    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
-    autoLogDecision({
-      db: env.DB,
-      accountId: ctx.account_id,
-      method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
-      statusCode: 200,
-      tier: ctx.tier,
-      sessionId: commitSessionId,
-    }).catch(() => {});
-
     const body = await request.json() as Record<string, unknown>;
     if (!body.decision_id || typeof body.decision_id !== 'string') {
       return err('decision_id is required', 400);
@@ -2911,6 +2946,31 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
     if (!body.outcome || typeof body.outcome !== 'string') {
       return err('outcome is required', 400);
     }
+
+    const outcomeQuality = validateActionQuality(String(body.outcome));
+    const strictQualityMode = isStrictQualityMode(env, ctx);
+    if (!outcomeQuality.valid && strictQualityMode) {
+      return actionQualityError(outcomeQuality);
+    }
+
+    const commitDedupActorKey = `${ctx.account_id}:${commitAgentId || commitSessionId || ctx.api_key_id || 'account'}`;
+    const commitDedupFingerprint = `${String(body.decision_id)}:${Boolean(body.success)}:${String(body.outcome)}`;
+    const cachedCommit = getDedupedResponse<Record<string, unknown>>('commit', commitDedupActorKey, commitDedupFingerprint);
+    if (cachedCommit) {
+      return json({ ...cachedCommit, decision_id: String(body.decision_id), deduped: true });
+    }
+
+    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
+    autoLogDecision({
+      db: env.DB,
+      accountId: ctx.account_id,
+      method: request.method,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      statusCode: 200,
+      tier: ctx.tier,
+      sessionId: commitSessionId,
+      body,
+    }).catch(() => {});
 
     // Route to the same workflow.after logic (backward compat — commit_only mode)
     const workflow = new WorkflowService(env.DB, env.AI);
@@ -3047,14 +3107,22 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
       }
     }).catch(() => {});
 
-    return json({
+    const response: Record<string, unknown> = {
       committed: true,
       success_rate: result.new_success_rate ?? 0.75,
       insight: null,
       narrative,
       risk_score,
       marrow_contributed,
-    });
+    };
+
+    if (!outcomeQuality.valid && !strictQualityMode) {
+      response.warnings = [actionQualityWarning(outcomeQuality)];
+    }
+
+    storeDedupedResponse('commit', commitDedupActorKey, commitDedupFingerprint, response);
+
+    return json(response);
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : 'Unknown error';
     console.error('POST /v1/agent/commit error:', msg);
@@ -3069,6 +3137,17 @@ router.post('/v1/workflow/before', async (request: IRequest, env: Env) => {
     const authResult = await requireAuth(request, env);
     if (authResult instanceof Response) return authResult;
     const ctx = authResult as RequestContext;
+    const body = (await request.json()) as Record<string, unknown>;
+    if (!body.decision_type || !body.action || !body.description) {
+      return err('Missing required fields: decision_type, action, description', 400);
+    }
+
+    const qualityResult = validateActionQuality(String(body.description || body.action || ''));
+    const strictQualityMode = isStrictQualityMode(env, ctx);
+    if (!qualityResult.valid && strictQualityMode) {
+      return actionQualityError(qualityResult);
+    }
+
     // Auto-log this API call as a decision (non-blocking, fire-and-forget)
     autoLogDecision({
       db: env.DB,
@@ -3076,14 +3155,9 @@ router.post('/v1/workflow/before', async (request: IRequest, env: Env) => {
       method: request.method,
       endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
-
       tier: ctx.tier,
+      body,
     }).catch(() => {});
-
-    const body = (await request.json()) as Record<string, unknown>;
-    if (!body.decision_type || !body.action || !body.description) {
-      return err('Missing required fields: decision_type, action, description', 400);
-    }
 
     const workflow = new WorkflowService(env.DB, env.AI);
     const wfSessionId = request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null;
@@ -3098,7 +3172,12 @@ router.post('/v1/workflow/before', async (request: IRequest, env: Env) => {
       ctx.tier
     );
 
-    return json(result, 200);
+    const response: Record<string, unknown> = { ...result };
+    if (!qualityResult.valid && !strictQualityMode) {
+      response.warnings = [...((result.warnings || []) as Record<string, unknown>[]), actionQualityWarning(qualityResult)];
+    }
+
+    return json(response, 200);
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : 'Unknown error';
     console.error('POST /v1/workflow/before error:', msg);
@@ -3111,6 +3190,17 @@ router.post('/v1/workflow/after', async (request: IRequest, env: Env) => {
     const authResult = await requireAuth(request, env);
     if (authResult instanceof Response) return authResult;
     const ctx = authResult as RequestContext;
+    const body = (await request.json()) as Record<string, unknown>;
+    if (!body.decision_id || body.success === undefined || !body.outcome) {
+      return err('Missing required fields: decision_id, success, outcome', 400);
+    }
+
+    const qualityResult = validateActionQuality(String(body.outcome || ''));
+    const strictQualityMode = isStrictQualityMode(env, ctx);
+    if (!qualityResult.valid && strictQualityMode) {
+      return actionQualityError(qualityResult);
+    }
+
     // Auto-log this API call as a decision (non-blocking, fire-and-forget)
     autoLogDecision({
       db: env.DB,
@@ -3118,14 +3208,9 @@ router.post('/v1/workflow/after', async (request: IRequest, env: Env) => {
       method: request.method,
       endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
-
       tier: ctx.tier,
+      body,
     }).catch(() => {});
-
-    const body = (await request.json()) as Record<string, unknown>;
-    if (!body.decision_id || body.success === undefined || !body.outcome) {
-      return err('Missing required fields: decision_id, success, outcome', 400);
-    }
 
     const workflow = new WorkflowService(env.DB, env.AI);
     const workflowAfterAgentId = request.headers.get('X-Marrow-Agent-Id');
@@ -3140,7 +3225,12 @@ router.post('/v1/workflow/after', async (request: IRequest, env: Env) => {
       ctx.account_id
     );
 
-    return json(result, 200);
+    const response: Record<string, unknown> = { ...result };
+    if (!qualityResult.valid && !strictQualityMode) {
+      response.warnings = [actionQualityWarning(qualityResult)];
+    }
+
+    return json(response, 200);
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : 'Unknown error';
     console.error('POST /v1/workflow/after error:', msg);
