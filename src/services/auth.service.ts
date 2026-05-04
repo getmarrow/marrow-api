@@ -167,11 +167,12 @@ export class AuthService {
       return null;
     }
 
-    this.db
+    // Update usage stats (awaited — ~1ms, prevents Workers runtime cancellation)
+    await this.db
       .prepare('UPDATE api_keys SET last_used_at = ?, last_used_ip = ?, usage_count = COALESCE(usage_count, 0) + 1 WHERE id = ?')
       .bind(now(), meta.ip || null, result.id)
       .run()
-      .catch(() => {});
+      .catch((e: unknown) => { console.error('[auth] usage_count update failed', (e as Error)?.message || e); });
 
     await this.recordKeyAudit(result.account_id, result.id, 'auth_success', 'system', {
       ...meta,
