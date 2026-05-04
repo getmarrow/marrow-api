@@ -5,12 +5,19 @@ import { ActionableInsight, Cluster } from './types';
 import { uuid, now } from './utils/crypto';
 import { computeEmbedding, cosineSimilarity } from './utils/vectors';
 import { DEFAULT_SEQUENCES, matchesTrigger, matchesFollowup } from './workflow-sequences';
+import { PiiService } from './services/pii.service';
 
 const CLUSTER_SIMILARITY_THRESHOLD = 0.75;
 const FAILURE_THRESHOLD = 3;
 
 export class PatternEngine {
-  constructor(private db: D1Database) {}
+  private ai: any;
+  private pii: PiiService;
+
+  constructor(private db: D1Database, ai?: any) {
+    this.ai = ai;
+    this.pii = new PiiService();
+  }
 
   /**
    * Main entry: analyze an action and return actionable insights
@@ -50,9 +57,9 @@ export class PatternEngine {
     decisionType: string,
     decisionId: string
   ): Promise<string | null> {
-    // Generate embedding from action text
-    const tokens = this.tokenize(action);
-    const embedding = computeEmbedding(decisionType, tokens);
+    // Generate embedding from action + decision type (semantic)
+    const safeAction = this.pii.stripString(action);
+    const embedding = await computeEmbedding(this.ai, `${decisionType}: ${safeAction}`);
 
     // Get existing clusters for this account
     const clusters = await this.db
@@ -227,18 +234,6 @@ export class PatternEngine {
         }
       }
     }
-  }
-
-  /**
-   * Tokenize action text for embedding
-   */
-  private tokenize(text: string): string[] {
-    return text
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, ' ')
-      .split(/\s+/)
-      .filter(t => t.length > 2)
-      .slice(0, 20);
   }
 
   /**

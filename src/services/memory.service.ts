@@ -6,6 +6,7 @@ type MemoryAuditAction = MemoryAuditEntry['action'];
 type MemoryAccessOptions = {
   includeDeleted?: boolean;
   accessAgentId?: string;
+  accessAgentIds?: string[];
 };
 
 type MemoryImportItem = {
@@ -57,6 +58,7 @@ interface ListFilters {
   includeDeleted?: boolean;
   limit?: number;
   agentId?: string;
+  agentIds?: string[];
 }
 
 interface RetrieveFilters {
@@ -69,6 +71,7 @@ interface RetrieveFilters {
   status?: MemoryStatus;
   shared?: boolean;
   agentId?: string;
+  agentIds?: string[];
 }
 
 const VALID_STATUSES = new Set<MemoryStatus>(['active', 'outdated', 'superseded', 'deleted']);
@@ -78,21 +81,23 @@ export class MemoryService {
 
   async listMemories(accountId: string, filters: ListFilters = {}): Promise<MemoryView[]> {
     const limit = this.clampLimit(filters.limit, 20, 100);
+    const agentIds = this.resolveAgentIds(filters.agentIds, filters.agentId);
     const { sql, binds } = this.buildMemoryQuery(accountId, {
       status: filters.status,
       query: filters.query,
       includeDeleted: filters.includeDeleted,
       limit,
-      agentId: filters.agentId,
+      agentId: agentIds.length === 1 ? agentIds[0] : undefined,
       defaultToActiveOnly: false,
     });
 
     const rows = await this.db.prepare(sql).bind(...binds).all<MemoryRow>();
-    return (rows.results || []).map((row) => this.toView(row));
+    const filteredRows = await this.filterRowsByAgentIds(rows.results || [], accountId, agentIds);
+    return filteredRows.map((row) => this.toView(row));
   }
 
   async getMemory(id: string, accountId: string, options: MemoryAccessOptions = {}): Promise<MemoryView | null> {
-    const row = await this.getAccessibleRow(id, accountId, options.accessAgentId);
+    const row = await this.getAccessibleRow(id, accountId, this.resolveAgentIds(options.accessAgentIds, options.accessAgentId));
     if (!row) return null;
     if (!options.includeDeleted && row.status === 'deleted') return null;
     return this.toView(row);
@@ -104,7 +109,8 @@ export class MemoryService {
     patch: { text?: string; source?: string | null; tags?: string[]; actor?: string; note?: string },
     options: MemoryAccessOptions = {}
   ): Promise<MemoryView | null> {
-    const row = await this.getAccessibleRow(id, accountId, options.accessAgentId);
+    const resolvedAgentIds = this.resolveAgentIds(options.accessAgentIds, options.accessAgentId);
+    const row = await this.getAccessibleRow(id, accountId, resolvedAgentIds);
     if (!row || row.status === 'deleted') return null;
 
     const ts = now();
@@ -129,7 +135,7 @@ export class MemoryService {
       .bind(nextText, nextSource, JSON.stringify(nextTags), JSON.stringify(nextAudit), ts, id, accountId)
       .run();
 
-    return this.getMemory(id, accountId, { includeDeleted: true, accessAgentId: options.accessAgentId });
+    return this.getMemory(id, accountId, { includeDeleted: true, accessAgentIds: resolvedAgentIds });
   }
 
   async deleteMemory(
@@ -138,7 +144,7 @@ export class MemoryService {
     meta: { actor?: string; note?: string } = {},
     options: MemoryAccessOptions = {}
   ): Promise<MemoryView | null> {
-    const row = await this.getAccessibleRow(id, accountId, options.accessAgentId);
+    const row = await this.getAccessibleRow(id, accountId, this.resolveAgentIds(options.accessAgentIds, options.accessAgentId));
     if (!row) return null;
     if (row.status === 'deleted') return this.toView(row);
 
@@ -175,8 +181,9 @@ export class MemoryService {
     meta: { actor?: string; note?: string } = {},
     options: MemoryAccessOptions = {}
   ): Promise<MemoryView | null> {
-    const row = await this.getAccessibleRow(id, accountId, options.accessAgentId);
-    if (!row || row.status === 'deleted') return null;
+    const resolvedAgentIds = this.resolveAgentIds(options.accessAgentIds, options.accessAgentId);
+    const row = await this.getAccessibleRow(id, accountId, resolvedAgentIds);
+    if (!row || row.status === 'deleted' || row.status === 'superseded') return null;
     if (row.status === 'outdated') return this.toView(row);
 
     const ts = now();
@@ -191,7 +198,7 @@ export class MemoryService {
       .bind('outdated', JSON.stringify(audit), ts, id, accountId)
       .run();
 
-    return this.getMemory(id, accountId, { includeDeleted: true, accessAgentId: options.accessAgentId });
+    return this.getMemory(id, accountId, { includeDeleted: true, accessAgentIds: resolvedAgentIds });
   }
 
   async supersedeMemory(
@@ -200,8 +207,9 @@ export class MemoryService {
     replacement: { text: string; source?: string; tags?: string[]; actor?: string; note?: string },
     options: MemoryAccessOptions = {}
   ): Promise<{ old: MemoryView; replacement: MemoryView } | null> {
-    const row = await this.getAccessibleRow(id, accountId, options.accessAgentId);
-    if (!row || row.status === 'deleted') return null;
+    const resolvedAgentIds = this.resolveAgentIds(options.accessAgentIds, options.accessAgentId);
+    const row = await this.getAccessibleRow(id, accountId, resolvedAgentIds);
+    if (!row || row.status === 'deleted' || row.status === 'superseded') return null;
 
     const ts = now();
     const replacementId = uuid();
@@ -228,35 +236,38 @@ export class MemoryService {
       supersedes: id,
     });
 
-    await this.db
-      .prepare(
-        'INSERT INTO memories (id, account_id, text, source, tags, status, supersedes, superseded_by, deleted_at, audit, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-      )
-      .bind(
-        replacementId,
-        accountId,
-        replacementText,
-        replacementSource,
-        JSON.stringify(replacementTags),
-        'active',
-        id,
-        null,
-        null,
-        JSON.stringify(replacementAudit),
-        ts,
-        ts
-      )
-      .run();
+    // Atomic supersede: INSERT replacement + UPDATE original in one batch.
+    // Previously two separate awaits — a crash between them left an active
+    // replacement with the original still in pre-supersede state (dangling
+    // duplicate). db.batch makes it all-or-nothing.
+    await this.db.batch([
+      this.db
+        .prepare(
+          'INSERT INTO memories (id, account_id, text, source, tags, status, supersedes, superseded_by, deleted_at, audit, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        )
+        .bind(
+          replacementId,
+          accountId,
+          replacementText,
+          replacementSource,
+          JSON.stringify(replacementTags),
+          'active',
+          id,
+          null,
+          null,
+          JSON.stringify(replacementAudit),
+          ts,
+          ts
+        ),
+      this.db
+        .prepare(
+          'UPDATE memories SET status = ?, superseded_by = ?, audit = ?, updated_at = ? WHERE id = ? AND account_id = ?'
+        )
+        .bind('superseded', replacementId, JSON.stringify(oldAudit), ts, id, accountId),
+    ]);
 
-    await this.db
-      .prepare(
-        'UPDATE memories SET status = ?, superseded_by = ?, audit = ?, updated_at = ? WHERE id = ? AND account_id = ?'
-      )
-      .bind('superseded', replacementId, JSON.stringify(oldAudit), ts, id, accountId)
-      .run();
-
-    const oldMemory = await this.getMemory(id, accountId, { includeDeleted: true, accessAgentId: options.accessAgentId });
-    const newMemory = await this.getMemory(replacementId, accountId, { includeDeleted: true, accessAgentId: options.accessAgentId });
+    const oldMemory = await this.getMemory(id, accountId, { includeDeleted: true, accessAgentIds: resolvedAgentIds });
+    const newMemory = await this.getMemory(replacementId, accountId, { includeDeleted: true, accessAgentIds: resolvedAgentIds });
     if (!oldMemory || !newMemory) throw new Error('Failed to load superseded memory state');
 
     return { old: oldMemory, replacement: newMemory };
@@ -269,7 +280,8 @@ export class MemoryService {
     actor?: string,
     options: MemoryAccessOptions = {}
   ): Promise<MemoryView | null> {
-    const row = await this.getAccessibleRow(id, accountId, options.accessAgentId);
+    const resolvedAgentIds = this.resolveAgentIds(options.accessAgentIds, options.accessAgentId);
+    const row = await this.getAccessibleRow(id, accountId, resolvedAgentIds);
     if (!row || row.status === 'deleted') return null;
 
     const normalizedAgentIds = this.normalizeSharedWith(agentIds);
@@ -296,11 +308,12 @@ export class MemoryService {
         .run();
     }
 
-    return this.getMemory(id, accountId, { includeDeleted: true, accessAgentId: options.accessAgentId });
+    return this.getMemory(id, accountId, { includeDeleted: true, accessAgentIds: resolvedAgentIds });
   }
 
   async retrieveMemories(accountId: string, query: string, filters: RetrieveFilters = {}): Promise<{ memories: MemoryView[]; query: string; count: number }> {
     const limit = this.clampLimit(filters.limit, 20, 100);
+    const agentIds = this.resolveAgentIds(filters.agentIds, filters.agentId);
     const { sql, binds } = this.buildMemoryQuery(accountId, {
       status: filters.status,
       query,
@@ -311,13 +324,14 @@ export class MemoryService {
       to: filters.to,
       source: filters.source,
       shared: filters.shared,
-      agentId: filters.agentId,
+      agentId: agentIds.length === 1 ? agentIds[0] : undefined,
       defaultToActiveOnly: true,
     });
 
     const rows = await this.db.prepare(sql).bind(...binds).all<MemoryRow>();
+    const accessibleRows = await this.filterRowsByAgentIds(rows.results || [], accountId, agentIds);
     const requiredTags = this.parseRequestedTags(filters.tags);
-    const memories = (rows.results || [])
+    const memories = accessibleRows
       .map((row) => this.toView(row))
       .filter((memory) => requiredTags.length === 0 || requiredTags.every((tag) => memory.tags.map((item) => item.toLowerCase()).includes(tag)));
 
@@ -330,7 +344,7 @@ export class MemoryService {
 
   async exportMemories(
     accountId: string,
-    options: { format?: 'json' | 'csv'; status?: MemoryStatus | 'all'; tags?: string[]; agentId?: string } = {}
+    options: { format?: 'json' | 'csv'; status?: MemoryStatus | 'all'; tags?: string[]; agentId?: string; agentIds?: string[] } = {}
   ): Promise<{ exported_at: string; account_id: string; count: number; memories: MemoryView[]; format: 'json' | 'csv'; csv?: string }> {
     const status = options.status && options.status !== 'all' && VALID_STATUSES.has(options.status) ? options.status : undefined;
     const memories = await this.listMemories(accountId, {
@@ -338,6 +352,7 @@ export class MemoryService {
       includeDeleted: options.status === 'all' || options.status === 'deleted',
       limit: 500,
       agentId: options.agentId,
+      agentIds: options.agentIds || (options.agentId ? [options.agentId] : undefined),
     });
     const requiredTags = this.sanitizeTags(options.tags || []);
     const filtered = requiredTags.length === 0
@@ -478,17 +493,36 @@ export class MemoryService {
     return { imported, skipped, errors };
   }
 
-  private async getAccessibleRow(id: string, accountId: string, accessAgentId?: string): Promise<MemoryRow | null> {
+  private async getAccessibleRow(id: string, accountId: string, accessAgentIds: string[] = []): Promise<MemoryRow | null> {
     const row = await this.getRow(id, accountId);
     if (!row) return null;
-    if (!accessAgentId) return row;
+    if (accessAgentIds.length === 0) return row;
 
-    const share = await this.db
-      .prepare('SELECT id FROM memory_shares WHERE memory_id = ? AND account_id = ? AND agent_id = ? LIMIT 1')
-      .bind(id, accountId, accessAgentId)
-      .first<{ id: string }>();
+    for (const accessAgentId of accessAgentIds) {
+      const share = await this.db
+        .prepare('SELECT id FROM memory_shares WHERE memory_id = ? AND account_id = ? AND agent_id = ? LIMIT 1')
+        .bind(id, accountId, accessAgentId)
+        .first<{ id: string }>();
+      if (share) return row;
+    }
 
-    return share ? row : null;
+    return null;
+  }
+
+  private resolveAgentIds(agentIds?: string[], agentId?: string): string[] {
+    const raw = agentIds && agentIds.length > 0 ? agentIds : (agentId ? [agentId] : []);
+    return Array.from(new Set(raw.map((value) => String(value || '').trim()).filter(Boolean)));
+  }
+
+  private async filterRowsByAgentIds(rows: MemoryRow[], accountId: string, agentIds: string[]): Promise<MemoryRow[]> {
+    if (agentIds.length === 0) return rows;
+
+    const filtered: MemoryRow[] = [];
+    for (const row of rows) {
+      const accessible = await this.getAccessibleRow(row.id, accountId, agentIds);
+      if (accessible) filtered.push(row);
+    }
+    return filtered;
   }
 
   private async getRow(id: string, accountId: string): Promise<MemoryRow | null> {

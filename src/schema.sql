@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   email TEXT NOT NULL UNIQUE,
   tier TEXT NOT NULL DEFAULT 'free',
   created_at TEXT NOT NULL,
-  CHECK (tier IN ('free', 'pro', 'enterprise'))
+  CHECK (tier IN ('free', 'pro', 'enterprise', 'owner'))
 );
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -16,8 +16,33 @@ CREATE TABLE IF NOT EXISTS api_keys (
   created_at TEXT NOT NULL,
   last_used_at TEXT,
   revoked_at TEXT,
+  name TEXT,
+  key_type TEXT NOT NULL DEFAULT 'live',
+  prefix TEXT,
+  scopes TEXT NOT NULL DEFAULT '["full"]',
+  last_used_ip TEXT,
+  usage_count INTEGER NOT NULL DEFAULT 0,
+  expires_at TEXT,
+  created_by TEXT,
+  agent_ids TEXT,
   FOREIGN KEY (account_id) REFERENCES accounts(id),
-  CHECK (status IN ('active', 'revoked'))
+  CHECK (status IN ('active', 'revoked')),
+  CHECK (key_type IN ('live', 'test'))
+);
+
+CREATE TABLE IF NOT EXISTS api_key_audit_log (
+  id TEXT PRIMARY KEY,
+  account_id TEXT,
+  key_id TEXT,
+  event TEXT NOT NULL,
+  actor TEXT,
+  ip TEXT,
+  user_agent TEXT,
+  details TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (account_id) REFERENCES accounts(id),
+  FOREIGN KEY (key_id) REFERENCES api_keys(id),
+  CHECK (event IN ('created', 'revoked', 'rotated', 'auth_failed', 'auth_success'))
 );
 
 -- Tier 2-3: Decisions & Outcomes
@@ -76,10 +101,14 @@ CREATE TABLE IF NOT EXISTS decision_vectors (
   decision_id TEXT NOT NULL,
   vector_embedding TEXT NOT NULL,
   decision_type TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT 'bge-base-en-v1.5',
+  dimensions INTEGER NOT NULL DEFAULT 768,
   created_at TEXT NOT NULL,
   FOREIGN KEY (decision_id) REFERENCES decisions(id),
   UNIQUE (decision_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_decision_vectors_type ON decision_vectors(decision_type);
 
 -- Tier 8: Pattern Discovery
 CREATE TABLE IF NOT EXISTS patterns (
@@ -283,6 +312,23 @@ CREATE TABLE IF NOT EXISTS bootstrap_templates (
   created_at TEXT NOT NULL
 );
 
+
+-- Learned Templates (Phase 2)
+CREATE TABLE IF NOT EXISTS learned_templates (
+  id TEXT PRIMARY KEY,
+  template_id TEXT NOT NULL UNIQUE,
+  pattern_cluster TEXT NOT NULL,
+  steps TEXT NOT NULL DEFAULT '[]',
+  success_rate REAL NOT NULL DEFAULT 0.0,
+  confidence REAL NOT NULL DEFAULT 0.0,
+  usage_count INTEGER NOT NULL DEFAULT 0,
+  decision_type TEXT NOT NULL DEFAULT 'general',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_learned_templates_score ON learned_templates(confidence * success_rate);
+
 -- Tier 20: Streaming (no dedicated table, uses existing)
 
 -- Indexes for performance
@@ -294,6 +340,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_account_id ON audit_log(account_id);
 CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash);
 CREATE INDEX IF NOT EXISTS idx_api_keys_account_id ON api_keys(account_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(prefix);
+CREATE INDEX IF NOT EXISTS idx_api_keys_status_account ON api_keys(account_id, status);
+CREATE INDEX IF NOT EXISTS idx_api_key_audit_account ON api_key_audit_log(account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_api_key_audit_key ON api_key_audit_log(key_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_lessons_account_id ON lessons(account_id);
 CREATE INDEX IF NOT EXISTS idx_lessons_is_published ON lessons(is_published);
 CREATE INDEX IF NOT EXISTS idx_memories_account_status ON memories(account_id, status, updated_at DESC);

@@ -3,8 +3,8 @@
  * Cloudflare Workers + D1 + itty-router
  */
 import { Router, IRequest } from 'itty-router';
-import { Env, RequestContext, ApiResponse } from './types';
-import { AuthService } from './services/auth.service';
+import { Env, RequestContext, ApiResponse, ApiKeyScope, ManagedApiKey } from './types';
+import { AuthRateLimitError, AuthService, AuthServiceError } from './services/auth.service';
 import { DecisionService } from './services/decision.service';
 import { CollaborationService } from './services/collaboration.service';
 import { PatternsService } from './services/patterns.service';
@@ -85,6 +85,73 @@ function getUrl(request: IRequest): URL {
   return new URL(request.url);
 }
 
+function hasAnyScope(ctx: RequestContext, scopes: ApiKeyScope[]): boolean {
+  const granted = ctx.scopes || ['full'];
+  return granted.includes('full') || scopes.some((scope) => granted.includes(scope));
+}
+
+function getRequiredScopes(path: string, method: string): ApiKeyScope[] | 'full' | null {
+  if (path === '/v1/auth/account') return null;
+  if (path.startsWith('/v1/auth/keys')) return ['agents:manage'];
+  if (path === '/v1/memories/import') return method === 'GET' ? ['memories:read'] : ['memories:import', 'memories:write'];
+  if (path === '/v1/memories/export' || path === '/v1/memories/retrieve') return ['memories:read', 'memories:export'];
+  if (path.startsWith('/v1/memories')) return method === 'GET' ? ['memories:read'] : ['memories:write'];
+  if (path === '/v1/agent/think' || path === '/v1/agent/commit' || path.startsWith('/v1/decisions') || path.startsWith('/decisions')) {
+    return method === 'GET' ? ['decisions:read'] : ['decisions:write'];
+  }
+  if (path.startsWith('/v1/patterns')) return ['patterns:read'];
+  if (path.startsWith('/v1/webhooks')) return ['webhooks:manage'];
+  if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') return 'full';
+  return 'full';
+}
+
+function getAccessAgentIds(ctx: RequestContext): string[] | undefined {
+  if (ctx.agent_ids && ctx.agent_ids.length > 0) return ctx.agent_ids;
+  if (ctx.agent_id) return [ctx.agent_id];
+  return undefined;
+}
+
+function isAgentBoundContext(ctx: RequestContext): boolean {
+  return Boolean(ctx.agent_id) || Boolean(ctx.agent_ids && ctx.agent_ids.length > 0);
+}
+
+function isTestKeyContext(ctx: RequestContext): boolean {
+  return ctx.api_key_type === 'test';
+}
+
+function isTestKeyManagementPath(path: string): boolean {
+  return path === '/v1/auth/account'
+    || path === '/v1/auth/keys'
+    || /^\/v1\/auth\/keys\/[^/]+$/.test(path)
+    || /^\/v1\/auth\/keys\/[^/]+\/(revoke|rotate)$/.test(path)
+    || path === '/v1/auth/keys/revoke';
+}
+
+function ensureTestKeyManagedKeyAccess(ctx: RequestContext, key: ManagedApiKey | null): Response | null {
+  if (!isTestKeyContext(ctx)) return null;
+  if (!key) return err('Not found', 404);
+  if (key.key_type !== 'test') return err('Test keys can only manage test keys.', 403);
+  return null;
+}
+
+function filterKeysForContext(ctx: RequestContext, keys: ManagedApiKey[]): ManagedApiKey[] {
+  return isTestKeyContext(ctx) ? keys.filter((key) => key.key_type === 'test') : keys;
+}
+
+function enforceRoutePolicy(request: IRequest, ctx: RequestContext): Response | null {
+  const path = getUrl(request).pathname;
+  if (isTestKeyContext(ctx) && !isTestKeyManagementPath(path)) {
+    return err('Test keys cannot access production data.', 403);
+  }
+
+  const required = getRequiredScopes(path, request.method.toUpperCase());
+  if (required === null) return null;
+  if (required === 'full') {
+    return hasAnyScope(ctx, ['full']) ? null : err('Insufficient scope', 403);
+  }
+  return hasAnyScope(ctx, required) ? null : err('Insufficient scope', 403);
+}
+
 // ============= Router =============
 
 const router = Router();
@@ -98,12 +165,26 @@ async function requireAuth(request: IRequest, env: Env): Promise<RequestContext 
 
   try {
     const authService = new AuthService(env.DB);
-    const ctx = await authService.validateToken(authHeader);
+    const ctx = await authService.validateToken(authHeader, {
+      ip: request.headers.get('cf-connecting-ip'),
+      userAgent: request.headers.get('user-agent'),
+    });
     if (!ctx) {
       return err('Unauthorized', 401);
     }
+
+    const allowed = await authService.enforceApiRateLimit(ctx.api_key_id, ctx.tier);
+    if (!allowed) {
+      return err('Rate limit exceeded', 429);
+    }
+
+    const policyError = enforceRoutePolicy(request, ctx);
+    if (policyError) return policyError;
+
     return ctx;
   } catch (error) {
+    if (error instanceof AuthRateLimitError) return err(error.message, 429);
+    if (error instanceof AuthServiceError) return err(error.message, error.status);
     return err('Auth error', 500);
   }
 }
@@ -161,7 +242,7 @@ async function sendEmail(env: Env, to: string, subject: string, html: string): P
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: 'Marrow <noreply@getmarrow.ai>', to, subject, html }),
+      body: JSON.stringify({ from: 'Marrow <noreply@mail.getmarrow.ai>', to, subject, html }),
     });
     if (!res.ok) { console.error('[Resend error]', await res.text()); return false; }
     return true;
@@ -243,8 +324,11 @@ router.post('/v1/keys/request', async (request: IRequest, env: Env) => {
 
     const otpService = new OtpService(env.DB);
 
-    // Rate limit: max 5 requests per email per hour
-    const allowed = await otpService.checkRateLimit(email);
+    // Rate limit: max 5 OTP requests per email per hour. Uses the shared
+    // rate_limit_tracker (same utility as the IP check above) — the previous
+    // OtpService.checkRateLimit was broken because email_otps uses an UPSERT
+    // on email, so its row count was always 0 or 1 regardless of attempts.
+    const allowed = await checkRateLimit(env.DB, `otp_request_email:${email}`, 5, 60 * 60 * 1000);
     if (!allowed) return err('Too many requests. Try again later.', 429);
 
     const otp = otpService.generateOtp();
@@ -289,7 +373,7 @@ router.post('/v1/keys/request', async (request: IRequest, env: Env) => {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        from: 'Marrow <noreply@getmarrow.ai>',
+        from: 'Marrow <noreply@mail.getmarrow.ai>',
         to: email,
         subject: 'Your Marrow API key verification code',
         text: emailText,
@@ -365,7 +449,7 @@ router.post('/v1/keys/verify', async (request: IRequest, env: Env) => {
         .run();
     }
 
-    const created = await authService.createApiKey(accountId);
+    const created = await authService.createApiKey(accountId, { createdBy: 'signup', name: 'Primary signup key' });
     const apiKey = created.key;
 
     const emailService = new EmailService(env.DB, env);
@@ -400,7 +484,7 @@ router.post('/v1/auth/accounts', async (request: IRequest, env: Env) => {
     const account = await authService.createAccount(
       String(body.name || ''), String(body.email || ''), 'free'  // H2 fix: always free, never trust client-supplied tier
     );
-    const { key, keyId } = await authService.createApiKey(account.id);
+    const { key, keyId } = await authService.createApiKey(account.id, { createdBy: 'signup', name: 'Primary signup key' });
     const emailService = new EmailService(env.DB, env);
     // SECURITY: api_key intentionally NOT passed to template — emails never carry secrets.
     // User receives the key in the JSON response below.
@@ -429,8 +513,148 @@ router.get('/v1/auth/account', async (request: IRequest, env: Env) => {
     const authService = new AuthService(env.DB);
     const account = await authService.getAccount(ctx.account_id);
     if (!account) return err('Not found', 404);
+    if (isTestKeyContext(ctx)) return json({ tier: account.tier });
     return json(account);
   } catch (e: unknown) { return err('Internal error'); }
+});
+
+router.get('/v1/auth/keys', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+    const authService = new AuthService(env.DB);
+    const keys = filterKeysForContext(ctx, await authService.listKeys(ctx.account_id));
+    return json({ keys });
+  } catch (e: unknown) {
+    if (e instanceof AuthServiceError) return err(e.message, e.status);
+    return err('Internal error');
+  }
+});
+
+router.post('/v1/auth/keys', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+    const body = await request.json() as {
+      name?: string;
+      key_type?: 'live' | 'test';
+      scopes?: string[];
+      expires_at?: string | null;
+      agent_ids?: string[];
+    };
+    if (isTestKeyContext(ctx) && body.key_type && body.key_type !== 'test') {
+      return err('Test keys can only manage test keys.', 403);
+    }
+    const authService = new AuthService(env.DB);
+    const created = await authService.createApiKey(
+      ctx.account_id,
+      {
+        name: body.name,
+        keyType: isTestKeyContext(ctx) ? 'test' : body.key_type,
+        scopes: body.scopes,
+        expiresAt: body.expires_at,
+        agentIds: body.agent_ids,
+        createdBy: 'dashboard',
+      },
+      {
+        ip: request.headers.get('cf-connecting-ip'),
+        userAgent: request.headers.get('user-agent'),
+      },
+    );
+    return json({ key: created.key, key_id: created.keyId, masked_key: created.maskedKey }, 201);
+  } catch (e: unknown) {
+    if (e instanceof AuthServiceError) return err(e.message, e.status);
+    return err('Internal error');
+  }
+});
+
+router.get('/v1/auth/keys/audit', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+    if (isTestKeyContext(ctx)) return err('Test keys cannot access production data.', 403);
+    const url = getUrl(request);
+    const page = Number(url.searchParams.get('page') || '1');
+    const pageSize = Number(url.searchParams.get('page_size') || url.searchParams.get('limit') || '20');
+    const authService = new AuthService(env.DB);
+    const audit = await authService.listKeyAudit(ctx.account_id, page, pageSize);
+    return json(audit);
+  } catch (e: unknown) {
+    if (e instanceof AuthServiceError) return err(e.message, e.status);
+    return err('Internal error');
+  }
+});
+
+router.get('/v1/auth/keys/:id', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+    const authService = new AuthService(env.DB);
+    const key = await authService.getKey(String(request.params?.id || ''), ctx.account_id);
+    const accessError = ensureTestKeyManagedKeyAccess(ctx, key);
+    if (accessError) return accessError;
+    if (!key) return err('Not found', 404);
+    return json({ key });
+  } catch (e: unknown) {
+    if (e instanceof AuthServiceError) return err(e.message, e.status);
+    return err('Internal error');
+  }
+});
+
+router.post('/v1/auth/keys/:id/revoke', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+    const authService = new AuthService(env.DB);
+    const keyId = String(request.params?.id || '');
+    const key = await authService.getKey(keyId, ctx.account_id);
+    const accessError = ensureTestKeyManagedKeyAccess(ctx, key);
+    if (accessError) return accessError;
+    await authService.revokeApiKey(
+      keyId,
+      ctx.account_id,
+      {
+        ip: request.headers.get('cf-connecting-ip'),
+        userAgent: request.headers.get('user-agent'),
+      },
+      'user',
+    );
+    return json({ revoked: true });
+  } catch (e: unknown) {
+    if (e instanceof AuthServiceError) return err(e.message, e.status);
+    return err('Internal error');
+  }
+});
+
+router.post('/v1/auth/keys/:id/rotate', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+    const authService = new AuthService(env.DB);
+    const keyId = String(request.params?.id || '');
+    const key = await authService.getKey(keyId, ctx.account_id);
+    const accessError = ensureTestKeyManagedKeyAccess(ctx, key);
+    if (accessError) return accessError;
+    const rotated = await authService.rotateKey(
+      keyId,
+      ctx.account_id,
+      {
+        ip: request.headers.get('cf-connecting-ip'),
+        userAgent: request.headers.get('user-agent'),
+      },
+      'user',
+    );
+    return json({ key: rotated.key, key_id: rotated.keyId, masked_key: rotated.maskedKey });
+  } catch (e: unknown) {
+    if (e instanceof AuthServiceError) return err(e.message, e.status);
+    return err('Internal error');
+  }
 });
 
 router.post('/v1/auth/keys/revoke', async (request: IRequest, env: Env) => {
@@ -438,21 +662,25 @@ router.post('/v1/auth/keys/revoke', async (request: IRequest, env: Env) => {
     const authResult = await requireAuth(request, env);
     if (authResult instanceof Response) return authResult;
     const ctx = authResult as RequestContext;
-    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
-    autoLogDecision({
-      db: env.DB,
-      accountId: ctx.account_id,
-      method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
-      statusCode: 200,
-
-      tier: ctx.tier,
-    }).catch(() => {});
     const body = await request.json() as Record<string, unknown>;
     const authService = new AuthService(env.DB);
-    await authService.revokeApiKey(String(body.key_id), ctx.account_id);
+    const key = await authService.getKey(String(body.key_id), ctx.account_id);
+    const accessError = ensureTestKeyManagedKeyAccess(ctx, key);
+    if (accessError) return accessError;
+    await authService.revokeApiKey(
+      String(body.key_id),
+      ctx.account_id,
+      {
+        ip: request.headers.get('cf-connecting-ip'),
+        userAgent: request.headers.get('user-agent'),
+      },
+      'user',
+    );
     return json({ revoked: true });
-  } catch (e: unknown) { return err('Internal error'); }
+  } catch (e: unknown) {
+    if (e instanceof AuthServiceError) return err(e.message, e.status);
+    return err('Internal error');
+  }
 });
 
 // ============= TIER 2: DECISIONS =============
@@ -475,7 +703,7 @@ router.post('/decisions', async (request: IRequest, env: Env) => {
     }).catch(() => {});
 
     const body = await request.json() as Record<string, unknown>;
-    const decisionService = new DecisionService(env.DB);
+    const decisionService = new DecisionService(env.DB, env.AI);
     const enterpriseService = new EnterpriseService(env.DB, env.ENCRYPTION_KEY);
 
     const validation = decisionService.validateDecision(body);
@@ -556,7 +784,7 @@ router.get('/decisions', async (request: IRequest, env: Env) => {
     }).catch(() => {});
 
     const url = getUrl(request);
-    const decisionService = new DecisionService(env.DB);
+    const decisionService = new DecisionService(env.DB, env.AI);
     const decisions = await decisionService.listDecisions(ctx.account_id, {
       decision_type: url.searchParams.get('decision_type') || undefined,
       limit: parseInt(url.searchParams.get('limit') || '50'),
@@ -611,8 +839,8 @@ router.get('/v1/decisions/routing-suggestions', async (request: IRequest, env: E
 
     const url = getUrl(request);
     const decisionType = url.searchParams.get('decision_type') || 'general';
-    const patterns = new PatternsService(env.DB);
-    const suggestions = await patterns.predictSimilarDecisions({ type: decisionType }, decisionType, 5);
+    const patterns = new PatternsService(env.DB, env.AI);
+    const { similar: suggestions } = await patterns.predictSimilarDecisions({ type: decisionType }, decisionType, 5);
     return json({ routing_suggestions: suggestions });
   } catch (e: unknown) { return err('Internal error'); }
 });
@@ -655,7 +883,7 @@ router.get('/v1/decisions/:id', async (request: IRequest, env: Env) => {
 
       tier: ctx.tier,
     }).catch(() => {});
-    const decisionService = new DecisionService(env.DB);
+    const decisionService = new DecisionService(env.DB, env.AI);
     const decision = await decisionService.getDecision(String(request.params?.id), ctx.account_id);
     if (!decision) return err('Not found', 404);
     return json(decision);
@@ -867,8 +1095,8 @@ router.post('/v1/decisions/predict', async (request: IRequest, env: Env) => {
       tier: ctx.tier,
     }).catch(() => {});
     const body = await request.json() as Record<string, unknown>;
-    const patterns = new PatternsService(env.DB);
-    const similar = await patterns.predictSimilarDecisions(
+    const patterns = new PatternsService(env.DB, env.AI);
+    const { similar } = await patterns.predictSimilarDecisions(
       body.context as Record<string, unknown>, String(body.decision_type), 5
     );
     return json({ similar_decisions: similar });
@@ -962,7 +1190,7 @@ router.get('/v1/trends', async (request: IRequest, env: Env) => {
     }).catch(() => {});
 
     const url = getUrl(request);
-    const patterns = new PatternsService(env.DB);
+    const patterns = new PatternsService(env.DB, env.AI);
     const result = await patterns.calculateTrends(ctx.account_id, url.searchParams.get('decision_type') || 'general');
     return json(result);
   } catch (e: unknown) { return err('Internal error'); }
@@ -1150,7 +1378,7 @@ router.get('/v1/hive', async (request: IRequest, env: Env) => {
     }).catch(() => {});
 
     const url = getUrl(request);
-    const patterns = new PatternsService(env.DB);
+    const patterns = new PatternsService(env.DB, env.AI);
     const sort = url.searchParams.get('sort') || 'priority';
 
     if (sort === 'priority') {
@@ -1179,7 +1407,7 @@ router.get('/v1/hive/signals', async (request: IRequest, env: Env) => {
     }).catch(() => {});
 
     const url = getUrl(request);
-    const patterns = new PatternsService(env.DB);
+    const patterns = new PatternsService(env.DB, env.AI);
     const decision_type = url.searchParams.get('decision_type') || 'general';
     const limit = parseInt(url.searchParams.get('limit') || '20');
 
@@ -1989,7 +2217,7 @@ router.get('/v1/stream', async (request: IRequest, env: Env) => {
       writer.write(encoder.encode(connectEvent));
 
       // Send recent decisions as catch-up
-      const decisionService = new DecisionService(env.DB);
+      const decisionService = new DecisionService(env.DB, env.AI);
       const recent = await decisionService.listDecisions(ctx.account_id, { decision_type: decisionType !== 'all' ? decisionType : undefined, limit: 10 });
 
       for (const decision of recent) {
@@ -2120,7 +2348,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
     if (previousOutcome && previousOutcome.length > 2000) return err('previous_outcome max 2000 characters', 400);
     const previousCausedBy = body.previous_caused_by ? String(body.previous_caused_by) : null;
 
-    const workflow = new WorkflowService(env.DB);
+    const workflow = new WorkflowService(env.DB, env.AI);
     let previousCommitted = false;
     let insight: string | null = null;
     let updatedSuccessRate: number | null = null;
@@ -2191,7 +2419,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
     }
 
     // ── STEP 3: Pattern Engine — clustering, failure detection, workflow gaps ──
-    const patternEngine = new PatternEngine(env.DB);
+    const patternEngine = new PatternEngine(env.DB, env.AI);
     const engineResult = await patternEngine.analyze(ctx.account_id, action, type, result.decision_id).catch(() => ({ insights: [], clusterId: null }));
 
     // T20: Stream URL for live updates
@@ -2315,6 +2543,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
         causal_chain: result.causal_context || null,
         success_rate: successRate,
         priority_score: result.priority_score ?? 0.5,
+        risk_score: result.risk_score,
         velocity: 0,
         insight,
         insights: actionableInsights,
@@ -2469,6 +2698,14 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
       ? { latest: MARROW_SDK_LATEST, current: clientSdkVersion, message: `Update available: npm install @getmarrow/sdk@${MARROW_SDK_LATEST}` }
       : undefined;
     if (sdkUpdateAvailable) response.sdk_update = sdkUpdateAvailable;
+
+    // Phase 3: Auto-learn templates (fire-and-forget with 15-min throttle)
+    checkRateLimit(env.DB, 'learn_templates_throttle', 1, 15 * 60 * 1000).then(allowed => {
+      if (allowed) {
+        const patAuto = new PatternsService(env.DB, env.AI);
+        patAuto.learnTemplates().catch((e: unknown) => console.error('[auto-learn think]', e instanceof Error ? e.message : e));
+      }
+    }).catch(() => {});
 
     return json(response);
   } catch (e: unknown) {
@@ -2665,7 +2902,7 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
     }
 
     // Route to the same workflow.after logic (backward compat — commit_only mode)
-    const workflow = new WorkflowService(env.DB);
+    const workflow = new WorkflowService(env.DB, env.AI);
     const result = await workflow.after(
       {
         decision_id: String(body.decision_id),
@@ -2767,6 +3004,22 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
       warning_avoided = Boolean(saveRow);
     }
 
+    // Phase 2: Best-effort risk score for committed decision (non-blocking)
+    let risk_score: number | null = null;
+    try {
+      const decision = await env.DB
+        .prepare('SELECT decision_type FROM decisions WHERE id = ? AND account_id = ? LIMIT 1')
+        .bind(String(body.decision_id), ctx.account_id)
+        .first<{ decision_type: string }>();
+      if (decision) {
+        const patterns = new PatternsService(env.DB, env.AI);
+        const { risk_score: rs } = await patterns.predictSimilarDecisions(
+          { action: String(body.outcome) }, decision.decision_type, 5
+        );
+        risk_score = rs;
+      }
+    } catch (_e) { /* non-blocking: risk score is best-effort */ }
+
     const marrow_contributed = {
       success: Boolean(body.success),
       pattern_reused,
@@ -2775,11 +3028,20 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
       has_signal: pattern_reused || warning_avoided || linked_to_prior,
     };
 
+    // Phase 3: Auto-learn templates after commit (fire-and-forget, 15-min throttle)
+    checkRateLimit(env.DB, 'learn_templates_throttle', 1, 15 * 60 * 1000).then(allowed => {
+      if (allowed) {
+        const patLearn = new PatternsService(env.DB, env.AI);
+        patLearn.learnTemplates().catch((e: unknown) => console.error('[auto-learn commit]', e instanceof Error ? e.message : e));
+      }
+    }).catch(() => {});
+
     return json({
       committed: true,
       success_rate: result.new_success_rate ?? 0.75,
       insight: null,
       narrative,
+      risk_score,
       marrow_contributed,
     });
   } catch (e: unknown) {
@@ -2812,7 +3074,7 @@ router.post('/v1/workflow/before', async (request: IRequest, env: Env) => {
       return err('Missing required fields: decision_type, action, description', 400);
     }
 
-    const workflow = new WorkflowService(env.DB);
+    const workflow = new WorkflowService(env.DB, env.AI);
     const wfSessionId = request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null;
     const result = await workflow.before(
       {
@@ -2854,7 +3116,7 @@ router.post('/v1/workflow/after', async (request: IRequest, env: Env) => {
       return err('Missing required fields: decision_id, success, outcome', 400);
     }
 
-    const workflow = new WorkflowService(env.DB);
+    const workflow = new WorkflowService(env.DB, env.AI);
     const workflowAfterAgentId = request.headers.get('X-Marrow-Agent-Id');
     const result = await workflow.after(
       {
@@ -2891,7 +3153,7 @@ router.get('/v1/workflow/status', async (request: IRequest, env: Env) => {
       tier: ctx.tier,
     }).catch(() => {});
 
-    const workflow = new WorkflowService(env.DB);
+    const workflow = new WorkflowService(env.DB, env.AI);
     const result = await workflow.status(ctx.account_id);
 
     return json(result, 200);
@@ -4424,6 +4686,30 @@ router.patch('/v1/orgs/:id/members/:memberId', async (request: IRequest, env: En
   }
 });
 
+// GET /v1/templates/learned — learned templates from pattern clusters (Phase 2)
+// No auth required — public browsing of discovered templates
+// NOTE: must be defined BEFORE /v1/templates (line 4498) to avoid :slug catch
+router.get('/v1/templates/learned', async (request: IRequest, env: Env) => {
+  try {
+    const url = getUrl(request);
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '20') || 20, 100);
+    const patterns = new PatternsService(env.DB, env.AI);
+
+    // Phase 3: If table empty, sync-learn on first access
+    const countRow = await env.DB.prepare('SELECT COUNT(*) as c FROM learned_templates').first<{ c: number }>();
+    const isEmpty = (countRow?.c || 0) === 0;
+    if (isEmpty) {
+      await patterns.learnTemplates().catch((e: unknown) => console.error('[sync-learn]', e instanceof Error ? e.message : e));
+    }
+
+    const templates = await patterns.getLearnedTemplates(limit);
+    return json({ templates, refreshed: isEmpty });
+  } catch (e: unknown) {
+    console.error('GET /v1/templates/learned error:', e instanceof Error ? e.message : e);
+    return err('Internal server error', 500);
+  }
+});
+
 // ---------- Workflow Template Marketplace ----------
 
 // GET /v1/templates — list templates
@@ -4520,6 +4806,34 @@ router.post('/v1/templates', async (request: IRequest, env: Env) => {
   }
 });
 
+// GET /v1/org/patterns — cross-agent team patterns (Phase 3)
+// Tier-gated: Team/Enterprise only. Free/Pro get 403.
+router.get('/v1/org/patterns', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    if (ctx.tier !== 'enterprise' && ctx.tier !== 'owner') {
+      return err('Team patterns require Enterprise tier', 403);
+    }
+
+    const orgSvc = new OrgService(env.DB);
+    const org = await orgSvc.getOrgForAccount(ctx.account_id);
+    if (!org) return err('No organization found for this account', 404);
+
+    const url = getUrl(request);
+    const decisionType = url.searchParams.get('decision_type') || 'all';
+    const patterns = new PatternsService(env.DB, env.AI);
+    const result = await patterns.discoverOrgPatterns(org.id, decisionType);
+
+    return json({ org_id: org.id, org_name: org.name, patterns: result });
+  } catch (e: unknown) {
+    console.error('GET /v1/org/patterns error:', e instanceof Error ? e.message : e);
+    return err('Internal server error', 500);
+  }
+});
+
 // ---------- Fleet Dashboard ----------
 
 // GET /v1/fleet — fleet status
@@ -4534,7 +4848,7 @@ router.get('/v1/memories/retrieve', async (request: IRequest, env: Env) => {
     const url = getUrl(request);
     const statusParam = url.searchParams.get('status');
     const query = url.searchParams.get('q') || '';
-    const accessAgentId = ctx.agent_id || undefined;
+    const accessAgentIds = getAccessAgentIds(ctx);
     const memoryService = new MemoryService(env.DB);
     const result = await memoryService.retrieveMemories(ctx.account_id, query, {
       limit: Number(url.searchParams.get('limit') || 20),
@@ -4549,7 +4863,8 @@ router.get('/v1/memories/retrieve', async (request: IRequest, env: Env) => {
       shared: url.searchParams.get('shared') === null
         ? undefined
         : url.searchParams.get('shared') === 'true',
-      agentId: accessAgentId,
+      agentId: accessAgentIds?.[0],
+      agentIds: accessAgentIds,
     });
 
     return json(result);
@@ -4579,7 +4894,8 @@ router.get('/v1/memories/export', async (request: IRequest, env: Env) => {
         ? statusParam as 'all' | 'active' | 'outdated' | 'superseded' | 'deleted'
         : undefined,
       tags,
-      agentId: ctx.agent_id || undefined,
+      agentId: getAccessAgentIds(ctx)?.[0],
+      agentIds: getAccessAgentIds(ctx),
     });
 
     return json(result);
@@ -4594,7 +4910,7 @@ router.post('/v1/memories/import', async (request: IRequest, env: Env) => {
     const authResult = await requireAuth(request, env);
     if (authResult instanceof Response) return authResult;
     const ctx = authResult as RequestContext;
-    if (ctx.agent_id) return err('Agent-scoped tokens cannot import memories', 403);
+    if (isAgentBoundContext(ctx)) return err('Agent-bound tokens cannot import memories', 403);
 
     const body = await request.json() as {
       memories?: Array<{ text?: string; source?: string; tags?: string[]; sharedWith?: string[]; shared_with?: string[] }>;
@@ -4638,7 +4954,8 @@ router.get('/v1/memories', async (request: IRequest, env: Env) => {
       query: url.searchParams.get('query') || undefined,
       includeDeleted: url.searchParams.get('includeDeleted') === 'true',
       limit: Number(url.searchParams.get('limit') || 20),
-      agentId: ctx.agent_id || url.searchParams.get('agent_id') || undefined,
+      agentId: getAccessAgentIds(ctx)?.[0] || url.searchParams.get('agent_id') || undefined,
+      agentIds: getAccessAgentIds(ctx),
     });
 
     return json({ memories, count: memories.length });
@@ -4657,7 +4974,7 @@ router.get('/v1/memories/:id', async (request: IRequest, env: Env) => {
     const memoryService = new MemoryService(env.DB);
     const memory = await memoryService.getMemory(String(request.params?.id), ctx.account_id, {
       includeDeleted: getUrl(request).searchParams.get('includeDeleted') === 'true',
-      accessAgentId: ctx.agent_id || undefined,
+      accessAgentIds: getAccessAgentIds(ctx),
     });
 
     if (!memory) {
@@ -4680,7 +4997,7 @@ router.patch('/v1/memories/:id', async (request: IRequest, env: Env) => {
 
     const memoryService = new MemoryService(env.DB);
     const memory = await memoryService.updateMemory(String(request.params?.id), ctx.account_id, body, {
-      accessAgentId: ctx.agent_id || undefined,
+      accessAgentIds: getAccessAgentIds(ctx),
     });
     if (!memory) {
       return err('Memory not found', 404, { id: String(request.params?.id) });
@@ -4704,7 +5021,7 @@ router.delete('/v1/memories/:id', async (request: IRequest, env: Env) => {
 
     const memoryService = new MemoryService(env.DB);
     const memory = await memoryService.deleteMemory(String(request.params?.id), ctx.account_id, body, {
-      accessAgentId: ctx.agent_id || undefined,
+      accessAgentIds: getAccessAgentIds(ctx),
     });
     if (!memory) {
       return err('Memory not found', 404, { id: String(request.params?.id) });
@@ -4726,7 +5043,7 @@ router.post('/v1/memories/:id/outdated', async (request: IRequest, env: Env) => 
 
     const memoryService = new MemoryService(env.DB);
     const memory = await memoryService.markOutdated(String(request.params?.id), ctx.account_id, body, {
-      accessAgentId: ctx.agent_id || undefined,
+      accessAgentIds: getAccessAgentIds(ctx),
     });
     if (!memory) {
       return err('Memory not found', 404, { id: String(request.params?.id) });
@@ -4757,7 +5074,7 @@ router.post('/v1/memories/:id/supersede', async (request: IRequest, env: Env) =>
       actor: body.actor,
       note: body.note,
     }, {
-      accessAgentId: ctx.agent_id || undefined,
+      accessAgentIds: getAccessAgentIds(ctx),
     });
     if (!result) {
       return err('Memory not found', 404, { id: String(request.params?.id) });
@@ -4777,7 +5094,7 @@ router.post('/v1/memories/:id/share', async (request: IRequest, env: Env) => {
     const authResult = await requireAuth(request, env);
     if (authResult instanceof Response) return authResult;
     const ctx = authResult as RequestContext;
-    if (ctx.agent_id) return err('Agent-scoped tokens cannot share memories', 403);
+    if (isAgentBoundContext(ctx)) return err('Agent-bound tokens cannot share memories', 403);
 
     const body = await request.json().catch(() => ({})) as { agent_ids?: string[]; agentIds?: string[]; actor?: string };
 

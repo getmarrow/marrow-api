@@ -56,7 +56,7 @@ class FakeD1Statement {
 
 class FakeD1Database {
   accounts = new Map<string, { id: string; name: string; email: string; tier: string; created_at: string }>();
-  apiKeys = new Map<string, { id: string; account_id: string; key_hash: string; status: string; created_at: string; last_used_at: string | null }>();
+  apiKeys = new Map<string, { id: string; account_id: string; key_hash: string; status: string; created_at: string; last_used_at: string | null; expires_at?: string | null; scopes?: string | null; key_type?: string | null; agent_ids?: string | null; last_used_ip?: string | null; usage_count?: number | null; revoked_at?: string | null; name?: string | null; prefix?: string | null; created_by?: string | null }>();
   agents = new Map<string, AgentRow>();
   memories = new Map<string, MemoryRow>();
   memoryShares: Array<{ id: string; memory_id: string; account_id: string; agent_id: string; created_at: string }> = [];
@@ -82,31 +82,43 @@ class FakeD1Database {
   async first<T>(sql: string, params: unknown[]): Promise<T | null> {
     const normalized = normalizeSql(sql);
 
-    if (normalized.includes('from api_keys ak join accounts a on ak.account_id = a.id')) {
+    if (normalized.includes('from api_keys where key_hash = ? and status = \'active\'')) {
       const keyHash = String(params[0] || '');
       const apiKey = Array.from(this.apiKeys.values()).find((row) => row.key_hash === keyHash && row.status === 'active');
       if (!apiKey) return null;
-      const account = this.accounts.get(apiKey.account_id);
-      if (!account) return null;
       return {
         id: apiKey.id,
         account_id: apiKey.account_id,
         status: apiKey.status,
-        tier: account.tier,
+        expires_at: apiKey.expires_at || null,
+        scopes: apiKey.scopes || '["full"]',
+        key_type: apiKey.key_type || 'live',
+        agent_ids: apiKey.agent_ids || null,
       } as T;
     }
 
-    if (normalized.includes('from agents ag join accounts a on ag.account_id = a.id')) {
+    if (normalized.includes('from agents where api_key_hash = ? and status != \'archived\'')) {
       const keyHash = String(params[0] || '');
       const agent = Array.from(this.agents.values()).find((row) => row.api_key_hash === keyHash && row.status !== 'archived');
       if (!agent) return null;
-      const account = this.accounts.get(agent.account_id);
-      if (!account) return null;
       return {
-        agent_id: agent.id,
+        id: agent.id,
         account_id: agent.account_id,
-        tier: account.tier,
       } as T;
+    }
+
+    if (normalized.startsWith('select id, name, email, tier, created_at from accounts where id = ?')) {
+      const accountId = String(params[0] || '');
+      const account = this.accounts.get(accountId);
+      return account ? ({ ...account } as T) : null;
+    }
+
+    if (normalized.includes('select id, account_id, status, created_at, last_used_at, revoked_at, name, key_type, prefix, scopes, last_used_ip, usage_count, expires_at, created_by, agent_ids from api_keys where id = ? and account_id = ? limit 1')) {
+      const keyId = String(params[0] || '');
+      const accountId = String(params[1] || '');
+      const key = this.apiKeys.get(keyId);
+      if (!key || key.account_id !== accountId) return null;
+      return ({ ...key } as T);
     }
 
     if (normalized.startsWith('select * from memories where id = ? and account_id = ?')) {
@@ -148,15 +160,37 @@ class FakeD1Database {
       return { results, success: true, meta: {} };
     }
 
+    if (normalized.includes('select id, account_id, status, created_at, last_used_at, revoked_at, name, key_type, prefix, scopes, last_used_ip, usage_count, expires_at, created_by, agent_ids from api_keys where account_id = ? order by created_at desc')) {
+      const accountId = String(params[0] || '');
+      const results = Array.from(this.apiKeys.values())
+        .filter((row) => row.account_id === accountId)
+        .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+        .map((row) => clone(row) as T);
+      return { results, success: true, meta: {} };
+    }
+
     return { results: [], success: true, meta: {} };
   }
 
   async run(sql: string, params: unknown[]) {
     const normalized = normalizeSql(sql);
 
-    if (normalized.startsWith('update api_keys set last_used_at = ? where id = ?')) {
-      const key = this.apiKeys.get(String(params[1] || ''));
-      if (key) key.last_used_at = String(params[0] || '');
+    if (normalized.startsWith('update api_keys set last_used_at = ?, last_used_ip = ?, usage_count = coalesce(usage_count, 0) + 1 where id = ?')) {
+      const key = this.apiKeys.get(String(params[2] || ''));
+      if (key) {
+        key.last_used_at = String(params[0] || '');
+        key.last_used_ip = params[1] == null ? null : String(params[1]);
+        key.usage_count = Number(key.usage_count || 0) + 1;
+      }
+      return { success: true, meta: {} };
+    }
+
+    if (normalized.startsWith('update api_keys set status = ?, revoked_at = ? where id = ?')) {
+      const key = this.apiKeys.get(String(params[2] || ''));
+      if (key) {
+        key.status = String(params[0] || 'revoked');
+        key.revoked_at = params[1] == null ? null : String(params[1]);
+      }
       return { success: true, meta: {} };
     }
 
@@ -362,11 +396,39 @@ describe('memory endpoints', () => {
   const agentId = 'agent_alpha';
   const otherAgentId = 'agent_beta';
 
+  async function seedApiKey(options: {
+    id: string;
+    token: string;
+    scopes?: string[];
+    keyType?: 'live' | 'test';
+    agentIds?: string[] | null;
+    name?: string | null;
+    createdBy?: string | null;
+  }) {
+    db.apiKeys.set(options.id, {
+      id: options.id,
+      account_id: accountId,
+      key_hash: await sha256(options.token),
+      status: 'active',
+      created_at: now(),
+      last_used_at: null,
+      expires_at: null,
+      scopes: JSON.stringify(options.scopes || ['full']),
+      key_type: options.keyType || 'live',
+      agent_ids: options.agentIds?.length ? options.agentIds.join(',') : null,
+      last_used_ip: null,
+      usage_count: 0,
+      revoked_at: null,
+      name: options.name || null,
+      prefix: `${options.token.slice(0, 13)}...${options.token.slice(-4)}`,
+      created_by: options.createdBy || 'test',
+    });
+  }
+
   beforeEach(async () => {
     db = new FakeD1Database();
     ownerToken = 'mrw_acct_test_abcdefghijklmnopqrstuvwxyz1234567890';
     agentToken = 'marrow_agent_abcdefghijklmnopqrstuvwxyz1234567890';
-    const ownerHash = await sha256(ownerToken);
     const agentHash = await sha256(agentToken);
     const createdAt = now();
 
@@ -378,13 +440,9 @@ describe('memory endpoints', () => {
       created_at: createdAt,
     });
 
-    db.apiKeys.set('key_owner', {
+    await seedApiKey({
       id: 'key_owner',
-      account_id: accountId,
-      key_hash: ownerHash,
-      status: 'active',
-      created_at: createdAt,
-      last_used_at: null,
+      token: ownerToken,
     });
 
     db.agents.set(agentId, {
@@ -501,6 +559,76 @@ describe('memory endpoints', () => {
     expect(body.error).toBe('Route not found');
     expect(body.details.path).toBe('/v1/definitely-not-a-route');
     expect(body.details.method).toBe('POST');
+  });
+
+  it('route policy blocks write endpoints for read-only scoped keys', async () => {
+    const scopedToken = 'mrw_live_deadbeefdeadbeefdeadbeefdeadbeef';
+    await seedApiKey({
+      id: 'key_scoped_readonly',
+      token: scopedToken,
+      scopes: ['decisions:read'],
+    });
+
+    const createKeyRes = await apiFetch('/v1/auth/keys', {
+      method: 'POST',
+      body: JSON.stringify({ name: 'should fail' }),
+    }, scopedToken);
+    expect(createKeyRes.status).toBe(403);
+    await expect(createKeyRes.json()).resolves.toMatchObject({ error: 'Insufficient scope' });
+
+    seedMemory({ id: 'shared-alpha', text: 'alpha memory', sharedWith: [agentId] });
+    const patchMemoryRes = await apiFetch('/v1/memories/shared-alpha', {
+      method: 'PATCH',
+      body: JSON.stringify({ text: 'still nope' }),
+    }, scopedToken);
+    expect(patchMemoryRes.status).toBe(403);
+    await expect(patchMemoryRes.json()).resolves.toMatchObject({ error: 'Insufficient scope' });
+  });
+
+  it('test keys stay trapped in the test-key sandbox', async () => {
+    const testKeyToken = 'mrw_test_deadbeefdeadbeefdeadbeefdeadbeef';
+    await seedApiKey({
+      id: 'key_test_only',
+      token: testKeyToken,
+      keyType: 'test',
+      scopes: ['agents:manage'],
+    });
+
+    const accountRes = await apiFetch('/v1/auth/account', {}, testKeyToken);
+    expect(accountRes.status).toBe(200);
+    const accountBody = await accountRes.json();
+    expect(accountBody).toMatchObject({ data: { tier: 'pro' } });
+    expect(accountBody.data.email).toBeUndefined();
+    expect(accountBody.data.name).toBeUndefined();
+
+    const createLiveKeyRes = await apiFetch('/v1/auth/keys', {
+      method: 'POST',
+      body: JSON.stringify({ name: 'escape hatch', key_type: 'live' }),
+    }, testKeyToken);
+    expect(createLiveKeyRes.status).toBe(403);
+    await expect(createLiveKeyRes.json()).resolves.toMatchObject({ error: 'Test keys can only manage test keys.' });
+
+    const memoriesRes = await apiFetch('/v1/memories', {}, testKeyToken);
+    expect(memoriesRes.status).toBe(403);
+    await expect(memoriesRes.json()).resolves.toMatchObject({ error: 'Test keys cannot access production data.' });
+  });
+
+  it('test keys cannot revoke or rotate live keys', async () => {
+    const testKeyToken = 'mrw_test_feedfacefeedfacefeedfacefeedface';
+    await seedApiKey({
+      id: 'key_test_admin',
+      token: testKeyToken,
+      keyType: 'test',
+      scopes: ['agents:manage'],
+    });
+
+    const revokeRes = await apiFetch('/v1/auth/keys/key_owner/revoke', { method: 'POST' }, testKeyToken);
+    expect(revokeRes.status).toBe(403);
+    await expect(revokeRes.json()).resolves.toMatchObject({ error: 'Test keys can only manage test keys.' });
+
+    const rotateRes = await apiFetch('/v1/auth/keys/key_owner/rotate', { method: 'POST' }, testKeyToken);
+    expect(rotateRes.status).toBe(403);
+    await expect(rotateRes.json()).resolves.toMatchObject({ error: 'Test keys can only manage test keys.' });
   });
 
   it('imports a memory and lists it back through the route surface', async () => {

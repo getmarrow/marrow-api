@@ -45,18 +45,6 @@ export class OtpService {
   }
 
   /**
-   * Check rate limit: max 5 OTP requests per email per hour
-   */
-  async checkRateLimit(email: string): Promise<boolean> {
-    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    const row = await this.db
-      .prepare('SELECT COUNT(*) as cnt FROM email_otps WHERE email = ? AND created_at > ?')
-      .bind(email, oneHourAgo)
-      .first<{ cnt: number }>();
-    return (row?.cnt ?? 0) < 5;
-  }
-
-  /**
    * Store OTP in D1, replacing any existing one for this email.
    * OTP is hashed before storage (H3 fix — never store plaintext).
    */

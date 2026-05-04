@@ -1,0 +1,17 @@
+{
+  "name": "marrow-api-production",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-01",
+  "account_id": "c050a9ec0f7e36de2bc7e943a7172fb7",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "marrow-db",
+      "database_id": "da15b603-6806-45a9-b8bd-bad48b6b6ae3"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "workers_dev": true
+}

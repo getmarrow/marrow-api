@@ -3,7 +3,7 @@
  * Tests: POST /v1/workflow/before, /v1/workflow/after, GET /v1/workflow/status
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { setupTestDb, REAL_API_KEY, REAL_ACCOUNT_ID } from './helpers';
 import { WorkflowService } from '../workflow';
 
@@ -17,6 +17,25 @@ describe('Workflow Service', () => {
   });
 
   describe('POST /v1/workflow/before', () => {
+    it('uses CF AI for workflow-before semantic routing with real action/context', async () => {
+      const ai = { run: vi.fn(async () => ({ data: [new Array(768).fill(0.1)] })) };
+      workflow = new WorkflowService(db, ai);
+
+      await workflow.before(
+        {
+          decision_type: 'implementation',
+          action: 'deploy oauth fix for alice@example.com',
+          description: 'Call +1-555-123-4567 before shipping the $500 payout flow',
+        },
+        REAL_ACCOUNT_ID
+      );
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(ai.run).toHaveBeenCalled();
+      const payloads = ai.run.mock.calls.map((call: any[]) => call[1]?.text?.[0]).filter(Boolean);
+      expect(payloads.some((text: string) => text.includes('implementation: {'))).toBe(true);
+      expect(payloads.some((text: string) => text.includes('[EMAIL]') || text.includes('[PHONE]') || text.includes('[AMOUNT]'))).toBe(true);
+    });
     it('should return decision_id and context from all tiers', async () => {
       const result = await workflow.before(
         {

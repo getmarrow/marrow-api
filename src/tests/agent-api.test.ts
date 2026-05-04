@@ -3,7 +3,7 @@
  * 2-call pattern: all 20 tiers as one
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { setupTestDb, REAL_API_KEY, REAL_ACCOUNT_ID } from './helpers';
 import { WorkflowService } from '../workflow';
 
@@ -48,6 +48,25 @@ describe('Agent API — /v1/agent/think', () => {
         expect(result.decision_id).toBeDefined();
       }
     });
+  });
+
+  it('uses CF AI semantic path for think workflow inputs', async () => {
+    const ai = { run: vi.fn(async () => ({ data: [new Array(768).fill(0.1)] })) };
+    workflow = new WorkflowService(db, ai);
+
+    await workflow.before(
+      {
+        decision_type: 'implementation',
+        action: 'email alice@example.com about deploy',
+        description: 'call +1-555-123-4567 before shipping $500 refund flow',
+      },
+      REAL_ACCOUNT_ID
+    );
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(ai.run).toHaveBeenCalled();
+    const payloads = ai.run.mock.calls.map((call: any[]) => call[1]?.text?.[0]).filter(Boolean);
+    expect(payloads.some((text: string) => text.includes('[EMAIL]') || text.includes('[PHONE]') || text.includes('[AMOUNT]'))).toBe(true);
   });
 
   describe('think: intelligence response shape', () => {

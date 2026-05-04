@@ -49,21 +49,86 @@ export interface Account {
   created_at: string;
 }
 
+export type AccountTier = 'free' | 'pro' | 'enterprise' | 'owner';
+export type ApiKeyType = 'live' | 'test';
+export type ApiKeyStatus = 'active' | 'revoked';
+export type ApiKeyScope =
+  | 'full'
+  | 'decisions:read'
+  | 'decisions:write'
+  | 'memories:read'
+  | 'memories:write'
+  | 'memories:import'
+  | 'memories:export'
+  | 'patterns:read'
+  | 'agents:manage'
+  | 'webhooks:manage'
+  | 'billing:read';
+
 export interface ApiKey {
   id: string;
   account_id: string;
   key_hash: string;
-  status: 'active' | 'revoked';
+  status: ApiKeyStatus;
   created_at: string;
-  last_used_at?: string;
-  revoked_at?: string;
+  last_used_at?: string | null;
+  revoked_at?: string | null;
+  name?: string | null;
+  key_type?: ApiKeyType;
+  prefix?: string | null;
+  scopes?: string | null;
+  last_used_ip?: string | null;
+  usage_count?: number;
+  expires_at?: string | null;
+  created_by?: string | null;
+  agent_ids?: string | null;
+}
+
+export interface ManagedApiKey {
+  id: string;
+  account_id: string;
+  name: string | null;
+  key_type: ApiKeyType;
+  masked_key: string;
+  scopes: ApiKeyScope[];
+  status: ApiKeyStatus;
+  created_at: string;
+  last_used_at: string | null;
+  last_used_ip: string | null;
+  usage_count: number;
+  expires_at: string | null;
+  created_by: string | null;
+  agent_ids: string[];
+  revoked_at: string | null;
+}
+
+export type ApiKeyAuditEvent =
+  | 'created'
+  | 'revoked'
+  | 'rotated'
+  | 'auth_failed'
+  | 'auth_success';
+
+export interface ApiKeyAuditLogEntry {
+  id: string;
+  account_id: string | null;
+  key_id: string | null;
+  event: ApiKeyAuditEvent;
+  actor: string | null;
+  ip: string | null;
+  user_agent: string | null;
+  details: Record<string, unknown> | null;
+  created_at: string;
 }
 
 export interface RequestContext {
   account_id: string;
-  tier: 'free' | 'pro' | 'enterprise' | 'owner';
+  tier: AccountTier;
   api_key_id: string;
+  api_key_type?: ApiKeyType;
+  scopes?: ApiKeyScope[];
   agent_id?: string; // Set when auth token is an agent-scoped key (marrow_agent_*)
+  agent_ids?: string[]; // Set when an API key is bound to specific agents
 }
 
 // ============= Decisions (Tiers 2-3) =============
@@ -112,6 +177,8 @@ export interface DecisionVector {
   decision_id: string;
   vector_embedding: number[];
   decision_type: string;
+  model: string;
+  dimensions: number;
   created_at: string;
 }
 
@@ -380,3 +447,15 @@ export interface ApiResponse<T = unknown> {
     deprecation_warning?: string;
   };
 }
+
+export interface LearnedTemplate {
+  template_id: string;
+  pattern_cluster: string;
+  steps: string[];
+  success_rate: number;
+  confidence: number;
+  usage_count: number;
+  decision_type: string;
+  created_at: string;
+}
+

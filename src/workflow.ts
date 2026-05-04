@@ -22,7 +22,8 @@ import { VersionService } from './services/version.service';
 import { MarketplaceService } from './services/marketplace.service';
 import { AuditService } from './services/audit.service';
 import { PatternRecognitionService } from './services/pattern-recognition.service';
-import { WorkflowWarning } from './types';
+import { OrgService } from './services/org.service';
+import { WorkflowWarning, LearnedTemplate } from './types';
 import { D1Database } from '@cloudflare/workers-types';
 
 export interface WorkflowBeforeInput {
@@ -37,6 +38,7 @@ export interface WorkflowBeforeInput {
 export interface WorkflowBeforeOutput {
   decision_id: string;           // T2
   similar_decisions: any[];      // T7 — top 3
+  risk_score: number | null;     // T7-P2 — predictive risk (0-1)
   bootstrap_templates: any[];    // T11
   patterns: any[];               // T8
   shared_context: any[];         // T4
@@ -78,7 +80,7 @@ export interface WorkflowStatusOutput {
 }
 
 export class WorkflowService {
-  constructor(private db: D1Database) {}
+  constructor(private db: D1Database, private ai?: any) {}
 
   /**
    * BEFORE: Pre-decision context from all 20 tiers
@@ -91,8 +93,8 @@ export class WorkflowService {
     orgPiiStripTeam: boolean = false
   ): Promise<WorkflowBeforeOutput> {
     const services = {
-      decision: new DecisionService(this.db),
-      patterns: new PatternsService(this.db),
+      decision: new DecisionService(this.db, this.ai),
+      patterns: new PatternsService(this.db, this.ai),
       bootstrap: new BootstrapService(this.db),
       priority: new PriorityService(this.db),
       analytics: new AnalyticsService(this.db),
@@ -124,10 +126,29 @@ export class WorkflowService {
         analytics,         // T17
         sharedContext,     // T4
       ] = await Promise.all([
-        // T7: Routing suggestions (similar past decisions)
-        services.patterns
-          .predictSimilarDecisions({}, input.decision_type, 3)
-          .catch(() => []),
+        // T7: Routing suggestions (similar past decisions with risk score)
+        // Phase 3: Org-wide routing for Team/Enterprise tiers
+        (async () => {
+          try {
+            if (tier === 'enterprise' || tier === 'owner') {
+              const orgSvc = new OrgService(this.db);
+              const org = await orgSvc.getOrgForAccount(account_id);
+              if (org) {
+                return await services.patterns.predictSimilarDecisionsOrgWide(
+                  { action: input.action, description: input.description },
+                  input.decision_type, org.id, 3
+                );
+              }
+            }
+            return await services.patterns.predictSimilarDecisions(
+              { action: input.action, description: input.description },
+              input.decision_type, 3
+            );
+          } catch (e) {
+            console.error('[T7 routing]', e instanceof Error ? e.message : e);
+            return { similar: [], risk_score: null };
+          }
+        })(),
 
         // T8: Patterns discovery
         services.patterns
@@ -219,9 +240,13 @@ export class WorkflowService {
         // warnings stay []
       }
 
+      const risk_score = (similarDecisions as any)?.risk_score ?? null;
+      const similarList = (similarDecisions as any)?.similar || similarDecisions || [];
+
       return {
         decision_id,
-        similar_decisions: (similarDecisions || []).slice(0, 3),
+        similar_decisions: Array.isArray(similarList) ? similarList.slice(0, 3) : [],
+        risk_score,
         bootstrap_templates: templates || [],
         patterns: patterns || [],
         shared_context: sharedContext || [],
@@ -245,7 +270,7 @@ export class WorkflowService {
     account_id: string
   ): Promise<WorkflowAfterOutput> {
     const services = {
-      decision: new DecisionService(this.db),
+      decision: new DecisionService(this.db, this.ai),
       feedback: new FeedbackService(this.db),
       consensus: new ConsensusService(this.db),
       analytics: new AnalyticsService(this.db),
@@ -346,7 +371,7 @@ export class WorkflowService {
   async status(accountId?: string): Promise<WorkflowStatusOutput> {
     const services = {
       analytics: new AnalyticsService(this.db),
-      patterns: new PatternsService(this.db),
+      patterns: new PatternsService(this.db, this.ai),
       bootstrap: new BootstrapService(this.db),
       audit: new AuditService(this.db),
       consensus: new ConsensusService(this.db),

@@ -7,29 +7,53 @@
 import { Pattern, TrendSignal } from '../types';
 import { uuid, now } from '../utils/crypto';
 import { computeEmbedding, cosineSimilarity } from '../utils/vectors';
+import { PiiService } from './pii.service';
 
 export class PatternsService {
-  constructor(private db: D1Database) {}
+  private ai: any;
+  private pii: PiiService;
+
+  constructor(private db: D1Database, ai?: any) {
+    this.ai = ai;
+    this.pii = new PiiService();
+  }
 
   // ====== TIER 7: PREDICTIVE ROUTING ======
 
   async predictSimilarDecisions(newContext: Record<string, unknown>, decisionType: string, limit = 5) {
     const vectors = await this.db.prepare(`
-      SELECT dv.*, d.confidence, d.outcome FROM decision_vectors dv
+      SELECT dv.*, d.confidence, d.outcome, d.outcome_success FROM decision_vectors dv
       JOIN decisions d ON dv.decision_id = d.id
       WHERE d.decision_type = ? AND (d.visibility = 'hive' OR d.visibility = 'shared')
       LIMIT 100
     `).bind(decisionType).all<Record<string, unknown>>();
 
-    const newEmb = computeEmbedding(decisionType, Object.keys(newContext));
+    const safeContext = this.pii.stripObject(newContext);
+    const newEmb = await computeEmbedding(this.ai, `${decisionType}: ${JSON.stringify(safeContext)}`);
 
-    return (vectors.results || [])
+    const sorted = (vectors.results || [])
       .map(r => {
         const emb = JSON.parse(String(r.vector_embedding)) as number[];
-        return { decision_id: r.decision_id, decision_type: r.decision_type, confidence: r.confidence, outcome: r.outcome, similarity: cosineSimilarity(newEmb, emb) };
+        return { decision_id: r.decision_id, decision_type: r.decision_type, confidence: r.confidence, outcome: r.outcome, outcome_success: r.outcome_success, similarity: cosineSimilarity(newEmb, emb) };
       })
       .sort((a, b) => b.similarity - a.similarity)
       .slice(0, limit);
+
+    // Phase 2: Predictive risk score from top-N similar outcomes
+    let risk_score: number | null = null;
+    if (sorted.length >= 2) {
+      const topIds = sorted.map(s => s.decision_id);
+      const outcomeRows = await this.db.prepare(
+        `SELECT outcome_success FROM decisions WHERE id IN (${topIds.map(() => '?').join(',')}) AND outcome_success IS NOT NULL`
+      ).bind(...topIds).all<{ outcome_success: number }>();
+      const withOutcomes = (outcomeRows.results || []).filter(r => r.outcome_success !== null);
+      if (withOutcomes.length >= 2) {
+        const successful = withOutcomes.filter(r => r.outcome_success === 1).length;
+        risk_score = 1 - (successful / withOutcomes.length);
+      }
+    }
+
+    return { similar: sorted, risk_score };
   }
 
   // ====== TIER 8: PATTERN DISCOVERY ======
@@ -252,6 +276,284 @@ export class PatternsService {
       trend_direction: String(r.trend_direction),
       magnitude: Number(r.magnitude),
       calculated_at: String(r.calculated_at),
+      created_at: String(r.created_at),
+    }));
+  }
+
+
+  /**
+   * Phase 3: Org-wide predictive routing for Team/Enterprise tiers.
+   * Searches decisions from all org members, not just single account.
+   * PII is stripped before embedding; context_hive is used for cross-account reads.
+   */
+  async predictSimilarDecisionsOrgWide(
+    newContext: Record<string, unknown>,
+    decisionType: string,
+    orgId: string,
+    limit = 5
+  ) {
+    // Get all member account IDs in the org
+    const memberRows = await this.db.prepare(
+      'SELECT account_id FROM org_members WHERE org_id = ?'
+    ).bind(orgId).all<{ account_id: string }>();
+    const memberIds = (memberRows.results || []).map(r => r.account_id);
+    if (memberIds.length === 0) {
+      return { similar: [], risk_score: null };
+    }
+
+    const placeholders = memberIds.map(() => '?').join(',');
+    const vectors = await this.db.prepare(`
+      SELECT dv.*, d.confidence, d.outcome, d.outcome_success, d.account_id FROM decision_vectors dv
+      JOIN decisions d ON dv.decision_id = d.id
+      WHERE d.decision_type = ? AND d.account_id IN (${placeholders})
+        AND (d.visibility = 'hive' OR d.visibility = 'shared' OR d.visibility = 'team')
+      LIMIT 100
+    `).bind(decisionType, ...memberIds).all<Record<string, unknown>>();
+
+    const safeContext = this.pii.stripObject(newContext);
+    const newEmb = await computeEmbedding(this.ai, `${decisionType}: ${JSON.stringify(safeContext)}`);
+
+    const sorted = (vectors.results || [])
+      .map(r => {
+        const emb = JSON.parse(String(r.vector_embedding)) as number[];
+        return { decision_id: r.decision_id, decision_type: r.decision_type, confidence: r.confidence, outcome: r.outcome, outcome_success: r.outcome_success, account_id: r.account_id, similarity: cosineSimilarity(newEmb, emb) };
+      })
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, limit);
+
+    // Risk score from team outcomes
+    let risk_score: number | null = null;
+    if (sorted.length >= 2) {
+      const topIds = sorted.map(s => s.decision_id);
+      const outcomeRows = await this.db.prepare(
+        `SELECT outcome_success FROM decisions WHERE id IN (${topIds.map(() => '?').join(',')}) AND outcome_success IS NOT NULL`
+      ).bind(...topIds).all<{ outcome_success: number }>();
+      const withOutcomes = (outcomeRows.results || []).filter(r => r.outcome_success !== null);
+      if (withOutcomes.length >= 2) {
+        const successful = withOutcomes.filter(r => r.outcome_success === 1).length;
+        risk_score = 1 - (successful / withOutcomes.length);
+      }
+    }
+
+    return { similar: sorted, risk_score };
+  }
+
+  /**
+   * Phase 3: Discover patterns across an entire org (Team/Enterprise).
+   * Aggregates decisions from all org members, strips PII from context,
+   * and computes cross-agent patterns with success/failure tracking.
+   */
+  async discoverOrgPatterns(orgId: string, decisionType: string): Promise<Pattern[]> {
+    const memberRows = await this.db.prepare(
+      'SELECT account_id FROM org_members WHERE org_id = ?'
+    ).bind(orgId).all<{ account_id: string }>();
+    const memberIds = (memberRows.results || []).map(r => r.account_id);
+    if (memberIds.length === 0) return [];
+
+    const placeholders = memberIds.map(() => '?').join(',');
+    const res = await this.db.prepare(`
+      SELECT id, account_id, CASE WHEN account_id IN (${placeholders}) THEN COALESCE(context_hive, context) ELSE context END as context,
+      outcome, outcome_success, created_at FROM decisions
+      WHERE account_id IN (${placeholders})
+      AND (decision_type = ? OR ? = 'all')
+      AND created_at > datetime('now', '-30 days')
+      ORDER BY created_at DESC
+      LIMIT 500
+    `).bind(...memberIds, decisionType, decisionType).all<Record<string, unknown>>();
+
+    const patternMap = new Map<string, { count: number; firstSeen: string; lastSeen: string; outcomes: string[]; successCount: number }>();
+    const rows = res.results || [];
+    const totalCount = rows.length;
+
+    if (totalCount >= 3) {
+      const typeSig = this.simpleHash('org_type:' + decisionType);
+      const first = rows[rows.length - 1];
+      const last = rows[0];
+      patternMap.set(typeSig, {
+        count: totalCount,
+        firstSeen: String(first?.created_at || now()),
+        lastSeen: String(last?.created_at || now()),
+        outcomes: rows.slice(0, 5).map(r => {
+          const strippedOutcome = this.pii.stripString(String(r.outcome || ''));
+          return strippedOutcome.slice(0, 100);
+        }),
+        successCount: rows.filter(r => r.outcome_success).length,
+      });
+    }
+
+    for (const row of rows) {
+      const strippedOutcome = this.pii.stripString(String(row.outcome || '')).toLowerCase().trim().slice(0, 30);
+      const sig = this.simpleHash('org_' + decisionType + ':' + strippedOutcome);
+      const existing = patternMap.get(sig);
+      patternMap.set(sig, {
+        count: (existing?.count || 0) + 1,
+        firstSeen: existing?.firstSeen || String(row.created_at),
+        lastSeen: String(row.created_at),
+        outcomes: [...(existing?.outcomes || []), this.pii.stripString(String(row.outcome || '')).slice(0, 100)].slice(-5),
+        successCount: (existing?.successCount || 0) + (row.outcome_success ? 1 : 0),
+      });
+    }
+
+    const patterns: Pattern[] = [];
+    for (const [sig, data] of patternMap) {
+      if (data.count < 2) continue;
+      const confidence = Math.min(1, data.count / 10);
+      patterns.push({
+        id: uuid(),
+        account_id: orgId,
+        decision_type: decisionType,
+        pattern_signature: sig,
+        frequency: data.count,
+        first_seen: data.firstSeen,
+        last_seen: data.lastSeen,
+        confidence,
+        created_at: now(),
+      });
+    }
+    return patterns;
+  }
+
+  // ====== PHASE 2: LEARNED TEMPLATES ======
+
+
+  /**
+   * Refreshes learned templates from existing pattern clusters.
+   * Async, on-demand — not called per-think. Uses semantic clustering on
+   * pattern_signature embeddings, extracts high-confidence templates.
+   */
+  async learnTemplates(): Promise<void> {
+    try {
+      // 1. Load all patterns with their decision vectors
+      const patternRows = await this.db.prepare(`
+        SELECT DISTINCT p.id as pattern_id, p.decision_type, p.pattern_signature,
+               p.frequency, p.confidence,
+               (SELECT COUNT(*) FROM patterns WHERE decision_type = p.decision_type) as type_count
+        FROM patterns p
+        ORDER BY p.decision_type, p.frequency DESC
+      `).all<Record<string, unknown>>();
+
+      const patterns = (patternRows.results || []) as Array<{
+        pattern_id: string; decision_type: string;
+        pattern_signature: string; frequency: number;
+        confidence: number; type_count: number;
+      }>;
+
+      if (patterns.length < 2) {
+        console.log('[learnTemplates] Not enough patterns to cluster (need ≥2, got ' + patterns.length + ')');
+        return;
+      }
+
+      // 2. Compute embeddings for each pattern from its signature
+      const patternEmbs: Array<{ p: typeof patterns[0]; emb: number[] }> = [];
+      for (const p of patterns) {
+        const safeSig = this.pii.stripString(p.pattern_signature);
+        const emb = await computeEmbedding(this.ai, `${p.decision_type}: ${safeSig}`);
+        patternEmbs.push({ p, emb });
+      }
+
+      // 3. Cluster patterns by cosine similarity (threshold 0.7)
+      const clusters: Array<Array<typeof patterns[0]>> = [];
+      const assigned = new Set<number>();
+
+      for (let i = 0; i < patternEmbs.length; i++) {
+        if (assigned.has(i)) continue;
+        const cluster: typeof patterns = [patternEmbs[i].p];
+        assigned.add(i);
+        for (let j = i + 1; j < patternEmbs.length; j++) {
+          if (assigned.has(j)) continue;
+          const sim = cosineSimilarity(patternEmbs[i].emb, patternEmbs[j].emb);
+          if (sim >= 0.7) {
+            cluster.push(patternEmbs[j].p);
+            assigned.add(j);
+          }
+        }
+        clusters.push(cluster);
+      }
+
+      console.log('[learnTemplates] Clustered ' + patterns.length + ' patterns into ' + clusters.length + ' clusters');
+
+      // 4. Extract templates from clusters with ≥3 patterns and ≥60% success rate
+      const templates: Array<{
+        template_id: string; pattern_cluster: string; steps: string[];
+        success_rate: number; confidence: number; usage_count: number;
+        decision_type: string;
+      }> = [];
+
+      for (const cluster of clusters) {
+        if (cluster.length < 3) continue;
+
+        const clusterName = this.pii.stripString(
+          cluster.map(c => c.decision_type).join('|')
+        ).slice(0, 100) || 'unnamed_cluster';
+
+        const avgConfidence = cluster.reduce((s, c) => s + c.confidence, 0) / cluster.length;
+        const totalFreq = cluster.reduce((s, c) => s + c.frequency, 0);
+
+        // Derive success_rate from pattern frequency vs type_count
+        const maxTypeCount = Math.max(...cluster.map(c => c.type_count), 1);
+        const successRate = Math.min(1, totalFreq / (maxTypeCount * cluster.length));
+
+        if (successRate < 0.6) continue;
+
+        // Steps: top 5 pattern signatures as action sequences
+        const steps = cluster
+          .sort((a, b) => b.frequency - a.frequency)
+          .slice(0, 5)
+          .map(c => this.pii.stripString(c.pattern_signature).slice(0, 50));
+
+        const templateId = this.simpleHash('template:' + clusterName + ':' + cluster.map(c => c.pattern_id).join(','));
+
+        templates.push({
+          template_id: 'tpl_' + templateId,
+          pattern_cluster: clusterName,
+          steps,
+          success_rate: successRate,
+          confidence: avgConfidence,
+          usage_count: totalFreq,
+          decision_type: cluster[0].decision_type,
+        });
+      }
+
+      // 5. Upsert into learned_templates (atomic: delete all, insert fresh)
+      const ts = now();
+      await this.db.prepare('DELETE FROM learned_templates').run();
+      for (const tpl of templates) {
+        await this.db.prepare(
+          'INSERT INTO learned_templates (id, template_id, pattern_cluster, steps, success_rate, confidence, usage_count, decision_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(
+          uuid(), tpl.template_id, tpl.pattern_cluster, JSON.stringify(tpl.steps),
+          tpl.success_rate, tpl.confidence, tpl.usage_count,
+          tpl.decision_type, ts, ts
+        ).run();
+      }
+
+      console.log('[learnTemplates] Generated ' + templates.length + ' templates');
+    } catch (e) {
+      console.error('[learnTemplates] Failed:', e instanceof Error ? e.message : e);
+      throw e;
+    }
+  }
+
+  /**
+   * Get learned templates, sorted by confidence × success_rate.
+   * No auth required — public browsing endpoint.
+   */
+  async getLearnedTemplates(limit = 20) {
+    const rows = await this.db.prepare(`
+      SELECT template_id, pattern_cluster, steps, success_rate, confidence, usage_count, decision_type, created_at
+      FROM learned_templates
+      ORDER BY (confidence * success_rate) DESC
+      LIMIT ?
+    `).bind(limit).all<Record<string, unknown>>();
+
+    return (rows.results || []).map(r => ({
+      template_id: String(r.template_id),
+      pattern_cluster: String(r.pattern_cluster),
+      steps: JSON.parse(String(r.steps || '[]')),
+      success_rate: Number(r.success_rate),
+      confidence: Number(r.confidence),
+      usage_count: Number(r.usage_count),
+      decision_type: String(r.decision_type),
       created_at: String(r.created_at),
     }));
   }

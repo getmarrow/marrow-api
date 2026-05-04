@@ -5,9 +5,9 @@
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
 
-export const REAL_API_KEY = process.env.TEST_API_KEY || '';
+export const REAL_API_KEY = process.env.TEST_API_KEY || 'mrw_empirebuu_test_real_api_key_abcdefghijklmnopqrstuvwxyz1234567890';
 export const REAL_ACCOUNT_ID = 'empirebuu';
-export const REAL_KEY_HASH = 'f54e7036e7e926c256b227e1247be1ffd56e255e720d2e43fd1c02da34c9dd43';
+export const REAL_KEY_HASH = 'f2210c259884d775b30555f8f2dbb7d59307e2338fad4085a7691c9c3df4c4b8';
 export const TEST_ENCRYPTION_KEY = 'test-encryption-key-for-marrow-unit-tests';
 
 export async function setupTestDb(): Promise<D1Database> {
@@ -36,7 +36,9 @@ class InMemoryDB {
       'pattern_tests', 'pattern_results', 'transfer_history', 'transfer_metrics',
       'decision_priority', 'queue_status', 'bootstrap_instances', 'consensus_analysis',
       'snapshot_metadata', 'snapshot_diffs', 'restore_jobs', 'migration_guides',
-      'deprecation_warnings', 'lesson_versions', 'versions'
+      'deprecation_warnings', 'lesson_versions', 'versions',
+      'learned_templates', 'memories', 'memory_shares',
+      'orgs', 'org_members', 'api_key_audit_log', 'rate_limits'
     ];
     for (const name of tableNames) {
       this.tables.set(name, new Map());
@@ -51,13 +53,15 @@ class InMemoryDB {
   addRow(table: string, row: Record<string, unknown>) {
     const t = this.rawRows.get(table);
     if (t) {
-      // Handle OR REPLACE / OR IGNORE for unique constraints
-      const existing = t.findIndex(r => r.id === row.id);
-      if (existing >= 0) {
-        t[existing] = row;
-      } else {
-        t.push(row);
+      // Only treat explicit ids as replaceable unique keys.
+      if (row.id != null) {
+        const existing = t.findIndex(r => r.id === row.id);
+        if (existing >= 0) {
+          t[existing] = row;
+          return;
+        }
       }
+      t.push(row);
     }
   }
 
@@ -110,6 +114,14 @@ export function createMockD1(): D1Database {
     created_at: new Date().toISOString(),
     last_used_at: null,
     revoked_at: null,
+    name: 'Primary enterprise key',
+    key_type: 'live',
+    prefix: 'mrw_legacy_****',
+    scopes: JSON.stringify(['full']),
+    last_used_ip: null,
+    usage_count: 0,
+    expires_at: null,
+    created_by: 'signup',
   });
 
   // Seed bootstrap templates
@@ -187,8 +199,8 @@ function createStatement(db: InMemoryDB, sql: string): D1PreparedStatement {
       return { results: result.rows as T[], success: true, meta: {} as D1Meta };
     },
     async run(): Promise<D1Response> {
-      executeSql(db, sql, boundParams);
-      return { success: true, meta: {} as D1Meta };
+      const result = executeSql(db, sql, boundParams);
+      return { success: true, meta: { changes: result.changes } as D1Meta };
     },
     async raw<T>(): Promise<T[]> {
       const result = executeSql(db, sql, boundParams);
@@ -235,7 +247,7 @@ function executeInsert(db: InMemoryDB, sql: string, params: unknown[]): SqlResul
   if (!tableMatch) return { rows: [], changes: 0 };
 
   const table = tableMatch[1];
-  const colMatch = sql.match(/\(([^)]+)\)\s*VALUES/i);
+  const colMatch = sql.match(/\(([^)]+)\)\s*(?:VALUES|SELECT)/i);
   if (!colMatch) return { rows: [], changes: 0 };
 
   const columns = colMatch[1].split(',').map(c => c.trim());
@@ -245,18 +257,21 @@ function executeInsert(db: InMemoryDB, sql: string, params: unknown[]): SqlResul
     row[columns[i]] = i < params.length ? params[i] : null;
   }
 
+  if (/INSERT\s+INTO\s+api_keys/i.test(sql) && /SELECT\s+\?/i.test(sql) && /WHERE\s*\(\s*SELECT\s+COUNT\(\*\)/i.test(sql)) {
+    const accountId = String(params[columns.length] || '');
+    const limit = Number(params[columns.length + 1] || 0);
+    const active = db.queryRows('api_keys', r => r.account_id === accountId && r.status === 'active').length;
+    if (active >= limit) return { rows: [], changes: 0 };
+  }
+
   // Handle OR REPLACE: remove existing row with same unique key
   if (/OR\s+REPLACE/i.test(sql)) {
-    const existing = db.getRows(table);
-    // Check for unique constraints (id, or composite unique)
     if (row.id) {
       db.deleteRows(table, r => r.id === row.id);
     }
-    // For consensus_votes: unique on (decision_id, voting_agent_id)
     if (table === 'consensus_votes' && row.decision_id && row.voting_agent_id) {
       db.deleteRows(table, r => r.decision_id === row.decision_id && r.voting_agent_id === row.voting_agent_id);
     }
-    // For lesson_ratings: unique on (lesson_id, account_id)
     if (table === 'lesson_ratings' && row.lesson_id && row.account_id) {
       db.deleteRows(table, r => r.lesson_id === row.lesson_id && r.account_id === row.account_id);
     }
@@ -266,6 +281,9 @@ function executeInsert(db: InMemoryDB, sql: string, params: unknown[]): SqlResul
   if (/OR\s+IGNORE/i.test(sql)) {
     const existing = db.getRows(table);
     if (row.id && existing.some(r => r.id === row.id)) {
+      return { rows: [], changes: 0 };
+    }
+    if (table === 'decision_vectors' && row.decision_id && existing.some(r => r.decision_id === row.decision_id)) {
       return { rows: [], changes: 0 };
     }
   }
@@ -637,6 +655,13 @@ function evalCondition(row: Record<string, unknown>, cond: string, params: unkno
   if (lteMatch) {
     const col = lteMatch[1].split('.').pop()!;
     return String(row[col] || '') <= String(params[startIdx] || '');
+  }
+
+  // Handle < ?
+  const ltMatch = trimCond.match(/(\w+(?:\.\w+)?)\s*<\s*\?/);
+  if (ltMatch) {
+    const col = ltMatch[1].split('.').pop()!;
+    return String(row[col] || '') < String(params[startIdx] || '');
   }
 
   return true; // Default pass for unrecognized conditions

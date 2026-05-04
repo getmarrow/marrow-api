@@ -1,9 +1,9 @@
 /**
- * Tier 1: Authentication & Routing — 30 tests
+ * Tier 1: Authentication & Routing
  */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { AuthService } from '../services/auth.service';
-import { createMockD1, REAL_API_KEY, REAL_ACCOUNT_ID, REAL_KEY_HASH } from './helpers';
+import { AuthRateLimitError, AuthService, AuthServiceError } from '../services/auth.service';
+import { createMockD1, REAL_API_KEY, REAL_ACCOUNT_ID } from './helpers';
 
 describe('Tier 1: Authentication & Routing', () => {
   let db: D1Database;
@@ -14,196 +14,244 @@ describe('Tier 1: Authentication & Routing', () => {
     auth = new AuthService(db);
   });
 
-  // Token validation
-  it('validates real API key successfully', async () => {
+  it('validates legacy API keys for backward compatibility', async () => {
     const ctx = await auth.validateToken(`Bearer ${REAL_API_KEY}`);
     expect(ctx).not.toBeNull();
     expect(ctx!.account_id).toBe(REAL_ACCOUNT_ID);
     expect(ctx!.tier).toBe('enterprise');
+    expect(ctx!.api_key_id).toBe('key-prod-001');
   });
 
-  it('rejects null auth header', async () => {
-    const ctx = await auth.validateToken(null);
-    expect(ctx).toBeNull();
+  it('rejects missing or malformed auth headers', async () => {
+    await expect(auth.validateToken(null)).resolves.toBeNull();
+    await expect(auth.validateToken('')).resolves.toBeNull();
+    await expect(auth.validateToken('Basic abc123')).resolves.toBeNull();
+    await expect(auth.validateToken('Bearer short')).resolves.toBeNull();
+    await expect(auth.validateToken('Bearer    ')).resolves.toBeNull();
   });
 
-  it('rejects empty auth header', async () => {
-    const ctx = await auth.validateToken('');
-    expect(ctx).toBeNull();
+  it('creates accounts with default and explicit tiers', async () => {
+    const free = await auth.createAccount('Free Agent', 'free@test.com');
+    const pro = await auth.createAccount('Pro Agent', 'pro@test.com', 'pro');
+    expect(free.tier).toBe('free');
+    expect(pro.tier).toBe('pro');
+    expect(free.id).not.toBe(pro.id);
+    expect(new Date(free.created_at).getTime()).toBeGreaterThan(0);
   });
 
-  it('rejects non-Bearer auth', async () => {
-    const ctx = await auth.validateToken('Basic abc123');
-    expect(ctx).toBeNull();
+  it('creates new-format managed API keys with masked display', async () => {
+    const created = await auth.createApiKey(REAL_ACCOUNT_ID, {
+      name: 'CI Runner',
+      keyType: 'test',
+      scopes: ['decisions:read', 'memories:write'],
+      createdBy: 'dashboard',
+    });
+
+    expect(created.key).toMatch(/^mrw_(live|test)_[a-f0-9]{32}$/);
+    expect(created.maskedKey).toMatch(/^mrw_(live|test)_[a-f0-9]{4}\.\.\.[a-f0-9]{4}$/);
+    expect(created.maskedKey).not.toBe(created.key);
+    expect(created.keyId).toBeTruthy();
   });
 
-  it('rejects short token', async () => {
-    const ctx = await auth.validateToken('Bearer short');
-    expect(ctx).toBeNull();
+  it('listKeys and getKey return masked keys only', async () => {
+    const created = await auth.createApiKey(REAL_ACCOUNT_ID, {
+      name: 'Production Agent #3',
+      keyType: 'live',
+      scopes: ['full'],
+      createdBy: 'api',
+    });
+
+    const listed = await auth.listKeys(REAL_ACCOUNT_ID);
+    const found = listed.find((key) => key.id === created.keyId);
+    expect(found).toBeTruthy();
+    expect(found!.masked_key).toBe(created.maskedKey);
+    expect(found!.masked_key).not.toBe(created.key);
+    expect(found!.name).toBe('Production Agent #3');
+
+    const single = await auth.getKey(created.keyId, REAL_ACCOUNT_ID);
+    expect(single).not.toBeNull();
+    expect(single!.masked_key).toBe(created.maskedKey);
+    expect(single!.scopes).toEqual(['full']);
   });
 
-  it('rejects invalid token', async () => {
-    const ctx = await auth.validateToken('Bearer mrw_invalid_0000000000000000000000000000000000');
-    expect(ctx).toBeNull();
-  });
+  it('newly created key authenticates with type, scopes, and agent bindings', async () => {
+    const account = await auth.createAccount('Key Test', 'key@test.com', 'pro');
+    const created = await auth.createApiKey(account.id, {
+      name: 'Read Only',
+      keyType: 'test',
+      scopes: ['decisions:read'],
+      agentIds: ['agent-alpha', 'agent-beta'],
+      createdBy: 'dashboard',
+    });
 
-  it('rejects Bearer with no token', async () => {
-    const ctx = await auth.validateToken('Bearer ');
-    expect(ctx).toBeNull();
-  });
-
-  it('rejects Bearer with spaces only', async () => {
-    const ctx = await auth.validateToken('Bearer    ');
-    expect(ctx).toBeNull();
-  });
-
-  it('returns correct tier for enterprise account', async () => {
-    const ctx = await auth.validateToken(`Bearer ${REAL_API_KEY}`);
-    expect(ctx!.tier).toBe('enterprise');
-  });
-
-  it('returns api_key_id on successful auth', async () => {
-    const ctx = await auth.validateToken(`Bearer ${REAL_API_KEY}`);
-    expect(ctx!.api_key_id).toBeTruthy();
-  });
-
-  // Account creation
-  it('creates new account', async () => {
-    const account = await auth.createAccount('Test Agent', 'test@test.com', 'free');
-    expect(account.id).toBeTruthy();
-    expect(account.name).toBe('Test Agent');
-    expect(account.email).toBe('test@test.com');
-    expect(account.tier).toBe('free');
-  });
-
-  it('creates pro account', async () => {
-    const account = await auth.createAccount('Pro Agent', 'pro@test.com', 'pro');
-    expect(account.tier).toBe('pro');
-  });
-
-  it('creates enterprise account', async () => {
-    const account = await auth.createAccount('Enterprise', 'ent@test.com', 'enterprise');
-    expect(account.tier).toBe('enterprise');
-  });
-
-  it('defaults to free tier', async () => {
-    const account = await auth.createAccount('Free', 'free@test.com');
-    expect(account.tier).toBe('free');
-  });
-
-  it('generates unique account IDs', async () => {
-    const a1 = await auth.createAccount('A1', 'a1@test.com');
-    const a2 = await auth.createAccount('A2', 'a2@test.com');
-    expect(a1.id).not.toBe(a2.id);
-  });
-
-  it('sets created_at timestamp', async () => {
-    const account = await auth.createAccount('Time', 'time@test.com');
-    expect(account.created_at).toBeTruthy();
-    expect(new Date(account.created_at).getTime()).toBeGreaterThan(0);
-  });
-
-  // API key management
-  it('creates API key for account', async () => {
-    const { key, keyId } = await auth.createApiKey(REAL_ACCOUNT_ID);
-    expect(key).toMatch(/^mrw_/);
-    expect(key).toContain(REAL_ACCOUNT_ID);
-    expect(keyId).toBeTruthy();
-  });
-
-  it('generated key has correct format', async () => {
-    const { key } = await auth.createApiKey(REAL_ACCOUNT_ID);
-    expect(key).toMatch(/^mrw_\w+_[a-f0-9]{64}$/);
-  });
-
-  it('generated keys are unique', async () => {
-    const k1 = await auth.createApiKey(REAL_ACCOUNT_ID);
-    const k2 = await auth.createApiKey(REAL_ACCOUNT_ID);
-    expect(k1.key).not.toBe(k2.key);
-    expect(k1.keyId).not.toBe(k2.keyId);
-  });
-
-  it('newly created key can authenticate', async () => {
-    const account = await auth.createAccount('KeyTest', 'keytest@test.com');
-    const { key } = await auth.createApiKey(account.id);
-    const ctx = await auth.validateToken(`Bearer ${key}`);
+    const ctx = await auth.validateToken(`Bearer ${created.key}`);
     expect(ctx).not.toBeNull();
     expect(ctx!.account_id).toBe(account.id);
+    expect(ctx!.api_key_type).toBe('test');
+    expect(ctx!.scopes).toEqual(['decisions:read']);
+    expect(ctx!.agent_ids).toEqual(['agent-alpha', 'agent-beta']);
+
+    const stored = await auth.getKey(created.keyId, account.id);
+    expect(stored!.agent_ids).toEqual(['agent-alpha', 'agent-beta']);
   });
 
-  // Key revocation
-  it('revokes API key', async () => {
-    const account = await auth.createAccount('Revoke', 'revoke@test.com');
-    const { key, keyId } = await auth.createApiKey(account.id);
-
-    // Verify it works first
-    const ctx1 = await auth.validateToken(`Bearer ${key}`);
-    expect(ctx1).not.toBeNull();
-
-    // Revoke
-    await auth.revokeApiKey(keyId, account.id);
-
-    // Verify it's rejected
-    const ctx2 = await auth.validateToken(`Bearer ${key}`);
-    expect(ctx2).toBeNull();
+  it('rejects invalid scopes instead of silently upgrading them', async () => {
+    const account = await auth.createAccount('Bad Scope', 'bad-scope@test.com', 'pro');
+    await expect(auth.createApiKey(account.id, { scopes: ['totally:invalid'] })).rejects.toMatchObject({
+      status: 400,
+      message: 'Invalid scope: totally:invalid',
+    });
   });
 
-  // Account retrieval
-  it('gets existing account', async () => {
-    const account = await auth.getAccount(REAL_ACCOUNT_ID);
-    expect(account).not.toBeNull();
-    expect(account!.name).toBe('Empire Buu');
+  it('enforces free-tier key limits', async () => {
+    const account = await auth.createAccount('Free Fleet', 'fleet@test.com', 'free');
+    await auth.createApiKey(account.id, { name: 'Key 1' });
+    await auth.createApiKey(account.id, { name: 'Key 2' });
+    await expect(auth.createApiKey(account.id, { name: 'Key 3' })).rejects.toMatchObject<AuthServiceError>({
+      status: 403,
+      message: 'Tier key limit reached (2)',
+    });
   });
 
-  it('returns null for non-existent account', async () => {
-    const account = await auth.getAccount('nonexistent');
+  it('rejects expiry on free tier but allows it on pro', async () => {
+    const free = await auth.createAccount('Free Expiry', 'free-expiry@test.com', 'free');
+    const pro = await auth.createAccount('Pro Expiry', 'pro-expiry@test.com', 'pro');
+    const future = new Date(Date.now() + 60_000).toISOString();
+
+    await expect(auth.createApiKey(free.id, { expiresAt: future })).rejects.toMatchObject<AuthServiceError>({
+      status: 403,
+    });
+
+    const created = await auth.createApiKey(pro.id, {
+      name: 'Expiring Key',
+      expiresAt: future,
+      scopes: ['decisions:read', 'memories:read'],
+    });
+    const stored = await auth.getKey(created.keyId, pro.id);
+    expect(stored!.expires_at).toBe(future);
+    expect(stored!.scopes).toEqual(['decisions:read', 'memories:read']);
+  });
+
+  it('revoked keys no longer authenticate', async () => {
+    const account = await auth.createAccount('Revoke Test', 'revoke@test.com', 'pro');
+    const created = await auth.createApiKey(account.id, { name: 'Revocable' });
+
+    expect(await auth.validateToken(`Bearer ${created.key}`)).not.toBeNull();
+    await auth.revokeApiKey(created.keyId, account.id);
+    await expect(auth.validateToken(`Bearer ${created.key}`)).resolves.toBeNull();
+  });
+
+  it('rotating a key invalidates the old key and returns a new working key', async () => {
+    const account = await auth.createAccount('Rotate Test', 'rotate@test.com', 'pro');
+    const original = await auth.createApiKey(account.id, {
+      name: 'Rotating Key',
+      scopes: ['decisions:write'],
+    });
+
+    const rotated = await auth.rotateKey(original.keyId, account.id);
+
+    expect(rotated.keyId).not.toBe(original.keyId);
+    expect(rotated.key).not.toBe(original.key);
+    await expect(auth.validateToken(`Bearer ${original.key}`)).resolves.toBeNull();
+    const newCtx = await auth.validateToken(`Bearer ${rotated.key}`);
+    expect(newCtx).not.toBeNull();
+    expect(newCtx!.account_id).toBe(account.id);
+  });
+
+  it('rejects expired keys and marks them revoked', async () => {
+    const account = await auth.createAccount('Expiry Test', 'expiry@test.com', 'pro');
+    const past = new Date(Date.now() - 60_000).toISOString();
+    const created = await auth.createApiKey(account.id, {
+      name: 'Expired Key',
+      expiresAt: past,
+    });
+
+    const ctx = await auth.validateToken(`Bearer ${created.key}`);
+    expect(ctx).toBeNull();
+
+    const stored = await auth.getKey(created.keyId, account.id);
+    expect(stored!.status).toBe('revoked');
+    expect(stored!.revoked_at).toBeTruthy();
+  });
+
+  it('logs audit events for create, auth success, revoke, rotate, and auth failure', async () => {
+    const account = await auth.createAccount('Audit Test', 'audit@test.com', 'pro');
+    const created = await auth.createApiKey(account.id, { name: 'Audit Key', createdBy: 'dashboard' });
+    await auth.validateToken(`Bearer ${created.key}`);
+    await auth.revokeApiKey(created.keyId, account.id, { ip: '1.2.3.4', userAgent: 'vitest' }, 'user');
+
+    const second = await auth.createApiKey(account.id, { name: 'Rotate Me' });
+    await auth.rotateKey(second.keyId, account.id, { ip: '5.6.7.8', userAgent: 'vitest' }, 'user');
+    await auth.validateToken(`Bearer mrw_live_${'a'.repeat(32)}`);
+
+    const auditRows = await db
+      .prepare('SELECT * FROM api_key_audit_log WHERE account_id = ?')
+      .bind(account.id)
+      .all<Record<string, unknown>>();
+
+    const events = (auditRows.results || []).map((row) => row.event);
+    expect(events).toContain('created');
+    expect(events).toContain('auth_success');
+    expect(events).toContain('revoked');
+    expect(events).toContain('rotated');
+
+    const failedRows = await db
+      .prepare('SELECT * FROM api_key_audit_log WHERE event = ?')
+      .bind('auth_failed')
+      .all<Record<string, unknown>>();
+    expect((failedRows.results || []).length).toBeGreaterThan(0);
+  });
+
+  it('logs failed auth for unknown but valid-format keys', async () => {
+    const token = `mrw_live_${'b'.repeat(32)}`;
+    const ctx = await auth.validateToken(`Bearer ${token}`);
+    expect(ctx).toBeNull();
+
+    const auditRows = await db
+      .prepare('SELECT * FROM api_key_audit_log WHERE event = ?')
+      .bind('auth_failed')
+      .all<Record<string, unknown>>();
+
+    expect((auditRows.results || []).length).toBe(1);
+    expect(auditRows.results?.[0]?.account_id ?? null).toBeNull();
+  });
+
+  it('enforces auth-attempt rate limits per key', async () => {
+    const account = await auth.createAccount('Auth Limit', 'auth-limit@test.com', 'pro');
+    const created = await auth.createApiKey(account.id, { name: 'Burst Key' });
+
+    for (let i = 0; i < 100; i++) {
+      const ctx = await auth.validateToken(`Bearer ${created.key}`);
+      expect(ctx).not.toBeNull();
+    }
+
+    await expect(auth.validateToken(`Bearer ${created.key}`)).rejects.toBeInstanceOf(AuthRateLimitError);
+  });
+
+  it('enforces per-tier API rate limits per key', async () => {
+    const account = await auth.createAccount('API Limit', 'api-limit@test.com', 'free');
+    const created = await auth.createApiKey(account.id, { name: 'Free Key' });
+
+    for (let i = 0; i < 60; i++) {
+      await expect(auth.enforceApiRateLimit(created.keyId, 'free')).resolves.toBe(true);
+    }
+
+    await expect(auth.enforceApiRateLimit(created.keyId, 'free')).resolves.toBe(false);
+  });
+
+  it('never exposes plaintext keys in list or get results', async () => {
+    const account = await auth.createAccount('Mask Test', 'mask@test.com', 'pro');
+    const created = await auth.createApiKey(account.id, { name: 'Masked Key' });
+
+    const listed = await auth.listKeys(account.id);
+    const got = await auth.getKey(created.keyId, account.id);
+
+    expect(JSON.stringify(listed)).not.toContain(created.key);
+    expect(JSON.stringify(got)).not.toContain(created.key);
+  });
+
+  it('returns null for unknown accounts', async () => {
+    const account = await auth.getAccount('missing-account');
     expect(account).toBeNull();
-  });
-
-  // Isolation (Tier 11)
-  it('validates own decision access', async () => {
-    const ctx = await auth.validateToken(`Bearer ${REAL_API_KEY}`);
-    expect(ctx).not.toBeNull();
-    expect(ctx!.account_id).toBe(REAL_ACCOUNT_ID);
-  });
-
-  it('different accounts get different IDs', async () => {
-    const a1 = await auth.createAccount('A1', 'a1@test.com');
-    const a2 = await auth.createAccount('A2', 'a2@test.com');
-    expect(a1.id).not.toBe(a2.id);
-    // Each agent can only see their own data through account_id filtering
-  });
-
-  // Edge cases
-  it('handles token with extra whitespace', async () => {
-    const ctx = await auth.validateToken(`Bearer  ${REAL_API_KEY}  `);
-    // Trimmed token should still work
-    expect(ctx).not.toBeNull();
-  });
-
-  it('key hash is SHA-256 (64 hex chars)', () => {
-    expect(REAL_KEY_HASH).toMatch(/^[a-f0-9]{64}$/);
-  });
-
-  it('never stores plaintext key', async () => {
-    const { key } = await auth.createApiKey(REAL_ACCOUNT_ID);
-    // The key should not be in the database as plaintext
-    // Only the hash should be stored
-    expect(key).toContain('mrw_');
-  });
-
-  it('multiple accounts can coexist', async () => {
-    const a1 = await auth.createAccount('Agent1', 'a1@test.com', 'free');
-    const a2 = await auth.createAccount('Agent2', 'a2@test.com', 'pro');
-    const k1 = await auth.createApiKey(a1.id);
-    const k2 = await auth.createApiKey(a2.id);
-
-    const ctx1 = await auth.validateToken(`Bearer ${k1.key}`);
-    const ctx2 = await auth.validateToken(`Bearer ${k2.key}`);
-
-    expect(ctx1!.account_id).toBe(a1.id);
-    expect(ctx2!.account_id).toBe(a2.id);
-    expect(ctx1!.tier).toBe('free');
-    expect(ctx2!.tier).toBe('pro');
   });
 });

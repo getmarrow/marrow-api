@@ -2,7 +2,7 @@
  * Additional tests to reach 360+ total
  * Covers edge cases, crypto utils, and more integration scenarios
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { sha256, uuid, randomHex, now, aesGcmEncrypt, aesGcmDecrypt } from '../utils/crypto';
 import { compress, decompress, compressionStats } from '../utils/compression';
 import { computeEmbedding, cosineSimilarity } from '../utils/vectors';
@@ -15,6 +15,10 @@ import { EnterpriseService } from '../services/enterprise.service';
 import { AnalyticsService } from '../services/analytics.service';
 import { AuditService } from '../services/audit.service';
 import { createMockD1, REAL_API_KEY, REAL_ACCOUNT_ID, TEST_ENCRYPTION_KEY } from './helpers';
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe('Crypto Utils', () => {
   it('sha256 produces 64 hex chars', async () => {
@@ -82,15 +86,15 @@ describe('Crypto Utils', () => {
 });
 
 describe('Vector Utils Edge Cases', () => {
-  it('embedding with empty keys', () => {
-    const emb = computeEmbedding('test', []);
-    expect(emb.length).toBe(64);
+  it('embedding with empty text', async () => {
+    const emb = await computeEmbedding(null, '');
+    expect(emb.length).toBeGreaterThanOrEqual(64);
   });
 
-  it('embedding with many keys', () => {
-    const keys = Array.from({ length: 20 }, (_, i) => `key${i}`);
-    const emb = computeEmbedding('test', keys);
-    expect(emb.length).toBe(64);
+  it('embedding with long text', async () => {
+    const text = 'test: ' + Array.from({ length: 50 }, (_, i) => `key${i}`).join(' ');
+    const emb = await computeEmbedding(null, text);
+    expect(emb.length).toBeGreaterThanOrEqual(64);
   });
 
   it('cosine similarity with empty vectors', () => {
@@ -107,8 +111,14 @@ describe('Vector Utils Edge Cases', () => {
     expect(sim).toBeCloseTo(-1.0, 5);
   });
 
-  it('embedding is normalized (unit length)', () => {
-    const emb = computeEmbedding('normalize', ['test', 'keys']);
+  it('cosine similarity returns 0 for mixed dimensions', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(cosineSimilarity([1, 0, 0, 0], [1, 0, 0])).toBe(0);
+    expect(errorSpy).toHaveBeenCalled();
+  });
+
+  it('embedding is normalized (unit length)', async () => {
+    const emb = await computeEmbedding(null, 'normalize: test keys for normalization');
     const norm = Math.sqrt(emb.reduce((s, v) => s + v * v, 0));
     expect(norm).toBeCloseTo(1.0, 3);
   });
@@ -214,6 +224,60 @@ describe('Decision Service Edge Cases', () => {
     const lower = await svc.listDecisions(REAL_ACCOUNT_ID, { decision_type: 'trading' });
     expect(upper.length).toBe(1);
     expect(lower.length).toBe(1);
+  });
+
+  it('strips PII before sending outcome text to embeddings', async () => {
+    let embeddedText = '';
+    const ai = {
+      run: async (_model: string, payload: { text: string[] }) => {
+        embeddedText = payload.text[0];
+        return { data: [new Array(768).fill(0.1)] };
+      },
+    };
+
+    svc = new DecisionService(db, ai);
+    await svc.createDecision(
+      REAL_ACCOUNT_ID,
+      'support',
+      { ticket: 'T-1' },
+      'Email alice@example.com and call +1-555-123-4567 about the $500 refund',
+      0.5,
+    );
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(embeddedText).toContain('[EMAIL]');
+    expect(embeddedText).toContain('[PHONE]');
+    expect(embeddedText).toContain('[AMOUNT]');
+    expect(embeddedText).not.toContain('alice@example.com');
+    expect(embeddedText).not.toContain('+1-555-123-4567');
+    expect(embeddedText).not.toContain('$500');
+
+    const vectors = await db.prepare('SELECT * FROM decision_vectors WHERE decision_type = ?').bind('support').all<Record<string, unknown>>();
+    expect(vectors.results?.[0]?.model).toBe('bge-base-en-v1.5');
+    expect(vectors.results?.[0]?.dimensions).toBe(768);
+  });
+
+  it('falls back to token vectors without blocking decision creation when AI fails', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const ai = {
+      run: async () => { throw new Error('ai down'); },
+    };
+
+    svc = new DecisionService(db, ai);
+    const decision = await svc.createDecision(
+      REAL_ACCOUNT_ID,
+      'ops',
+      { service: 'gateway' },
+      'Restart gateway after config validation passes',
+      0.7,
+    );
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(decision.id).toBeTruthy();
+    const vectors = await db.prepare('SELECT * FROM decision_vectors WHERE decision_type = ?').bind('ops').all<Record<string, unknown>>();
+    expect(vectors.results?.[0]?.model).toBe('token-fallback');
+    expect(vectors.results?.[0]?.dimensions).toBeGreaterThanOrEqual(64);
+    expect(errorSpy).toHaveBeenCalled();
   });
 
   it('validation handles undefined fields', () => {

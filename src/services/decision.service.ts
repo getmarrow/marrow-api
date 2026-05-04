@@ -15,9 +15,13 @@ const COMPRESSION_THRESHOLD = 4096;
 
 export class DecisionService {
   private audit: AuditService;
+  private ai: any;
+  private pii: PiiService;
 
-  constructor(private db: D1Database) {
+  constructor(private db: D1Database, ai?: any) {
     this.audit = new AuditService(db);
+    this.ai = ai;
+    this.pii = new PiiService();
   }
 
   validateDecision(data: unknown): { valid: boolean; errors?: Record<string, string> } {
@@ -49,6 +53,26 @@ export class DecisionService {
     }
 
     return Object.keys(errors).length > 0 ? { valid: false, errors } : { valid: true };
+  }
+
+  /**
+   * Generate and store a semantic embedding for a decision.
+   * Fire-and-forget — embedding failure must never block decision creation.
+   */
+  private async storeEmbedding(decisionId: string, decisionType: string, outcome: string): Promise<void> {
+    try {
+      const sanitizedOutcome = this.pii.stripString(outcome);
+      const embedding = await computeEmbedding(this.ai, `${decisionType}: ${sanitizedOutcome}`);
+      const dims = embedding.length;
+      const model = dims === 768 ? 'bge-base-en-v1.5' : 'token-fallback';
+      await this.db
+        .prepare('INSERT OR IGNORE INTO decision_vectors (id, decision_id, vector_embedding, decision_type, model, dimensions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .bind(uuid(), decisionId, JSON.stringify(embedding), decisionType, model, dims, now())
+        .run();
+    } catch (error) {
+      console.error('DecisionService.storeEmbedding failed:', error);
+      // Embedding is best-effort — never block the decision
+    }
   }
 
   /**
@@ -126,13 +150,8 @@ export class DecisionService {
       .bind(id, accountId, decisionType, contextStr, outcome, confidence, effectiveVisibility, isCompressed ? 1 : 0, contextRaw, contextHive, sessionId, agentId, ts, ts)
       .run();
 
-    // Tier 7: vector embedding
-    const embedding = computeEmbedding(decisionType, Object.keys(context));
-    await this.db
-      .prepare('INSERT INTO decision_vectors (id, decision_id, vector_embedding, decision_type, created_at) VALUES (?, ?, ?, ?, ?)')
-      .bind(uuid(), id, JSON.stringify(embedding), decisionType, ts)
-      .run()
-      .catch(() => {});
+    // Tier 7: semantic vector embedding (async, fire-and-forget)
+    this.storeEmbedding(id, decisionType, outcome).catch(() => {});
 
     // Tier 13: audit
     await this.audit.log(accountId, 'CREATE', 'decision', id, { decision_type: decisionType, confidence, visibility: effectiveVisibility });
