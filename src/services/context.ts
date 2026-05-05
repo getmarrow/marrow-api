@@ -16,7 +16,6 @@ import { PriorityService } from './priority.service';
 import { EnterpriseService } from './enterprise.service';
 import { AnalyticsService } from './analytics.service';
 import { AuditService } from './audit.service';
-import { PatternRecognitionService } from './pattern-recognition.service';
 import { TransferService } from './transfer.service';
 import { BootstrapService } from './bootstrap.service';
 import { ConsensusService } from './consensus.service';
@@ -39,7 +38,7 @@ import { AgentService } from './agent.service';
 import { TemplatesService } from './templates.service';
 import { FleetService } from './fleet.service';
 import { NarrativeService } from './narrative.service';
-import { EmailService } from './email.service';
+import { getEmailService } from './email.service';
 import { MemoryService } from './memory.service';
 import { VelocityService } from './velocity.service';
 import { BaselineService } from './baseline.service';
@@ -64,7 +63,7 @@ export class ServiceContext {
   patterns()  { return this.get('patterns', () => new PatternsService(this.db, this.ai)); }
   workflow()  { return this.get('workflow', () => new WorkflowService(this.db, this.ai)); }
   nudge()     { return this.get('nudge', () => new NudgeService(this.db)); }
-  email()     { return this.get('email', () => new EmailService(this.db, this.env)); }
+  email()     { return this.get('email', () => getEmailService(this.db, this.env)); }
   pii()       { return this.get('pii', () => new PiiService()); }
   baseline()  { return this.get('baseline', () => new BaselineService(this.db)); }
   velocity()  { return this.get('velocity', () => new VelocityService(this.db)); }
@@ -78,7 +77,7 @@ export class ServiceContext {
   enterprise(){ return this.get('enterprise', () => new EnterpriseService(this.db, this.ai)); }
   analytics() { return this.get('analytics', () => new AnalyticsService(this.db)); }
   audit()     { return this.get('audit', () => new AuditService(this.db)); }
-  patternRecognition() { return this.get('patRecognition', () => new PatternRecognitionService(this.db)); }
+  patternRecognition() { return this.get('patRecognition', () => new PatternsService(this.db)); }
   transfer()  { return this.get('transfer', () => new TransferService(this.db, this.ai)); }
   bootstrap() { return this.get('bootstrap', () => new BootstrapService(this.db)); }
   consensus() { return this.get('consensus', () => new ConsensusService(this.db)); }

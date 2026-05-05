@@ -1,15 +1,15 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { setupTestDb } from './helpers';
-import { PatternRecognitionService } from '../services/pattern-recognition.service';
+import { PatternsService } from '../services/patterns.service';
 
 describe('Tier 8: Pattern Recognition', () => {
   let db: D1Database;
-  let service: PatternRecognitionService;
+  let service: PatternsService;
   let accountId: string;
 
   beforeAll(async () => {
     db = await setupTestDb();
-    service = new PatternRecognitionService(db);
+    service = new PatternsService(db);
     accountId = 'pattern-account-' + Date.now();
 
     await db.prepare('INSERT INTO accounts (id, name, email, tier) VALUES (?, ?, ?, ?)').bind(accountId, 'Test', 'test@example.com', 'free').run();

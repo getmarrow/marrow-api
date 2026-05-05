@@ -208,6 +208,15 @@ export class DecisionService {
     return (res.results || []).map(r => this.rowToDecision(r));
   }
 
+  async getDecisionCount(accountId: string, since?: string): Promise<number> {
+    const sql = since
+      ? 'SELECT COUNT(*) as c FROM decisions WHERE account_id = ? AND created_at > ?'
+      : 'SELECT COUNT(*) as c FROM decisions WHERE account_id = ?';
+    const params: unknown[] = since ? [accountId, since] : [accountId];
+    const row = await this.db.prepare(sql).bind(...params).first<{ c: number }>();
+    return row?.c ?? 0;
+  }
+
   async recordOutcome(decisionId: string, accountId: string, success: boolean, details?: Record<string, unknown>): Promise<Decision> {
     const decision = await this.getDecision(decisionId, accountId);
     if (!decision || decision.account_id !== accountId) throw new Error('Not found or unauthorized');
@@ -254,5 +263,13 @@ export class DecisionService {
       created_at: String(row.created_at),
       updated_at: String(row.updated_at),
     };
+  }
+
+  async getDecisionCount(accountId: string, since?: string): Promise<number> {
+    const row = await this.db.prepare(since
+      ? 'SELECT COUNT(*) as c FROM decisions WHERE account_id = ? AND created_at > ?'
+      : 'SELECT COUNT(*) as c FROM decisions WHERE account_id = ?'
+    ).bind(...(since ? [accountId, since] : [accountId])).first<{ c: number }>();
+    return row?.c ?? 0;
   }
 }

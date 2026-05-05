@@ -21,7 +21,6 @@ import { SnapshotService } from './services/snapshot.service';
 import { VersionService } from './services/version.service';
 import { MarketplaceService } from './services/marketplace.service';
 import { AuditService } from './services/audit.service';
-import { PatternRecognitionService } from './services/pattern-recognition.service';
 import { OrgService } from './services/org.service';
 import { WorkflowWarning, LearnedTemplate, DecisionQuality } from './types';
 import { D1Database } from '@cloudflare/workers-types';
@@ -297,7 +296,7 @@ export class WorkflowService {
       consensus: new ConsensusService(this.db),
       analytics: new AnalyticsService(this.db),
       causality: new CausalityService(this.db),
-      patternRecognition: new PatternRecognitionService(this.db),
+      patternRecognition: new PatternsService(this.db),
       collaboration: new CollaborationService(this.db),
       audit: new AuditService(this.db),
     };

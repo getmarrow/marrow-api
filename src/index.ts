@@ -14,7 +14,6 @@ import { AuditService } from './services/audit.service';
 import { FeedbackService } from './services/feedback.service';
 import { CausalityService } from './services/causality.service';
 import { PriorityService } from './services/priority.service';
-import { PatternRecognitionService } from './services/pattern-recognition.service';
 import { TransferService } from './services/transfer.service';
 import { BootstrapService } from './services/bootstrap.service';
 import { ConsensusService } from './services/consensus.service';
@@ -40,7 +39,7 @@ import { TemplatesService } from './services/templates.service';
 import { FleetService } from './services/fleet.service';
 import { NarrativeService } from './services/narrative.service';
 import { NudgeService } from './services/nudge.service';
-import { EmailService } from './services/email.service';
+import { EmailService, getEmailService } from './services/email.service';
 import { MemoryService } from './services/memory.service';
 import type { VelocityMetric } from './services/velocity.service';
 import type { ImprovementResult } from './services/baseline.service';
@@ -51,9 +50,6 @@ import { autoLogDecision, classifyDecisionQuality } from './middleware/auto-logg
 import { actionQualityWarning, isStrictQualityMode, validateActionQuality } from './middleware/action-validator';
 import { getDedupedResponse, storeDedupedResponse } from './middleware/dedup-cache';
 import { safely } from './utils/safely';
-import { authRouter } from './routes/auth';
-import { analyticsRouter } from './routes/analytics';
-import { agentRouter } from './routes/agent';
 
 // ============= Helpers =============
 
@@ -174,17 +170,6 @@ function enforceRoutePolicy(request: IRequest, ctx: RequestContext): Response | 
 
 const router = Router();
 
-router.all('/v1/keys/*', (request: IRequest, env: Env, ctx: ExecutionContext) => authRouter.handle(request as Request, env, ctx));
-router.all('/v1/auth/*', (request: IRequest, env: Env, ctx: ExecutionContext) => authRouter.handle(request as Request, env, ctx));
-router.all('/v1/agent/*', (request: IRequest, env: Env, ctx: ExecutionContext) => agentRouter.handle(request as Request, env, ctx));
-router.all('/v1/analytics*', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
-router.all('/v1/dashboard', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
-router.all('/v1/digest', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
-router.all('/v1/export', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
-router.all('/v1/search', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
-router.all('/v1/versions*', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
-router.all('/v1/snapshots*', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
-router.all('/v1/restore/status', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
 
 // ============= Auth Helper =============
 async function requireAuth(request: IRequest, env: Env): Promise<RequestContext | Response> {
@@ -319,7 +304,7 @@ router.get('/v1/email/unsubscribe', async (request: IRequest, env: Env) => {
       });
     }
 
-    const emailService = new EmailService(env.DB, env);
+    const emailService = getEmailService(env.DB, env);
     const ok = await emailService.unsubscribe(token);
     if (!ok) {
       return new Response('<!doctype html><html><body><h1>Not found</h1></body></html>', {
@@ -483,7 +468,7 @@ router.post('/v1/keys/verify', async (request: IRequest, env: Env) => {
     const created = await authService.createApiKey(accountId, { createdBy: 'signup', name: 'Primary signup key' });
     const apiKey = created.key;
 
-    const emailService = new EmailService(env.DB, env);
+    const emailService = getEmailService(env.DB, env);
     // SECURITY: never include api_key in email vars — emails are not a secure channel.
     // The user receives their key in the JSON response below; this email confirms
     // signup and points them at the install command using an env-var pattern.
@@ -516,7 +501,7 @@ router.post('/v1/auth/accounts', async (request: IRequest, env: Env) => {
       String(body.name || ''), String(body.email || ''), 'free'  // H2 fix: always free, never trust client-supplied tier
     );
     const { key, keyId } = await authService.createApiKey(account.id, { createdBy: 'signup', name: 'Primary signup key' });
-    const emailService = new EmailService(env.DB, env);
+    const emailService = getEmailService(env.DB, env);
     // SECURITY: api_key intentionally NOT passed to template — emails never carry secrets.
     // User receives the key in the JSON response below.
     emailService
@@ -536,7 +521,7 @@ router.get('/v1/auth/account', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -727,7 +712,7 @@ router.post('/decisions', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -808,7 +793,7 @@ router.get('/decisions', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -835,7 +820,7 @@ router.get('/v1/decisions/shared', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -862,7 +847,7 @@ router.get('/v1/decisions/routing-suggestions', async (request: IRequest, env: E
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -886,7 +871,7 @@ router.get('/v1/decisions/priority', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -909,7 +894,7 @@ router.get('/v1/decisions/:id', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -933,7 +918,7 @@ router.put('/v1/decisions/:id/outcome', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -961,7 +946,7 @@ router.get('/v1/decisions/:id/outcome', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -984,7 +969,7 @@ router.get('/v1/decisions/feedback/history', async (request: IRequest, env: Env)
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1007,7 +992,7 @@ router.get('/v1/feedback/metrics', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1032,7 +1017,7 @@ router.post('/v1/decisions/:id/share', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1065,7 +1050,7 @@ router.post('/v1/decisions/:id/caused-by', async (request: IRequest, env: Env) =
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1096,7 +1081,7 @@ router.get('/v1/decisions/:id/causality', async (request: IRequest, env: Env) =>
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1120,7 +1105,7 @@ router.post('/v1/decisions/predict', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1146,14 +1131,14 @@ router.get('/v1/patterns', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
     }).catch(() => {});
 
     const url = getUrl(request);
-    const prService = new PatternRecognitionService(env.DB);
+    const prService = new PatternsService(env.DB);
     const patterns = await prService.recognizePatterns(ctx.account_id, url.searchParams.get('decision_type') || undefined);
     return json(patterns);
   } catch (e: unknown) { return err('Internal error'); }
@@ -1169,13 +1154,13 @@ router.get('/v1/patterns/:id', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
     }).catch(() => {});
 
-    const prService = new PatternRecognitionService(env.DB);
+    const prService = new PatternsService(env.DB);
     const stats = await prService.getPatternStats(String(request.params?.id), ctx.account_id);
     return json(stats);
   } catch (e: unknown) { return err('Internal error'); }
@@ -1191,14 +1176,14 @@ router.post('/v1/patterns/:id/validate', async (request: IRequest, env: Env) => 
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
     }).catch(() => {});
 
     const body = await request.json() as Record<string, unknown>;
-    const prService = new PatternRecognitionService(env.DB);
+    const prService = new PatternsService(env.DB);
     const result = await prService.validatePattern(String(request.params?.id), String(body.decision_id), ctx.account_id);
     return json(result);
   } catch (e: unknown) { return err('Internal error'); }
@@ -1214,7 +1199,7 @@ router.get('/v1/trends', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1239,7 +1224,7 @@ router.get('/v1/lessons/transfer', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1266,7 +1251,7 @@ router.post('/v1/lessons/:id/transfer-to', async (request: IRequest, env: Env) =
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1292,7 +1277,7 @@ router.get('/v1/transfer-metrics', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1321,7 +1306,7 @@ router.get('/v1/decisions/priority', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1344,7 +1329,7 @@ router.post('/v1/decisions/:id/prioritize', async (request: IRequest, env: Env) 
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1378,7 +1363,7 @@ router.get('/v1/queue/status', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1402,7 +1387,7 @@ router.get('/v1/hive', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1431,7 +1416,7 @@ router.get('/v1/hive/signals', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1459,7 +1444,7 @@ router.get('/v1/bootstrap', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1481,7 +1466,7 @@ router.get('/v1/bootstrap/categories', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1502,7 +1487,7 @@ router.post('/v1/bootstrap/:id/apply', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1528,7 +1513,7 @@ router.post('/v1/bootstrap', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1555,7 +1540,7 @@ router.get('/v1/audit', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1583,7 +1568,7 @@ router.get('/v1/audit/verify', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1606,7 +1591,7 @@ router.post('/v1/decisions/:id/consensus-vote', async (request: IRequest, env: E
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1633,7 +1618,7 @@ router.get('/v1/hive/consensus', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1658,7 +1643,7 @@ router.get('/v1/consensus/metrics', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1685,7 +1670,7 @@ router.post('/v1/snapshots', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1712,7 +1697,7 @@ router.get('/v1/snapshots', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1735,7 +1720,7 @@ router.get('/v1/snapshots/:id', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1758,7 +1743,7 @@ router.post('/v1/snapshots/:id/diff', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1787,7 +1772,7 @@ router.post('/v1/snapshots/:id/restore', async (request: IRequest, env: Env) => 
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1809,7 +1794,7 @@ router.get('/v1/restore/status', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1833,7 +1818,7 @@ router.delete('/v1/snapshots/:id', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1857,7 +1842,7 @@ router.get('/v1/versions', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1878,7 +1863,7 @@ router.get('/v1/versions/current', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1900,7 +1885,7 @@ router.get('/v1/versions/:from/migration/:to', async (request: IRequest, env: En
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1924,7 +1909,7 @@ router.get('/v1/analytics', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1954,7 +1939,7 @@ router.get('/v1/analytics/agent', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1976,7 +1961,7 @@ router.get('/v1/analytics/system', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1997,7 +1982,7 @@ router.get('/v1/analytics/trending', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2021,7 +2006,7 @@ router.post('/v1/lessons', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2052,7 +2037,7 @@ router.post('/v1/lessons/:id/publish', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2074,7 +2059,7 @@ router.get('/v1/lessons/marketplace', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2099,7 +2084,7 @@ router.post('/v1/lessons/:id/fork', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2127,7 +2112,7 @@ router.post('/v1/lessons/:id/rate', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2153,7 +2138,7 @@ router.get('/v1/lessons/:id/versions', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2176,7 +2161,7 @@ router.get('/v1/safety/violations', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2201,7 +2186,7 @@ router.post('/v1/safety/check', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2227,7 +2212,7 @@ router.get('/v1/stream', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2288,6 +2273,7 @@ router.get('/v1/stream', async (request: IRequest, env: Env) => {
 async function autoSnapshotIfNeeded(db: D1Database, accountId: string, encryptionKey?: string): Promise<void> {
   try {
     const snapshotService = new SnapshotService(db, encryptionKey);
+    const decisionService = new DecisionService(db);
     // M1: Rate limit — max 1 auto-snapshot per hour per account
     const lastSnapshotRow = await db
       .prepare('SELECT created_at FROM snapshots WHERE account_id = ? ORDER BY created_at DESC LIMIT 1')
@@ -2302,20 +2288,7 @@ async function autoSnapshotIfNeeded(db: D1Database, accountId: string, encryptio
     const snapshots = await snapshotService.listSnapshots(accountId, 1);
     const lastSnapshotTime = snapshots.length > 0 ? snapshots[0].created_at : null;
 
-    let decisionsSinceSnapshot = 0;
-    if (lastSnapshotTime) {
-      const row = await db
-        .prepare('SELECT COUNT(*) as c FROM decisions WHERE account_id = ? AND created_at > ?')
-        .bind(accountId, lastSnapshotTime)
-        .first<{ c: number }>();
-      decisionsSinceSnapshot = row?.c || 0;
-    } else {
-      const row = await db
-        .prepare('SELECT COUNT(*) as c FROM decisions WHERE account_id = ?')
-        .bind(accountId)
-        .first<{ c: number }>();
-      decisionsSinceSnapshot = row?.c || 0;
-    }
+    const decisionsSinceSnapshot = await decisionService.getDecisionCount(accountId, lastSnapshotTime || undefined);
 
     if (decisionsSinceSnapshot >= 10) {
       await snapshotService.createSnapshot(accountId, `auto-snapshot-${new Date().toISOString()}`, ['auto']);
@@ -2398,7 +2371,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
       tier: ctx.tier,
       sessionId: reqSessionId,
@@ -2562,11 +2535,8 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
     let upgradeHint: Record<string, unknown> | null = null;
     if (ctx.tier === 'free') {
       try {
-        const decisionCount = await env.DB
-          .prepare('SELECT COUNT(*) as c FROM decisions WHERE account_id = ?')
-          .bind(ctx.account_id)
-          .first<{ c: number }>();
-        const count = decisionCount?.c || 0;
+        const decisionService = new DecisionService(env.DB);
+        const count = await decisionService.getDecisionCount(ctx.account_id);
         const freeLimit = 500;
         const retentionDays = 30;
         if (count > freeLimit * 0.8) {
@@ -2624,11 +2594,8 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
 
     // ── Feature 7: Smart onboarding hint ──
     try {
-      const decisionCount = await env.DB
-        .prepare('SELECT COUNT(*) as c FROM decisions WHERE account_id = ?')
-        .bind(ctx.account_id)
-        .first<{ c: number }>();
-      const count = decisionCount?.c || 0;
+      const decisionService = new DecisionService(env.DB);
+      const count = await decisionService.getDecisionCount(ctx.account_id);
       let onboardingHint: string | null = null;
       if (count <= 3) {
         onboardingHint = 'Welcome to Marrow! Log decisions with think/commit to build your intelligence base.';
@@ -2800,7 +2767,7 @@ router.get('/v1/agent/patterns', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2982,7 +2949,7 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
       tier: ctx.tier,
       sessionId: commitSessionId,
@@ -3053,7 +3020,7 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
           .first<{ email: string }>();
         if (!account?.email) return;
 
-        const emailService = new EmailService(env.DB, env);
+        const emailService = getEmailService(env.DB, env);
         await emailService.sendTemplate(ctx.account_id, account.email, 'milestone_100', {
           email: account.email,
           improvement_pct,
@@ -3170,7 +3137,7 @@ router.post('/v1/workflow/before', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
       tier: ctx.tier,
       body,
@@ -3223,7 +3190,7 @@ router.post('/v1/workflow/after', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
       tier: ctx.tier,
       body,
@@ -3265,7 +3232,7 @@ router.get('/v1/workflow/status', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3294,7 +3261,7 @@ router.post('/v1/webhooks', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3326,7 +3293,7 @@ router.get('/v1/webhooks', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3355,7 +3322,7 @@ router.delete('/v1/webhooks/:id', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3380,7 +3347,7 @@ router.post('/v1/org', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3407,7 +3374,7 @@ router.post('/v1/org/invite', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3447,7 +3414,7 @@ router.put('/v1/org/settings', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3478,7 +3445,7 @@ router.get('/v1/org/members', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3506,7 +3473,7 @@ router.put('/v1/admin/accounts/:accountId/tier', async (request: IRequest, env: 
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3683,7 +3650,7 @@ router.get('/v1/admin/stats', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3756,7 +3723,7 @@ router.get('/v1/admin/trajectory', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3827,7 +3794,7 @@ router.get('/v1/export', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3861,7 +3828,7 @@ router.get('/v1/search', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
+      endpoint: new URL(request.url).pathname,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3918,15 +3885,13 @@ router.post('/v1/internal/trigger-onboarding', async (request: IRequest, env: En
       .first<{ id: string; email: string; name: string }>();
     if (!account) return err('Account not found', 404);
 
-    const countRow = await env.DB
-      .prepare('SELECT COUNT(*) as c FROM decisions WHERE account_id = ?')
-      .bind(body.account_id)
-      .first<{ c: number }>();
+    const decisionService = new DecisionService(env.DB);
+    const count = await decisionService.getDecisionCount(body.account_id);
 
     const html = emailCard('Your agent just logged its first decision 🧠', `
           <p style="margin:0 0 20px;font-size:14px;color:#999;line-height:1.6;">You're in. Marrow is now learning your patterns. Come back in 7 days — you'll see your success rate starting to form.</p>
           <div style="background:#1a1a1a;padding:16px;border-radius:8px;margin:0 0 24px;">
-            <p style="margin:0;font-size:32px;font-weight:700;color:#ffffff;">${countRow?.c || 1}</p>
+            <p style="margin:0;font-size:32px;font-weight:700;color:#ffffff;">${count || 1}</p>
             <p style="margin:4px 0 0;font-size:12px;color:#666;text-transform:uppercase;letter-spacing:1px;">decision logged</p>
           </div>
           <a href="https://getmarrow.ai" style="display:inline-block;padding:10px 20px;background:#ffffff;color:#0a0a0a;text-decoration:none;border-radius:6px;font-size:13px;font-weight:600;">View your dashboard →</a>
@@ -4524,7 +4489,7 @@ router.get('/v1/agent/nudge', async (request: IRequest, env: Env) => {
         db.prepare('SELECT email FROM accounts WHERE id = ? LIMIT 1').bind(acctId).first().catch(() => null),
       ]).then(([sent, acct]) => {
         if (!sent && acct?.email) {
-          const es = new EmailService(db, env2);
+          const es = getEmailService(db, env2);
           es.sendTemplate(acctId, acct.email, 'progress_report', {
             improvement_pct: impPct, attempts_pct: attPct, drift_pct: drfPct,
             pattern_reuse_pct: Math.round(100 - drfPct), success_rate: sucRate,
@@ -5424,7 +5389,7 @@ export default {
         .bind(newerThan, olderThan)
         .all<{ id: string; email: string }>();
 
-      const emailService = new EmailService(env.DB, env);
+      const emailService = getEmailService(env.DB, env);
       for (const account of eligible.results || []) {
         try {
           const allowed = await emailService.canSendTemplate(account.id, 'day3_nudge');
