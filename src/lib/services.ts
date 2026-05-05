@@ -100,7 +100,7 @@ export function getServices(env: Env): Services {
   if (!_services) {
     const db: D1Database = env.DB;
     const ai: any = env.AI;
-    const emailEnv: Env = env;
+
 
     _services = {
       auth:                    new AuthService(db),
@@ -136,7 +136,7 @@ export function getServices(env: Env): Services {
       templates:               new TemplatesService(db),
       fleet:                   new FleetService(db),
       narrative:               new NarrativeService(db),
-      email:                   new EmailService(db, emailEnv),
+      email:                   new EmailService(db, env),
       memory:                  new MemoryService(db),
       velocity:                new VelocityService(db),
       baseline:                new BaselineService(db),

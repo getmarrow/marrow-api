@@ -25,17 +25,6 @@ const TEMPLATES: Record<TemplateName, EmailTemplateFile> = {
   progress_report: progressReportTemplate,
 };
 
-const emailServiceCache = new WeakMap<object, EmailService>();
-
-export function getEmailService(db: D1Database, env: Env): EmailService {
-  const key = env;
-  const cached = emailServiceCache.get(key);
-  if (cached) return cached;
-  const service = new EmailService(db, env);
-  emailServiceCache.set(key, service);
-  return service;
-}
-
 export class EmailService {
   constructor(private db: D1Database, private env: Env) {}
 

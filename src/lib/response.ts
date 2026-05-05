@@ -29,7 +29,7 @@ export function fail(
   code: string,
   message: string,
   status = 500,
-  details?: Record<string, string>,
+  details?: Record<string, unknown>,
 ): Response {
   const body: Record<string, unknown> = { error: message, code };
   if (details) body.details = details;
