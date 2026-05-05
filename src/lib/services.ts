@@ -90,19 +90,24 @@ export interface Services {
   workflow:                WorkflowService;
 }
 
-let _services: Services | null = null;
+const servicesByDb = new WeakMap<object, Services>();
 
 /**
- * Return the singleton Services registry.
- * Services are created lazily on first call and cached for the Worker's lifetime.
+ * Return the singleton Services registry for this DB binding.
+ *
+ * In production, env.DB is stable across requests inside a worker isolate, so
+ * services are created once and reused. In tests, each mock DB is a distinct
+ * object, so state does not bleed between cases.
  */
 export function getServices(env: Env): Services {
-  if (!_services) {
-    const db: D1Database = env.DB;
-    const ai: any = env.AI;
+  const cacheKey = env.DB as unknown as object;
+  const cached = servicesByDb.get(cacheKey);
+  if (cached) return cached;
 
+  const db: D1Database = env.DB;
+  const ai: any = env.AI;
 
-    _services = {
+  const services: Services = {
       auth:                    new AuthService(db),
       decisions:               new DecisionService(db, ai),
       patterns:                new PatternsService(db, ai),
@@ -142,14 +147,15 @@ export function getServices(env: Env): Services {
       baseline:                new BaselineService(db),
       nudge:                   new NudgeService(db),
       workflow:                new WorkflowService(db, ai),
-    };
-  }
-  return _services;
+  };
+
+  servicesByDb.set(cacheKey, services);
+  return services;
 }
 
 /**
  * Reset the service cache. Used only in tests to get fresh state.
  */
 export function resetServices(): void {
-  _services = null;
+  // WeakMap state is keyed by DB identity; tests use fresh mock DB objects.
 }
