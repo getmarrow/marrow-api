@@ -1,0 +1,2 @@
+ALTER TABLE accounts ADD COLUMN nudged_at TEXT DEFAULT NULL;
+ALTER TABLE accounts ADD COLUMN nudged_decision_count INTEGER NOT NULL DEFAULT 0;

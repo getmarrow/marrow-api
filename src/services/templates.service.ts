@@ -17,6 +17,16 @@ export interface WorkflowTemplate {
   tags: string; // JSON array
   created_at: string;
   updated_at: string;
+  quality_score?: number;
+}
+
+export interface WorkflowTemplateSuggestion {
+  slug: string;
+  name: string;
+  avg_success_rate: number | null;
+  install_count: number;
+  quality_score: number;
+  author: string;
 }
 
 interface TemplateFilters {
@@ -37,6 +47,18 @@ interface TemplateInput {
 
 export class TemplatesService {
   constructor(private db: D1Database) {}
+
+  computeQualityScore(installCount: number, avgSuccessRate: number | null): number {
+    if (!installCount || !avgSuccessRate) return 0;
+    return Math.min(1, installCount * avgSuccessRate * 0.1);
+  }
+
+  private withQualityScore(template: WorkflowTemplate): WorkflowTemplate {
+    return {
+      ...template,
+      quality_score: this.computeQualityScore(Number(template.install_count || 0), template.avg_success_rate ?? null),
+    };
+  }
 
   /**
    * List templates with optional filters.
@@ -72,17 +94,19 @@ export class TemplatesService {
       .bind(...binds)
       .all<WorkflowTemplate>();
 
-    return res.results || [];
+    return (res.results || []).map((template) => this.withQualityScore(template));
   }
 
   /**
    * Get a single template by slug.
    */
   async getTemplate(slug: string): Promise<WorkflowTemplate | null> {
-    return this.db
+    const template = await this.db
       .prepare('SELECT * FROM workflow_templates WHERE slug = ?')
       .bind(slug)
       .first<WorkflowTemplate>();
+
+    return template ? this.withQualityScore(template) : null;
   }
 
   /**
@@ -140,6 +164,37 @@ export class TemplatesService {
       .run();
 
     return { workflow_id: workflowId };
+  }
+
+  async getSuggestedTemplates(decisionType: string, limit = 3): Promise<WorkflowTemplateSuggestion[]> {
+    const rows = await this.db
+      .prepare(
+        `SELECT * FROM workflow_templates
+         WHERE category = ? OR tags LIKE ? OR slug LIKE ?
+         ORDER BY install_count DESC, created_at DESC
+         LIMIT ?`
+      )
+      .bind(decisionType, `%${decisionType}%`, `%${decisionType}%`, Math.max(limit * 3, limit))
+      .all<WorkflowTemplate>();
+
+    return (rows.results || [])
+      .map((template) => this.withQualityScore(template))
+      .sort((a, b) => {
+        const qualityDelta = Number(b.quality_score || 0) - Number(a.quality_score || 0);
+        if (qualityDelta !== 0) return qualityDelta;
+        const successDelta = Number(b.avg_success_rate || 0) - Number(a.avg_success_rate || 0);
+        if (successDelta !== 0) return successDelta;
+        return Number(b.install_count || 0) - Number(a.install_count || 0);
+      })
+      .slice(0, limit)
+      .map((template) => ({
+        slug: template.slug,
+        name: template.name,
+        avg_success_rate: template.avg_success_rate ?? null,
+        install_count: Number(template.install_count || 0),
+        quality_score: Number(template.quality_score || 0),
+        author: template.author,
+      }));
   }
 
   /**

@@ -39,6 +39,7 @@ import { AgentService } from './services/agent.service';
 import { TemplatesService } from './services/templates.service';
 import { FleetService } from './services/fleet.service';
 import { NarrativeService } from './services/narrative.service';
+import { NudgeService } from './services/nudge.service';
 import { EmailService } from './services/email.service';
 import { MemoryService } from './services/memory.service';
 import type { VelocityMetric } from './services/velocity.service';
@@ -49,6 +50,10 @@ import { PatternEngine } from './pattern-engine';
 import { autoLogDecision, classifyDecisionQuality } from './middleware/auto-logger';
 import { actionQualityWarning, isStrictQualityMode, validateActionQuality } from './middleware/action-validator';
 import { getDedupedResponse, storeDedupedResponse } from './middleware/dedup-cache';
+import { safely } from './utils/safely';
+import { authRouter } from './routes/auth';
+import { analyticsRouter } from './routes/analytics';
+import { agentRouter } from './routes/agent';
 
 // ============= Helpers =============
 
@@ -109,7 +114,7 @@ function getRequiredScopes(path: string, method: string): ApiKeyScope[] | 'full'
   if (path === '/v1/memories/import') return method === 'GET' ? ['memories:read'] : ['memories:import', 'memories:write'];
   if (path === '/v1/memories/export' || path === '/v1/memories/retrieve') return ['memories:read', 'memories:export'];
   if (path.startsWith('/v1/memories')) return method === 'GET' ? ['memories:read'] : ['memories:write'];
-  if (path === '/v1/agent/think' || path === '/v1/agent/commit' || path.startsWith('/v1/decisions') || path.startsWith('/decisions')) {
+  if (path === '/v1/agent/think' || path === '/v1/agent/commit' || path === '/v1/agent/nudge' || path.startsWith('/v1/decisions') || path.startsWith('/decisions')) {
     return method === 'GET' ? ['decisions:read'] : ['decisions:write'];
   }
   if (path.startsWith('/v1/patterns')) return ['patterns:read'];
@@ -168,6 +173,18 @@ function enforceRoutePolicy(request: IRequest, ctx: RequestContext): Response | 
 // ============= Router =============
 
 const router = Router();
+
+router.all('/v1/keys/*', (request: IRequest, env: Env, ctx: ExecutionContext) => authRouter.handle(request as Request, env, ctx));
+router.all('/v1/auth/*', (request: IRequest, env: Env, ctx: ExecutionContext) => authRouter.handle(request as Request, env, ctx));
+router.all('/v1/agent/*', (request: IRequest, env: Env, ctx: ExecutionContext) => agentRouter.handle(request as Request, env, ctx));
+router.all('/v1/analytics*', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
+router.all('/v1/dashboard', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
+router.all('/v1/digest', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
+router.all('/v1/export', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
+router.all('/v1/search', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
+router.all('/v1/versions*', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
+router.all('/v1/snapshots*', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
+router.all('/v1/restore/status', (request: IRequest, env: Env, ctx: ExecutionContext) => analyticsRouter.handle(request as Request, env, ctx));
 
 // ============= Auth Helper =============
 async function requireAuth(request: IRequest, env: Env): Promise<RequestContext | Response> {
@@ -4477,6 +4494,53 @@ router.get('/v1/digest', async (request: IRequest, env: Env) => {
 });
 
 
+
+router.get('/v1/agent/nudge', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const rlAllowed = await checkRateLimit(env.DB, `agent_nudge:${ctx.account_id}`, 30, 60 * 1000);
+    if (!rlAllowed) return err('Rate limited', 429);
+
+    autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/agent/nudge', statusCode: 200, tier: ctx.tier }).catch((e) => { safely(() => console.warn('[auto-log]', e), 'auto-log'); });
+
+    const nudge = new NudgeService(env.DB);
+    const result = await nudge.checkNudge(ctx.account_id);
+
+    if (result.nudge && result.metrics) {
+      const m = result.metrics;
+      const impr = m.improvement;
+      const impPct = impr ? Math.abs(Math.round((impr.time_to_success_seconds?.delta_pct || impr.attempts_per_success?.delta_pct || 0) * 10) / 10) : 0;
+      const attPct = impr ? Math.abs(Math.round((impr.attempts_per_success?.delta_pct || 0) * 10) / 10) : 0;
+      const drfPct = impr ? Math.abs(Math.round((impr.drift_rate?.delta_pct || 0) * 10) / 10) : 0;
+      const sucRate = impr?.success_rate ? Math.round(impr.success_rate.current * 100) : 0;
+      const acctId = ctx.account_id;
+      const db = env.DB;
+      const env2 = env;
+      Promise.all([
+        db.prepare("SELECT id FROM emails_sent WHERE account_id = ? AND template_name = ? LIMIT 1").bind(acctId, 'progress_report').first().catch(() => null),
+        db.prepare('SELECT email FROM accounts WHERE id = ? LIMIT 1').bind(acctId).first().catch(() => null),
+      ]).then(([sent, acct]) => {
+        if (!sent && acct?.email) {
+          const es = new EmailService(db, env2);
+          es.sendTemplate(acctId, acct.email, 'progress_report', {
+            improvement_pct: impPct, attempts_pct: attPct, drift_pct: drfPct,
+            pattern_reuse_pct: Math.round(100 - drfPct), success_rate: sucRate,
+            saves_count: m.saves_count ?? 0, decisions_count: m.total_decisions,
+          }).catch((e) => { safely(() => console.warn('[nudge-email]', e), 'nudge-email'); });
+        }
+      }).catch((e) => { safely(() => console.warn('[nudge-email-lookup]', e), 'nudge-email-lookup'); });
+    }
+
+    return json(result);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : 'Unknown error';
+    console.error('GET /v1/agent/nudge error:', msg);
+    return err('Internal server error', 500);
+  }
+});
 
 // GET /v1/agent/status — quick health check for SDK quickStatus()
 router.get('/v1/agent/status', async (request: IRequest, env: Env) => {

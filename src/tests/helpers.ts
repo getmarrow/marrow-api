@@ -31,14 +31,14 @@ class InMemoryDB {
     const tableNames = [
       'accounts', 'api_keys', 'decisions', 'decision_shares', 'causality_edges',
       'decision_vectors', 'patterns', 'trend_signals', 'lessons', 'priority_queue',
-      'bootstrap_templates', 'audit_log', 'consensus_votes', 'snapshots',
+      'bootstrap_templates', 'workflow_templates', 'audit_log', 'consensus_votes', 'snapshots',
       'api_versions', 'analytics_snapshots', 'lesson_stats', 'lesson_ratings',
       'safety_violations', 'rate_limits', 'outcomes', 'causality_stats',
       'pattern_tests', 'pattern_results', 'transfer_history', 'transfer_metrics',
       'decision_priority', 'queue_status', 'bootstrap_instances', 'consensus_analysis',
       'snapshot_metadata', 'snapshot_diffs', 'restore_jobs', 'migration_guides',
       'deprecation_warnings', 'lesson_versions', 'versions',
-      'learned_templates', 'memories', 'memory_shares',
+      'learned_templates', 'memories', 'memory_shares', 'account_baselines', 'agent_baselines', 'saves',
       'orgs', 'org_members', 'api_key_audit_log', 'rate_limits'
     ];
     for (const name of tableNames) {
@@ -105,6 +105,8 @@ export function createMockD1(): D1Database {
     name: 'Empire Buu',
     email: 'buu@getmarrow.ai',
     tier: 'enterprise',
+    nudged_at: null,
+    nudged_decision_count: 0,
     created_at: new Date().toISOString(),
   });
 

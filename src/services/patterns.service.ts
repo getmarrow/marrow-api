@@ -9,6 +9,49 @@ import { uuid, now } from '../utils/crypto';
 import { computeEmbedding, cosineSimilarity } from '../utils/vectors';
 import { PiiService } from './pii.service';
 
+interface SimilarDecision {
+  decision_id: string;
+  decision_type: string;
+  confidence: number;
+  outcome: string;
+  outcome_success: number | null;
+  similarity: number;
+  account_id?: string;
+  visibility?: string;
+  created_at?: string;
+}
+
+interface SemanticSearchOptions {
+  limit?: number;
+  includePrivate?: boolean;
+  minSimilarity?: number;
+  excludeDecisionId?: string;
+}
+
+interface PredictRiskParams {
+  accountId: string;
+  action: string;
+  decisionType: string;
+  context?: Record<string, unknown>;
+}
+
+interface PredictRiskResult {
+  risk_score: number | null;
+  confidence: number;
+  similar_count: number;
+  top_failure_reason: string | null;
+}
+
+interface LearnedTemplateCandidate {
+  template_id: string;
+  pattern_cluster: string;
+  steps: string[];
+  success_rate: number;
+  confidence: number;
+  usage_count: number;
+  decision_type: string;
+}
+
 export class PatternsService {
   private ai: any;
   private pii: PiiService;
@@ -22,7 +65,7 @@ export class PatternsService {
 
   async predictSimilarDecisions(newContext: Record<string, unknown>, decisionType: string, limit = 5) {
     const vectors = await this.db.prepare(`
-      SELECT dv.*, d.confidence, d.outcome, d.outcome_success FROM decision_vectors dv
+      SELECT dv.*, d.account_id, d.visibility, d.confidence, d.outcome, d.outcome_success, d.created_at FROM decision_vectors dv
       JOIN decisions d ON dv.decision_id = d.id
       WHERE d.decision_type = ?
         AND (d.visibility = 'hive' OR d.visibility = 'shared')
@@ -33,29 +76,101 @@ export class PatternsService {
     const safeContext = this.pii.stripObject(newContext);
     const newEmb = await computeEmbedding(this.ai, `${decisionType}: ${JSON.stringify(safeContext)}`);
 
-    const sorted = (vectors.results || [])
-      .map(r => {
-        const emb = JSON.parse(String(r.vector_embedding)) as number[];
-        return { decision_id: r.decision_id, decision_type: r.decision_type, confidence: r.confidence, outcome: r.outcome, outcome_success: r.outcome_success, similarity: cosineSimilarity(newEmb, emb) };
-      })
-      .sort((a, b) => b.similarity - a.similarity)
+    const sorted = this.rankSimilarDecisions(vectors.results || [], newEmb)
       .slice(0, limit);
 
-    // Phase 2: Predictive risk score from top-N similar outcomes
-    let risk_score: number | null = null;
-    if (sorted.length >= 2) {
-      const topIds = sorted.map(s => s.decision_id);
-      const outcomeRows = await this.db.prepare(
-        `SELECT outcome_success FROM decisions WHERE id IN (${topIds.map(() => '?').join(',')}) AND outcome_success IS NOT NULL`
-      ).bind(...topIds).all<{ outcome_success: number }>();
-      const withOutcomes = (outcomeRows.results || []).filter(r => r.outcome_success !== null);
-      if (withOutcomes.length >= 2) {
-        const successful = withOutcomes.filter(r => r.outcome_success === 1).length;
-        risk_score = 1 - (successful / withOutcomes.length);
-      }
+    return { similar: sorted, risk_score: this.calculateSimpleRisk(sorted, 2) };
+  }
+
+  async semanticSearch(
+    queryText: string,
+    accountId: string,
+    options: SemanticSearchOptions = {}
+  ): Promise<SimilarDecision[]> {
+    const limit = Math.min(Math.max(options.limit || 5, 1), 20);
+    const minSimilarity = options.minSimilarity ?? 0;
+    const queryEmbedding = await computeEmbedding(this.ai, this.prepareSemanticQuery(queryText));
+
+    const vectors = await this.db.prepare(`
+      SELECT dv.*, d.account_id, d.visibility, d.confidence, d.outcome, d.outcome_success, d.created_at FROM decision_vectors dv
+      JOIN decisions d ON dv.decision_id = d.id
+      WHERE (d.quality IS NULL OR d.quality != 'trivial')
+      LIMIT 100
+    `).all<Record<string, unknown>>();
+
+    return this.rankSimilarDecisions(vectors.results || [], queryEmbedding)
+      .filter((row) => this.canAccessSemanticRow(row, accountId, Boolean(options.includePrivate)))
+      .filter((row) => !options.excludeDecisionId || row.decision_id !== options.excludeDecisionId)
+      .filter((row) => row.similarity >= minSimilarity)
+      .slice(0, limit);
+  }
+
+  async predictRisk(params: PredictRiskParams): Promise<PredictRiskResult> {
+    const safeContext = this.pii.stripObject(params.context || {});
+    const queryText = `${params.decisionType}: ${this.pii.stripString(params.action)} — ${JSON.stringify(safeContext)}`;
+    const semanticMatches = await this.semanticSearch(queryText, params.accountId, {
+      limit: 10,
+      includePrivate: true,
+      minSimilarity: 0.1,
+    });
+
+    const matchesWithOutcomes = semanticMatches.filter((match) => this.normalizeOutcomeSuccess(match.outcome_success) !== null);
+    const similar_count = matchesWithOutcomes.length;
+    const averageSimilarity = matchesWithOutcomes.length > 0
+      ? matchesWithOutcomes.reduce((sum, match) => sum + match.similarity, 0) / matchesWithOutcomes.length
+      : 0;
+
+    const historyRows = await this.db.prepare(`
+      SELECT outcome_success, created_at
+      FROM decisions
+      WHERE account_id = ?
+        AND decision_type = ?
+        AND outcome_success IS NOT NULL
+        AND (quality IS NULL OR quality != 'trivial')
+      LIMIT 200
+    `).bind(params.accountId, params.decisionType).all<Record<string, unknown>>();
+
+    const typeHistory = (historyRows.results || [])
+      .map((row) => ({
+        outcome_success: this.normalizeOutcomeSuccess(row.outcome_success),
+        created_at: row.created_at ? String(row.created_at) : null,
+      }))
+      .filter((row) => row.outcome_success !== null) as Array<{ outcome_success: number; created_at: string | null }>;
+
+    const confidence = Math.min(similar_count / 10, 1) * averageSimilarity;
+    const top_failure_reason = this.getTopFailureReason(matchesWithOutcomes);
+
+    if (similar_count < 3) {
+      return {
+        risk_score: null,
+        confidence,
+        similar_count,
+        top_failure_reason,
+      };
     }
 
-    return { similar: sorted, risk_score };
+    const weighted = matchesWithOutcomes.reduce((acc, match) => {
+      const outcomeSuccess = this.normalizeOutcomeSuccess(match.outcome_success);
+      if (outcomeSuccess === null) return acc;
+      const weight = Math.max(match.similarity, 0.05) * this.recencyWeight(match.created_at || null);
+      acc.total += weight;
+      if (outcomeSuccess === 1) acc.success += weight;
+      return acc;
+    }, { total: 0, success: 0 });
+
+    const semanticRisk = weighted.total > 0 ? 1 - (weighted.success / weighted.total) : null;
+    const typeRisk = this.calculateHistoryRisk(typeHistory);
+    const frequencyBlend = Math.min(typeHistory.length / 10, 1) * 0.35;
+    const risk_score = semanticRisk === null
+      ? typeRisk
+      : this.clampRisk((semanticRisk * (1 - frequencyBlend)) + (typeRisk * frequencyBlend));
+
+    return {
+      risk_score,
+      confidence,
+      similar_count,
+      top_failure_reason,
+    };
   }
 
   // ====== TIER 8: PATTERN DISCOVERY ======
@@ -319,29 +434,10 @@ export class PatternsService {
     const safeContext = this.pii.stripObject(newContext);
     const newEmb = await computeEmbedding(this.ai, `${decisionType}: ${JSON.stringify(safeContext)}`);
 
-    const sorted = (vectors.results || [])
-      .map(r => {
-        const emb = JSON.parse(String(r.vector_embedding)) as number[];
-        return { decision_id: r.decision_id, decision_type: r.decision_type, confidence: r.confidence, outcome: r.outcome, outcome_success: r.outcome_success, account_id: r.account_id, similarity: cosineSimilarity(newEmb, emb) };
-      })
-      .sort((a, b) => b.similarity - a.similarity)
+    const sorted = this.rankSimilarDecisions(vectors.results || [], newEmb)
       .slice(0, limit);
 
-    // Risk score from team outcomes
-    let risk_score: number | null = null;
-    if (sorted.length >= 2) {
-      const topIds = sorted.map(s => s.decision_id);
-      const outcomeRows = await this.db.prepare(
-        `SELECT outcome_success FROM decisions WHERE id IN (${topIds.map(() => '?').join(',')}) AND outcome_success IS NOT NULL`
-      ).bind(...topIds).all<{ outcome_success: number }>();
-      const withOutcomes = (outcomeRows.results || []).filter(r => r.outcome_success !== null);
-      if (withOutcomes.length >= 2) {
-        const successful = withOutcomes.filter(r => r.outcome_success === 1).length;
-        risk_score = 1 - (successful / withOutcomes.length);
-      }
-    }
-
-    return { similar: sorted, risk_score };
+    return { similar: sorted, risk_score: this.calculateSimpleRisk(sorted, 2) };
   }
 
   /**
@@ -480,11 +576,7 @@ export class PatternsService {
       console.log('[learnTemplates] Clustered ' + patterns.length + ' patterns into ' + clusters.length + ' clusters');
 
       // 4. Extract templates from clusters with ≥3 patterns and ≥60% success rate
-      const templates: Array<{
-        template_id: string; pattern_cluster: string; steps: string[];
-        success_rate: number; confidence: number; usage_count: number;
-        decision_type: string;
-      }> = [];
+      const templates: LearnedTemplateCandidate[] = [];
 
       for (const cluster of clusters) {
         if (cluster.length < 3) continue;
@@ -534,6 +626,8 @@ export class PatternsService {
         ).run();
       }
 
+      await this.autoPromoteTemplates(templates, ts);
+
       console.log('[learnTemplates] Generated ' + templates.length + ' templates');
     } catch (e) {
       console.error('[learnTemplates] Failed:', e instanceof Error ? e.message : e);
@@ -563,6 +657,171 @@ export class PatternsService {
       decision_type: String(r.decision_type),
       created_at: String(r.created_at),
     }));
+  }
+
+  private rankSimilarDecisions(rows: Record<string, unknown>[], queryEmbedding: number[]): SimilarDecision[] {
+    return rows
+      .map((row) => {
+        try {
+          const embedding = JSON.parse(String(row.vector_embedding || '[]')) as number[];
+          return {
+            decision_id: String(row.decision_id),
+            decision_type: String(row.decision_type),
+            confidence: Number(row.confidence || 0),
+            outcome: String(row.outcome || ''),
+            outcome_success: this.normalizeOutcomeSuccess(row.outcome_success),
+            similarity: cosineSimilarity(queryEmbedding, embedding),
+            account_id: row.account_id ? String(row.account_id) : undefined,
+            visibility: row.visibility ? String(row.visibility) : undefined,
+            created_at: row.created_at ? String(row.created_at) : undefined,
+          } satisfies SimilarDecision;
+        } catch {
+          return null;
+        }
+      })
+      .filter((row): row is SimilarDecision => Boolean(row))
+      .sort((a, b) => b.similarity - a.similarity);
+  }
+
+  private calculateSimpleRisk(matches: SimilarDecision[], minOutcomes: number): number | null {
+    const withOutcomes = matches.filter((match) => this.normalizeOutcomeSuccess(match.outcome_success) !== null);
+    if (withOutcomes.length < minOutcomes) return null;
+    const successful = withOutcomes.filter((match) => this.normalizeOutcomeSuccess(match.outcome_success) === 1).length;
+    return 1 - (successful / withOutcomes.length);
+  }
+
+  private canAccessSemanticRow(row: SimilarDecision, accountId: string, includePrivate: boolean): boolean {
+    if (row.account_id === accountId) {
+      if (includePrivate) return true;
+      return row.visibility === 'hive' || row.visibility === 'shared';
+    }
+    return row.visibility === 'hive' || row.visibility === 'shared';
+  }
+
+  private prepareSemanticQuery(text: string): string {
+    return this.pii.stripString(text || 'general: no context');
+  }
+
+  private normalizeOutcomeSuccess(value: unknown): number | null {
+    if (value === null || value === undefined) return null;
+    if (value === true || value === 1 || value === '1') return 1;
+    if (value === false || value === 0 || value === '0') return 0;
+    return null;
+  }
+
+  private recencyWeight(createdAt: string | null): number {
+    if (!createdAt) return 1;
+    const ageMs = Date.now() - new Date(createdAt).getTime();
+    if (!Number.isFinite(ageMs) || ageMs <= 0) return 1;
+    const ageDays = ageMs / 86400000;
+    return 1 / (1 + (ageDays / 30));
+  }
+
+  private calculateHistoryRisk(history: Array<{ outcome_success: number; created_at: string | null }>): number {
+    if (history.length === 0) return 0.5;
+    const totals = history.reduce((acc, row) => {
+      const weight = this.recencyWeight(row.created_at);
+      acc.total += weight;
+      if (row.outcome_success === 1) acc.success += weight;
+      return acc;
+    }, { total: 0, success: 0 });
+
+    if (totals.total === 0) return 0.5;
+    return this.clampRisk(1 - (totals.success / totals.total));
+  }
+
+  private clampRisk(value: number): number {
+    return Math.min(1, Math.max(0, value));
+  }
+
+  private getTopFailureReason(matches: SimilarDecision[]): string | null {
+    const reasons = new Map<string, number>();
+    for (const match of matches) {
+      if (this.normalizeOutcomeSuccess(match.outcome_success) !== 0) continue;
+      const reason = this.extractFailureReason(match.outcome);
+      if (!reason) continue;
+      reasons.set(reason, (reasons.get(reason) || 0) + 1);
+    }
+
+    const sorted = [...reasons.entries()].sort((a, b) => b[1] - a[1]);
+    return sorted[0]?.[0] || null;
+  }
+
+  private extractFailureReason(outcome: string): string | null {
+    const sanitized = this.pii.stripString(outcome || '').trim();
+    if (!sanitized) return null;
+    return sanitized
+      .split(/[.!?\n]/)[0]
+      .trim()
+      .slice(0, 120) || null;
+  }
+
+  private async autoPromoteTemplates(templates: LearnedTemplateCandidate[], ts: string): Promise<void> {
+    for (const template of templates) {
+      if (template.confidence < 0.8 || template.usage_count < 3 || template.success_rate < 0.8) {
+        continue;
+      }
+
+      const name = this.buildAutoTemplateName(template);
+      const slug = this.slugify(name);
+      const existing = await this.db.prepare(
+        `SELECT id, slug, name FROM workflow_templates
+         WHERE slug = ? OR name = ? OR slug LIKE ?
+         LIMIT 5`
+      ).bind(slug, name, `%${slug.split('-').slice(0, 2).join('%')}%`).all<Record<string, unknown>>();
+
+      if ((existing.results || []).length > 0) continue;
+
+      const steps = template.steps.map((step, index) => ({
+        step: index + 1,
+        name: this.formatWorkflowStepName(step),
+        description: step,
+        action_type: template.decision_type,
+      }));
+
+      await this.db.prepare(
+        `INSERT INTO workflow_templates (id, name, slug, description, industry, category, author, steps, install_count, avg_success_rate, tags, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(
+        uuid(),
+        name,
+        slug,
+        `Auto-promoted from learned Marrow patterns for ${template.decision_type}.`,
+        null,
+        template.decision_type,
+        '__auto__',
+        JSON.stringify(steps),
+        0,
+        template.success_rate,
+        JSON.stringify(['auto', 'learned', template.decision_type]),
+        ts,
+        ts
+      ).run();
+    }
+  }
+
+  private buildAutoTemplateName(template: LearnedTemplateCandidate): string {
+    const decisionLabel = template.decision_type
+      .split(/[_\s-]+/)
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(' ');
+    const clusterLabel = template.pattern_cluster.replace(/[|:_-]+/g, ' ').trim().slice(0, 40) || 'Workflow';
+    return `${decisionLabel} ${clusterLabel} Workflow`.trim().slice(0, 100);
+  }
+
+  private formatWorkflowStepName(step: string): string {
+    const cleaned = step.replace(/[_-]+/g, ' ').trim();
+    if (!cleaned) return 'Step';
+    return cleaned.charAt(0).toUpperCase() + cleaned.slice(1, 60);
+  }
+
+  private slugify(input: string): string {
+    return input
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 60);
   }
 
   private simpleHash(input: string): string {

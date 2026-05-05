@@ -4,8 +4,9 @@ import welcomeTemplate from '../email-templates/welcome.json';
 import day3NudgeTemplate from '../email-templates/day3_nudge.json';
 import milestone100Template from '../email-templates/milestone_100.json';
 import catchupV1Template from '../email-templates/catchup_v1.json';
+import progressReportTemplate from '../email-templates/progress_report.json';
 
-type TemplateName = 'welcome' | 'day3_nudge' | 'milestone_100' | 'catchup_v1';
+type TemplateName = 'welcome' | 'day3_nudge' | 'milestone_100' | 'catchup_v1' | 'progress_report';
 
 type TemplateVars = Record<string, string | number | null | undefined>;
 
@@ -21,6 +22,7 @@ const TEMPLATES: Record<TemplateName, EmailTemplateFile> = {
   day3_nudge: day3NudgeTemplate,
   milestone_100: milestone100Template,
   catchup_v1: catchupV1Template,
+  progress_report: progressReportTemplate,
 };
 
 export class EmailService {

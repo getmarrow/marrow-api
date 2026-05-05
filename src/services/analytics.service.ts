@@ -2,6 +2,7 @@
  * Tier 17: Analytics & Insights Dashboard
  */
 import { uuid, now } from '../utils/crypto';
+import { safely } from '../utils/safely';
 
 export class AnalyticsService {
   constructor(private db: D1Database) {}
@@ -42,7 +43,7 @@ export class AnalyticsService {
     for (const [name, value] of Object.entries(metrics)) {
       await this.db.prepare(
         'INSERT INTO analytics_snapshots (id, account_id, metric_name, value, recorded_at, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).bind(uuid(), accountId, name, value, ts, ts).run().catch(() => {});
+      ).bind(uuid(), accountId, name, value, ts, ts).run().catch((e) => safely(() => { console.warn('[silent-catch]', e); }, 'silent-catch'));
     }
 
     // Get historical for trends

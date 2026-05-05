@@ -1,5 +1,6 @@
 import type { D1Database } from '@cloudflare/workers-types';
 import { BaselineService } from './baseline.service';
+import { safely } from '../utils/safely';
 
 interface LatestCommitRow {
   outcome_recorded_at: string;
@@ -37,7 +38,7 @@ export class NarrativeService {
     }
 
     const baselineService = new BaselineService(this.db);
-    await baselineService.captureAccountBaselineIfEligible(accountId).catch(() => {});
+    await baselineService.captureAccountBaselineIfEligible(accountId).catch((e) => safely(() => { console.warn('[silent-catch]', e); }, 'silent-catch'));
 
     const baseline = await this.getAccountBaseline(accountId);
     if (baseline && this.wasCapturedByThisCommit(baseline.captured_at, latestCommit.outcome_recorded_at)) {

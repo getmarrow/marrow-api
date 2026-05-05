@@ -3,6 +3,7 @@
  * Called by cron every 6 hours
  */
 import { now, uuid } from '../utils/crypto';
+import { safely } from '../utils/safely';
 
 interface TierConfig {
   id: string;
@@ -60,7 +61,7 @@ export class RetentionService {
           .prepare('INSERT INTO audit_log (id, timestamp, account_id, action, resource_type, resource_id, changes, hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
           .bind(uuid(), ts, 'system', 'RETENTION_CLEANUP', 'decisions', tier.name, JSON.stringify({ deleted, tier: tier.name, cutoff }), uuid(), ts)
           .run()
-          .catch(() => {});
+          .catch((e) => safely(() => { console.warn('[silent-catch]', e); }, 'silent-catch'));
       }
     }
 

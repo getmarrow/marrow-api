@@ -6,6 +6,7 @@ import { uuid, now } from './utils/crypto';
 import { computeEmbedding, cosineSimilarity } from './utils/vectors';
 import { DEFAULT_SEQUENCES, matchesTrigger, matchesFollowup } from './workflow-sequences';
 import { PiiService } from './services/pii.service';
+import { safely } from './utils/safely';
 
 const CLUSTER_SIMILARITY_THRESHOLD = 0.75;
 const FAILURE_THRESHOLD = 3;
@@ -104,7 +105,7 @@ export class PatternEngine {
       .prepare('UPDATE decisions SET cluster_id = ? WHERE id = ? AND account_id = ?')
       .bind(clusterId, decisionId, accountId)
       .run()
-      .catch(() => {});
+      .catch((e) => safely(() => { console.warn('[silent-catch]', e); }, 'silent-catch'));
 
     return clusterId;
   }
@@ -230,7 +231,7 @@ export class PatternEngine {
             .prepare('INSERT INTO workflow_gaps (id, account_id, trigger_action, expected_followup, trigger_decision_id, detected_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
             .bind(uuid(), accountId, seq.trigger, seq.followup, decisionId, now(), now())
             .run()
-            .catch(() => {});
+            .catch((e) => safely(() => { console.warn('[silent-catch]', e); }, 'silent-catch'));
         }
       }
     }

@@ -10,6 +10,7 @@ import { compress, decompress } from '../utils/compression';
 import { computeEmbedding } from '../utils/vectors';
 import { AuditService } from './audit.service';
 import { PiiService } from './pii.service';
+import { safely } from '../utils/safely';
 
 const COMPRESSION_THRESHOLD = 4096;
 
@@ -59,12 +60,20 @@ export class DecisionService {
    * Generate and store a semantic embedding for a decision.
    * Fire-and-forget — embedding failure must never block decision creation.
    */
-  private async storeEmbedding(decisionId: string, decisionType: string, outcome: string, quality: DecisionQuality | null = null): Promise<void> {
+  private async storeEmbedding(
+    decisionId: string,
+    decisionType: string,
+    outcome: string,
+    context: Record<string, unknown>,
+    quality: DecisionQuality | null = null
+  ): Promise<void> {
     if (quality === 'trivial') return;
 
     try {
-      const sanitizedOutcome = this.pii.stripString(outcome);
-      const embedding = await computeEmbedding(this.ai, `${decisionType}: ${sanitizedOutcome}`);
+      const sanitizedOutcome = this.pii.stripString(outcome || 'no outcome') || 'no outcome';
+      const sanitizedContext = this.pii.stripObject(context || {});
+      const embedText = `${decisionType}: ${sanitizedOutcome} — ${JSON.stringify(sanitizedContext)}`;
+      const embedding = await computeEmbedding(this.ai, embedText);
       const dims = embedding.length;
       const model = dims === 768 ? 'bge-base-en-v1.5' : 'token-fallback';
       await this.db
@@ -154,7 +163,7 @@ export class DecisionService {
       .run();
 
     // Tier 7: semantic vector embedding (async, fire-and-forget)
-    this.storeEmbedding(id, decisionType, outcome, quality).catch(() => {});
+    this.storeEmbedding(id, decisionType, outcome, context, quality).catch((e) => safely(() => { console.warn('[silent-catch]', e); }, 'silent-catch'));
 
     // Tier 13: audit
     await this.audit.log(accountId, 'CREATE', 'decision', id, { decision_type: decisionType, confidence, visibility: effectiveVisibility });

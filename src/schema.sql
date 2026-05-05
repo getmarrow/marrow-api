@@ -4,6 +4,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   name TEXT NOT NULL,
   email TEXT NOT NULL UNIQUE,
   tier TEXT NOT NULL DEFAULT 'free',
+  nudged_at TEXT DEFAULT NULL,
+  nudged_decision_count INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   CHECK (tier IN ('free', 'pro', 'enterprise', 'owner'))
 );
@@ -313,6 +315,25 @@ CREATE TABLE IF NOT EXISTS bootstrap_templates (
   created_at TEXT NOT NULL
 );
 
+
+CREATE TABLE IF NOT EXISTS workflow_templates (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  slug TEXT UNIQUE,
+  description TEXT,
+  industry TEXT,
+  category TEXT,
+  author TEXT DEFAULT 'marrow',
+  steps TEXT NOT NULL,
+  install_count INTEGER DEFAULT 0,
+  avg_success_rate REAL,
+  tags TEXT DEFAULT '[]',
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_templates_industry ON workflow_templates(industry, install_count DESC);
+CREATE INDEX IF NOT EXISTS idx_workflow_templates_slug ON workflow_templates(slug);
 
 -- Learned Templates (Phase 2)
 CREATE TABLE IF NOT EXISTS learned_templates (

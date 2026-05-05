@@ -48,7 +48,31 @@ export interface Account {
   email: string;
   tier: 'free' | 'pro' | 'enterprise' | 'owner';
   org_id?: string | null;
+  nudged_at?: string | null;
+  nudged_decision_count?: number;
   created_at: string;
+}
+
+export interface NudgeMetricHighlight {
+  key: 'time_to_success_seconds' | 'attempts_per_success' | 'drift_rate' | 'success_rate' | 'saves_count';
+  label: string;
+  delta_pct?: number;
+  value?: number;
+  sentence: string;
+}
+
+export interface NudgeResponse {
+  nudge: boolean;
+  message: string | null;
+  metrics: {
+    total_decisions: number;
+    decisions_since_last_nudge: number;
+    nudged_at: string | null;
+    nudged_decision_count: number;
+    saves_count: number;
+    highlights: NudgeMetricHighlight[];
+    improvement?: Record<string, unknown> | null;
+  } | null;
 }
 
 export type AccountTier = 'free' | 'pro' | 'enterprise' | 'owner';

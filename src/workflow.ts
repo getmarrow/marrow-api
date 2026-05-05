@@ -25,6 +25,7 @@ import { PatternRecognitionService } from './services/pattern-recognition.servic
 import { OrgService } from './services/org.service';
 import { WorkflowWarning, LearnedTemplate, DecisionQuality } from './types';
 import { D1Database } from '@cloudflare/workers-types';
+import { safely } from './utils/safely';
 
 export interface WorkflowBeforeInput {
   decision_type: string;
@@ -182,7 +183,7 @@ export class WorkflowService {
           .catch(() => []),
 
         // T17: Current analytics baseline
-        services.analytics.getSystemAnalytics().catch(() => ({})),
+        services.analytics.getSystemAnalytics().catch((e) => { safely(() => { console.warn('[silent-catch]', e); }, 'silent-catch'); return {}; }),
 
         // T4: Hive shared context
         services.collaboration
@@ -310,25 +311,25 @@ export class WorkflowService {
 
       // V6.5: Capture baseline snapshot (fire-and-forget, idempotent)
       const baseline = new BaselineService(this.db);
-      baseline.captureAccountBaselineIfEligible(account_id).catch(() => {});
+      baseline.captureAccountBaselineIfEligible(account_id).catch((e) => safely(() => { console.warn('[silent-catch]', e); }, 'silent-catch'));
       if (input.agent_id) {
-        baseline.captureAgentBaselineIfEligible(account_id, input.agent_id).catch(() => {});
+        baseline.captureAgentBaselineIfEligible(account_id, input.agent_id).catch((e) => safely(() => { console.warn('[silent-catch]', e); }, 'silent-catch'));
       }
 
       // T12: Self-vote for consensus
       const voteResult = await services.consensus
         .recordVote(input.decision_id, account_id, input.success ? 'agree' : 'disagree', input.outcome)
-        .catch(() => ({}));
+        .catch((e) => { safely(() => { console.warn('[silent-catch]', e); }, 'silent-catch'); return {}; });
 
       // T13: Get consensus metrics
       const consensus = await services.consensus
         .calculateConsensus(input.decision_id)
-        .catch(() => ({}));
+        .catch((e) => { safely(() => { console.warn('[silent-catch]', e); }, 'silent-catch'); return {}; });
 
       // T17: Get updated analytics
       const updatedAnalytics = await services.analytics
         .getSystemAnalytics()
-        .catch(() => ({}));
+        .catch((e) => { safely(() => { console.warn('[silent-catch]', e); }, 'silent-catch'); return {}; });
       const new_success_rate =
         (updatedAnalytics as any)?.success_rate || 0.75;
       const velocity_trend =
@@ -418,7 +419,7 @@ export class WorkflowService {
           .catch(() => 0), // T19
         services.consensus
           .calculateConsensus('')
-          .catch(() => ({})), // T13
+          .catch((e) => { safely(() => { console.warn('[silent-catch]', e); }, 'silent-catch'); return {}; }), // T13
         services.snapshot
           .listSnapshots(accountId || 'any', 50)
           .then((s) => s?.length || 0)
