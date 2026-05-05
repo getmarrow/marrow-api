@@ -14,6 +14,7 @@ import { AuditService } from './services/audit.service';
 import { FeedbackService } from './services/feedback.service';
 import { CausalityService } from './services/causality.service';
 import { PriorityService } from './services/priority.service';
+import { PatternRecognitionService } from './services/pattern-recognition.service';
 import { TransferService } from './services/transfer.service';
 import { BootstrapService } from './services/bootstrap.service';
 import { ConsensusService } from './services/consensus.service';
@@ -39,7 +40,7 @@ import { TemplatesService } from './services/templates.service';
 import { FleetService } from './services/fleet.service';
 import { NarrativeService } from './services/narrative.service';
 import { NudgeService } from './services/nudge.service';
-import { EmailService, getEmailService } from './services/email.service';
+import { EmailService } from './services/email.service';
 import { MemoryService } from './services/memory.service';
 import type { VelocityMetric } from './services/velocity.service';
 import type { ImprovementResult } from './services/baseline.service';
@@ -50,6 +51,8 @@ import { autoLogDecision, classifyDecisionQuality } from './middleware/auto-logg
 import { actionQualityWarning, isStrictQualityMode, validateActionQuality } from './middleware/action-validator';
 import { getDedupedResponse, storeDedupedResponse } from './middleware/dedup-cache';
 import { safely } from './utils/safely';
+import { router as memoriesRouter } from './routes/memories';
+import { router as agentRouter } from './routes/agent';
 
 // ============= Helpers =============
 
@@ -169,7 +172,8 @@ function enforceRoutePolicy(request: IRequest, ctx: RequestContext): Response | 
 // ============= Router =============
 
 const router = Router();
-
+router.all('/v1/memories*', (request: IRequest, env: Env, ctx: ExecutionContext) => memoriesRouter.handle(request as Request, env, ctx));
+router.all('/v1/agent/*', (request: IRequest, env: Env, ctx: ExecutionContext) => agentRouter.handle(request as Request, env, ctx));
 
 // ============= Auth Helper =============
 async function requireAuth(request: IRequest, env: Env): Promise<RequestContext | Response> {
@@ -304,7 +308,7 @@ router.get('/v1/email/unsubscribe', async (request: IRequest, env: Env) => {
       });
     }
 
-    const emailService = getEmailService(env.DB, env);
+    const emailService = new EmailService(env.DB, env);
     const ok = await emailService.unsubscribe(token);
     if (!ok) {
       return new Response('<!doctype html><html><body><h1>Not found</h1></body></html>', {
@@ -468,7 +472,7 @@ router.post('/v1/keys/verify', async (request: IRequest, env: Env) => {
     const created = await authService.createApiKey(accountId, { createdBy: 'signup', name: 'Primary signup key' });
     const apiKey = created.key;
 
-    const emailService = getEmailService(env.DB, env);
+    const emailService = new EmailService(env.DB, env);
     // SECURITY: never include api_key in email vars — emails are not a secure channel.
     // The user receives their key in the JSON response below; this email confirms
     // signup and points them at the install command using an env-var pattern.
@@ -501,7 +505,7 @@ router.post('/v1/auth/accounts', async (request: IRequest, env: Env) => {
       String(body.name || ''), String(body.email || ''), 'free'  // H2 fix: always free, never trust client-supplied tier
     );
     const { key, keyId } = await authService.createApiKey(account.id, { createdBy: 'signup', name: 'Primary signup key' });
-    const emailService = getEmailService(env.DB, env);
+    const emailService = new EmailService(env.DB, env);
     // SECURITY: api_key intentionally NOT passed to template — emails never carry secrets.
     // User receives the key in the JSON response below.
     emailService
@@ -521,7 +525,7 @@ router.get('/v1/auth/account', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -712,7 +716,7 @@ router.post('/decisions', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -793,7 +797,7 @@ router.get('/decisions', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -820,7 +824,7 @@ router.get('/v1/decisions/shared', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -847,7 +851,7 @@ router.get('/v1/decisions/routing-suggestions', async (request: IRequest, env: E
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -871,7 +875,7 @@ router.get('/v1/decisions/priority', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -894,7 +898,7 @@ router.get('/v1/decisions/:id', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -918,7 +922,7 @@ router.put('/v1/decisions/:id/outcome', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -946,7 +950,7 @@ router.get('/v1/decisions/:id/outcome', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -969,7 +973,7 @@ router.get('/v1/decisions/feedback/history', async (request: IRequest, env: Env)
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -992,7 +996,7 @@ router.get('/v1/feedback/metrics', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1017,7 +1021,7 @@ router.post('/v1/decisions/:id/share', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1050,7 +1054,7 @@ router.post('/v1/decisions/:id/caused-by', async (request: IRequest, env: Env) =
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1081,7 +1085,7 @@ router.get('/v1/decisions/:id/causality', async (request: IRequest, env: Env) =>
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1105,7 +1109,7 @@ router.post('/v1/decisions/predict', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1131,14 +1135,14 @@ router.get('/v1/patterns', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
     }).catch(() => {});
 
     const url = getUrl(request);
-    const prService = new PatternsService(env.DB);
+    const prService = new PatternRecognitionService(env.DB);
     const patterns = await prService.recognizePatterns(ctx.account_id, url.searchParams.get('decision_type') || undefined);
     return json(patterns);
   } catch (e: unknown) { return err('Internal error'); }
@@ -1154,13 +1158,13 @@ router.get('/v1/patterns/:id', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
     }).catch(() => {});
 
-    const prService = new PatternsService(env.DB);
+    const prService = new PatternRecognitionService(env.DB);
     const stats = await prService.getPatternStats(String(request.params?.id), ctx.account_id);
     return json(stats);
   } catch (e: unknown) { return err('Internal error'); }
@@ -1176,14 +1180,14 @@ router.post('/v1/patterns/:id/validate', async (request: IRequest, env: Env) => 
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
     }).catch(() => {});
 
     const body = await request.json() as Record<string, unknown>;
-    const prService = new PatternsService(env.DB);
+    const prService = new PatternRecognitionService(env.DB);
     const result = await prService.validatePattern(String(request.params?.id), String(body.decision_id), ctx.account_id);
     return json(result);
   } catch (e: unknown) { return err('Internal error'); }
@@ -1199,7 +1203,7 @@ router.get('/v1/trends', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1224,7 +1228,7 @@ router.get('/v1/lessons/transfer', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1251,7 +1255,7 @@ router.post('/v1/lessons/:id/transfer-to', async (request: IRequest, env: Env) =
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1277,7 +1281,7 @@ router.get('/v1/transfer-metrics', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1306,7 +1310,7 @@ router.get('/v1/decisions/priority', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1329,7 +1333,7 @@ router.post('/v1/decisions/:id/prioritize', async (request: IRequest, env: Env) 
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1363,7 +1367,7 @@ router.get('/v1/queue/status', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1387,7 +1391,7 @@ router.get('/v1/hive', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1416,7 +1420,7 @@ router.get('/v1/hive/signals', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1444,7 +1448,7 @@ router.get('/v1/bootstrap', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1466,7 +1470,7 @@ router.get('/v1/bootstrap/categories', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1487,7 +1491,7 @@ router.post('/v1/bootstrap/:id/apply', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1513,7 +1517,7 @@ router.post('/v1/bootstrap', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1540,7 +1544,7 @@ router.get('/v1/audit', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1568,7 +1572,7 @@ router.get('/v1/audit/verify', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1591,7 +1595,7 @@ router.post('/v1/decisions/:id/consensus-vote', async (request: IRequest, env: E
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1618,7 +1622,7 @@ router.get('/v1/hive/consensus', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1643,7 +1647,7 @@ router.get('/v1/consensus/metrics', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1670,7 +1674,7 @@ router.post('/v1/snapshots', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1697,7 +1701,7 @@ router.get('/v1/snapshots', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1720,7 +1724,7 @@ router.get('/v1/snapshots/:id', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1743,7 +1747,7 @@ router.post('/v1/snapshots/:id/diff', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1772,7 +1776,7 @@ router.post('/v1/snapshots/:id/restore', async (request: IRequest, env: Env) => 
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1794,7 +1798,7 @@ router.get('/v1/restore/status', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1818,7 +1822,7 @@ router.delete('/v1/snapshots/:id', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1842,7 +1846,7 @@ router.get('/v1/versions', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1863,7 +1867,7 @@ router.get('/v1/versions/current', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1885,7 +1889,7 @@ router.get('/v1/versions/:from/migration/:to', async (request: IRequest, env: En
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1909,7 +1913,7 @@ router.get('/v1/analytics', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1939,7 +1943,7 @@ router.get('/v1/analytics/agent', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1961,7 +1965,7 @@ router.get('/v1/analytics/system', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -1982,7 +1986,7 @@ router.get('/v1/analytics/trending', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2006,7 +2010,7 @@ router.post('/v1/lessons', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2037,7 +2041,7 @@ router.post('/v1/lessons/:id/publish', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2059,7 +2063,7 @@ router.get('/v1/lessons/marketplace', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2084,7 +2088,7 @@ router.post('/v1/lessons/:id/fork', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2112,7 +2116,7 @@ router.post('/v1/lessons/:id/rate', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2138,7 +2142,7 @@ router.get('/v1/lessons/:id/versions', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2161,7 +2165,7 @@ router.get('/v1/safety/violations', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2186,7 +2190,7 @@ router.post('/v1/safety/check', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2212,7 +2216,7 @@ router.get('/v1/stream', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -2265,855 +2269,6 @@ router.get('/v1/stream', async (request: IRequest, env: Env) => {
   } catch (e: unknown) { return err('Internal error'); }
 });
 
-// ============= AGENT API: SINGLE-CALL THINK (ALL 20 TIERS) =============
-
-/**
- * Auto-snapshot helper: if account has 10+ decisions since last snapshot, create one (T14).
- */
-async function autoSnapshotIfNeeded(db: D1Database, accountId: string, encryptionKey?: string): Promise<void> {
-  try {
-    const snapshotService = new SnapshotService(db, encryptionKey);
-    const decisionService = new DecisionService(db);
-    // M1: Rate limit — max 1 auto-snapshot per hour per account
-    const lastSnapshotRow = await db
-      .prepare('SELECT created_at FROM snapshots WHERE account_id = ? ORDER BY created_at DESC LIMIT 1')
-      .bind(accountId)
-      .first<{ created_at: string }>();
-    if (lastSnapshotRow?.created_at) {
-      const lastTime = new Date(lastSnapshotRow.created_at).getTime();
-      const oneHourAgo = Date.now() - 60 * 60 * 1000;
-      if (lastTime > oneHourAgo) return; // Too recent, skip
-    }
-
-    const snapshots = await snapshotService.listSnapshots(accountId, 1);
-    const lastSnapshotTime = snapshots.length > 0 ? snapshots[0].created_at : null;
-
-    const decisionsSinceSnapshot = await decisionService.getDecisionCount(accountId, lastSnapshotTime || undefined);
-
-    if (decisionsSinceSnapshot >= 10) {
-      await snapshotService.createSnapshot(accountId, `auto-snapshot-${new Date().toISOString()}`, ['auto']);
-    }
-  } catch (_e) {
-    // T14 auto-snapshot is best-effort — never block the response
-  }
-}
-
-router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
-  try {
-    // T1: Auth
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-    // Read session ID early for auto-logger and downstream use
-    const reqSessionId = request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null;
-
-    // Resolve agent_id: PATH 2 header > PATH 1 auth-derived
-    let reqAgentId: string | null = ctx.agent_id || null;
-    const headerAgentId = request.headers.get('X-Marrow-Agent-Id');
-    if (headerAgentId && /^[a-f0-9-]{36}$/.test(headerAgentId)) {
-      // Validate agent belongs to this account
-      const agentCheck = await env.DB
-        .prepare("SELECT id FROM agents WHERE id = ? AND account_id = ? AND status != 'archived' LIMIT 1")
-        .bind(headerAgentId, ctx.account_id)
-        .first<{ id: string }>();
-      if (agentCheck) reqAgentId = agentCheck.id;
-    }
-
-    const body = await request.json() as Record<string, unknown>;
-    if (!body.action || typeof body.action !== 'string' || body.action.length > 1000) {
-      return err('action is required and must be under 1000 characters', 400);
-    }
-
-    const action = String(body.action);
-    const type = String(body.type || 'general');
-    if (type.length > 50) return err('type max 50 characters', 400);
-    let visibility = body.visibility ? String(body.visibility) as 'private' | 'shared' | 'hive' | 'team' : undefined;
-
-    const qualityValidation = validateActionQuality(action);
-    const strictQualityMode = isStrictQualityMode(env, ctx);
-    if (!qualityValidation.valid && strictQualityMode) {
-      return actionQualityError(qualityValidation);
-    }
-    const actionQuality = qualityValidation.valid
-      ? classifyDecisionQuality(action)
-      : { quality: 'trivial' as const, filtered: true, reason: 'trivial_action' as const };
-
-    // Gap 4: Detect if PII was stripped
-    const piiService = new PiiService();
-    const strippedAction = piiService.stripString(action);
-    const sanitized = strippedAction !== action;
-
-    // Extract previous session fields for auto-commit
-    const previousDecisionId = body.previous_decision_id ? String(body.previous_decision_id) : null;
-    const previousSuccess = body.previous_success !== undefined ? Boolean(body.previous_success) : null;
-    const previousOutcome = body.previous_outcome ? String(body.previous_outcome) : null;
-    if (previousOutcome && previousOutcome.length > 2000) return err('previous_outcome max 2000 characters', 400);
-    if (previousOutcome) {
-      const previousOutcomeQuality = validateActionQuality(previousOutcome);
-      if (!previousOutcomeQuality.valid && strictQualityMode) {
-        return actionQualityError(previousOutcomeQuality);
-      }
-    }
-    const previousCausedBy = body.previous_caused_by ? String(body.previous_caused_by) : null;
-
-    const dedupActorKey = `${ctx.account_id}:${reqAgentId || reqSessionId || ctx.api_key_id || 'account'}`;
-    const dedupFingerprint = `${type}:${action}`;
-    const canDedupThink = !previousDecisionId && previousSuccess === null && previousOutcome === null && !previousCausedBy;
-    if (canDedupThink) {
-      const cached = getDedupedResponse<Record<string, unknown>>('think', dedupActorKey, dedupFingerprint);
-      if (cached) {
-        return json({ ...cached, deduped: true });
-      }
-    }
-
-    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
-    autoLogDecision({
-      db: env.DB,
-      accountId: ctx.account_id,
-      method: request.method,
-      endpoint: new URL(request.url).pathname,
-      statusCode: 200,
-      tier: ctx.tier,
-      sessionId: reqSessionId,
-      body,
-    }).catch(() => {});
-
-    const workflow = new WorkflowService(env.DB, env.AI);
-    let previousCommitted = false;
-    let insight: string | null = null;
-    let updatedSuccessRate: number | null = null;
-
-    // ── STEP 1: Auto-commit previous session (if provided) ──────────────────
-    if (previousDecisionId && previousOutcome !== null && previousSuccess !== null) {
-      try {
-        const commitResult = await workflow.after(
-          {
-            decision_id: previousDecisionId,
-            success: previousSuccess,
-            outcome: previousOutcome,
-            related_decision_id: previousCausedBy ?? undefined,
-            agent_id: reqAgentId ?? undefined,
-          },
-          ctx.account_id
-        );
-        previousCommitted = true;
-        updatedSuccessRate = commitResult.new_success_rate ?? null;
-
-        // Surface insight if hive signals suggest a new pattern
-        const signals = commitResult.hive_signals || [];
-        if (signals.length > 0 && previousSuccess) {
-          insight = `Pattern detected: ${signals[0]?.type || signals[0]?.decision_type || 'recurring success'} trending in hive`;
-        }
-      } catch (_commitErr) {
-        // Non-fatal: continue opening new session even if commit fails
-        console.error('auto-commit of previous session failed:', _commitErr);
-      }
-    }
-
-    // T14: Auto-snapshot if 10+ decisions since last snapshot (non-blocking)
-    autoSnapshotIfNeeded(env.DB, ctx.account_id, env.ENCRYPTION_KEY).catch(() => {});
-
-    // Look up org settings — PII strip + default visibility (hive contribution control)
-    let orgPiiStripTeam = false;
-    if (ctx.tier === 'enterprise') {
-      const orgSvc = new OrgService(env.DB);
-      const org = await orgSvc.getOrgForAccount(ctx.account_id);
-      if (org) {
-        orgPiiStripTeam = !!org.pii_strip_team;
-        // Apply org default_visibility if agent didn't set one explicitly
-        if (!body.visibility && org.default_visibility) {
-          visibility = org.default_visibility as 'private' | 'shared' | 'hive' | 'team';
-        }
-      }
-    }
-
-    // ── STEP 2: Open new session with full intelligence ──────────────────────
-    const result = await workflow.before(
-      {
-        decision_type: type,
-        action,
-        description: action,
-        visibility,
-        session_id: reqSessionId,
-        agent_id: reqAgentId,
-        quality: actionQuality.quality,
-      },
-      ctx.account_id,
-      ctx.tier,
-      orgPiiStripTeam
-    );
-
-    // Update agent last_active_at on think (non-blocking)
-    if (reqAgentId) {
-      env.DB.prepare("UPDATE agents SET last_active_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND account_id = ?")
-        .bind(reqAgentId, ctx.account_id).run().catch(() => {});
-    }
-
-    // ── STEP 3: Pattern Engine — clustering, failure detection, workflow gaps ──
-    const patternEngine = new PatternEngine(env.DB, env.AI);
-    const engineResult = actionQuality.filtered
-      ? { insights: [], clusterId: null }
-      : await patternEngine.analyze(ctx.account_id, action, type, result.decision_id).catch(() => ({ insights: [], clusterId: null }));
-
-    // T20: Stream URL for live updates
-    const streamUrl = `/v1/stream?decision_type=${encodeURIComponent(type)}&format=sse`;
-
-    // Use updated success rate (post-commit) if available, else use pre-existing analytics
-    const successRate = updatedSuccessRate !== null ? updatedSuccessRate : (result.current_success_rate ?? 0.75);
-
-    // Map patterns with correct field names
-    const mappedPatterns = (result.patterns || []).map((p: Record<string, unknown>) => ({
-      pattern_id: p.pattern_signature || p.id || null,
-      decision_type: p.decision_type || type,
-      frequency: typeof p.frequency === 'number' ? p.frequency : 1,
-      confidence: typeof p.confidence === 'number' ? p.confidence : 0.5,
-      first_seen: p.first_seen || null,
-      last_seen: p.last_seen || null,
-    }));
-
-    // Build actionable insights array from pattern engine + frequency patterns
-    const actionableInsights = [...(engineResult.insights || [])];
-
-    // Add frequency insights from discovered patterns
-    if (mappedPatterns.length > 0) {
-      const topPattern = mappedPatterns.sort((a: { frequency: number }, b: { frequency: number }) => b.frequency - a.frequency)[0];
-      if (topPattern.confidence > 0.3) {
-        actionableInsights.push({
-          type: 'frequency' as const,
-          summary: `"${type}" recurring ${topPattern.frequency}x — confidence ${(topPattern.confidence * 100).toFixed(0)}%`,
-          action: `Review if "${type}" decisions need optimization`,
-          severity: (topPattern.confidence > 0.8 ? 'info' : 'warning') as 'info' | 'warning',
-          count: topPattern.frequency,
-        });
-      }
-    }
-
-    // Generate primary insight string (backwards compatible)
-    if (!insight) {
-      // Prioritize: workflow_gap > failure_pattern > frequency
-      const criticalInsight = actionableInsights.find(i => i.severity === 'critical');
-      const warningInsight = actionableInsights.find(i => i.severity === 'warning');
-      const anyInsight = actionableInsights[0];
-      const primaryInsight = criticalInsight || warningInsight || anyInsight;
-      if (primaryInsight) {
-        insight = primaryInsight.summary;
-      }
-    }
-
-    // ── Gap 1: First think() onboarding signal (non-blocking) ──
-    if (env.RESEND_API_KEY) {
-      env.DB
-        .prepare('SELECT first_think_at, email FROM accounts WHERE id = ? LIMIT 1')
-        .bind(ctx.account_id)
-        .first<{ first_think_at: string | null; email: string }>()
-        .then(async (acct) => {
-          if (acct && !acct.first_think_at) {
-            const ts = new Date().toISOString();
-            // M1 fix: Use meta.changes to prevent duplicate emails on race condition
-            const updateResult = await env.DB
-              .prepare('UPDATE accounts SET first_think_at = ? WHERE id = ? AND first_think_at IS NULL')
-              .bind(ts, ctx.account_id)
-              .run();
-            // Only send email if we actually won the race (row was changed)
-            if ((updateResult.meta?.changes ?? 0) > 0 && acct.email) {
-              const html = emailCard('Your agent just logged its first decision 🧠', `
-                <p style="margin:0 0 20px;font-size:14px;color:#999;line-height:1.6;">You're in. Marrow is now learning your patterns. Come back in 7 days — you'll see your success rate starting to form.</p>
-                <div style="background:#1a1a1a;padding:16px;border-radius:8px;margin:0 0 24px;">
-                  <p style="margin:0;font-size:32px;font-weight:700;color:#ffffff;">1</p>
-                  <p style="margin:4px 0 0;font-size:12px;color:#666;text-transform:uppercase;letter-spacing:1px;">decision logged</p>
-                </div>
-                <a href="https://getmarrow.ai" style="display:inline-block;padding:10px 20px;background:#ffffff;color:#0a0a0a;text-decoration:none;border-radius:6px;font-size:13px;font-weight:600;">View your dashboard →</a>
-              `);
-              sendEmail(env, acct.email, 'Your agent just logged its first decision 🧠', html).catch(() => {});
-            }
-          }
-        })
-        .catch(() => {});
-    }
-
-    // ── Gap 3: Upgrade hint for free tier users near limits (non-blocking check) ──
-    let upgradeHint: Record<string, unknown> | null = null;
-    if (ctx.tier === 'free') {
-      try {
-        const decisionService = new DecisionService(env.DB);
-        const count = await decisionService.getDecisionCount(ctx.account_id);
-        const freeLimit = 500;
-        const retentionDays = 30;
-        if (count > freeLimit * 0.8) {
-          upgradeHint = {
-            message: `You've logged ${count} decisions. Free tier keeps ${retentionDays} days. Upgrade to Pro for 1 year retention + private decisions.`,
-            tier: 'pro',
-            url: 'https://getmarrow.ai/pricing',
-          };
-        }
-      } catch (_e) {
-        // Non-fatal
-      }
-    }
-
-    const responseWarnings = (!qualityValidation.valid && !strictQualityMode)
-      ? [actionQualityWarning(qualityValidation)]
-      : (result.warnings || []);
-
-    const response: Record<string, unknown> = {
-      decision_id: result.decision_id,
-      sanitized,
-      warnings: responseWarnings,
-      intelligence: {
-        similar: (result.similar_decisions || []).map((d: Record<string, unknown>) => ({
-          outcome: d.outcome || d.description || '',
-          confidence: typeof d.confidence === 'number' ? d.confidence : 0.5,
-        })),
-        similar_count: (result.similar_decisions || []).length,
-        patterns: mappedPatterns,
-        patterns_count: mappedPatterns.length,
-        templates: (result.bootstrap_templates || []).map((t: Record<string, unknown>) => ({
-          steps: Array.isArray(t.template_decisions) ? t.template_decisions : [],
-          success_rate: typeof t.success_rate === 'number' ? t.success_rate : 0.5,
-        })),
-        shared: (result.shared_context || []).map((s: Record<string, unknown>) => ({
-          outcome: s.outcome || s.description || '',
-        })),
-        causal_chain: result.causal_context || null,
-        success_rate: successRate,
-        priority_score: result.priority_score ?? 0.5,
-        risk_score: result.risk_score,
-        velocity: 0,
-        insight,
-        insights: actionableInsights,
-        cluster_id: engineResult.clusterId,
-      },
-      stream_url: streamUrl,
-    };
-
-    if (actionQuality.filtered) {
-      response.filtered = true;
-      response.reason = actionQuality.reason;
-      response.quality = 'trivial';
-    }
-
-    // ── Feature 7: Smart onboarding hint ──
-    try {
-      const decisionService = new DecisionService(env.DB);
-      const count = await decisionService.getDecisionCount(ctx.account_id);
-      let onboardingHint: string | null = null;
-      if (count <= 3) {
-        onboardingHint = 'Welcome to Marrow! Log decisions with think/commit to build your intelligence base.';
-      } else if (count <= 10) {
-        onboardingHint = `You have logged ${count} decisions. After 10, personalized pattern matching begins.`;
-      } else if (count <= 50) {
-        onboardingHint = 'Pattern matching active. After 50 decisions, workflow detection begins.';
-      }
-      if (onboardingHint) (response as Record<string, unknown>).onboarding_hint = onboardingHint;
-    } catch (_e) { /* non-fatal */ }
-
-    // ── Feature 9: Cross-agent context (same account, other sessions) ──
-    try {
-      const sessionId = reqSessionId || ctx.account_id;
-      const teamRows = await env.DB.prepare(`
-        SELECT context, outcome, outcome_success, created_at, decision_type, session_id
-        FROM decisions
-        WHERE account_id = ? AND session_id IS NOT NULL AND session_id != ?
-          AND decision_type NOT LIKE 'post_%' -- Excludes auto-logger entries; extend to 'get_%','put_%','delete_%' if those start writing session_id
-          AND created_at > datetime('now', '-24 hours')
-        ORDER BY created_at DESC LIMIT 5
-      `).bind(ctx.account_id, sessionId).all<{
-        context: string; outcome: string; outcome_success: number | null;
-        created_at: string; decision_type: string; session_id: string;
-      }>();
-      if (teamRows.results && teamRows.results.length > 0) {
-        const pii = new PiiService();
-        const teamContext = (teamRows.results || []).map(r => {
-          // Extract action from context JSON (action is stored in context, not as a column)
-          let actionText = r.decision_type;
-          try {
-            const ctx = JSON.parse(r.context || '{}');
-            if (typeof ctx.action === 'string') actionText = ctx.action;
-            else if (typeof ctx.description === 'string') actionText = ctx.description;
-          } catch { /* use decision_type as fallback */ }
-          const strippedAction = pii.stripString(actionText);
-          const strippedOutcome = pii.stripString(r.outcome || '');
-          const hoursAgo = Math.round((Date.now() - new Date(r.created_at).getTime()) / 3600000);
-          return {
-            agent: r.decision_type,
-            action: strippedAction.slice(0, 100),
-            outcome: strippedOutcome.slice(0, 100),
-            when: hoursAgo <= 1 ? '1 hour ago' : `${hoursAgo} hours ago`,
-          };
-        });
-        (response.intelligence as Record<string, unknown>).team_context = teamContext;
-      }
-    } catch (_e) { /* non-fatal */ }
-
-    // ── Feature 4: Collective insight from cross-account patterns ──
-    try {
-      const collective = new CollectiveService(env.DB);
-      const collectiveInsight = await collective.getCollectiveInsight(type);
-      if (collectiveInsight) {
-        (response.intelligence as Record<string, unknown>).collective = collectiveInsight;
-      }
-    } catch (_e) { /* non-fatal */ }
-
-    // ── Feature 6: Record potential save if HIGH severity insight ──
-    if (actionableInsights.some(i => i.severity === 'critical')) {
-      const impact = new ImpactService(env.DB);
-      const topCritical = actionableInsights.find(i => i.severity === 'critical');
-      if (topCritical) {
-        await impact.recordPotentialSave(
-          ctx.account_id,
-          result.decision_id,
-          'critical_pattern',
-          topCritical.summary
-        ).catch(() => {});
-      }
-    }
-
-    if (upgradeHint) {
-      response.upgrade_hint = upgradeHint;
-
-      // Fire upgrade nudge email once (non-blocking)
-      if (ctx.tier === 'free' && env.RESEND_API_KEY) {
-        const upgradeDecisionCount = (upgradeHint as Record<string, unknown>).message
-          ? parseInt(((upgradeHint as Record<string, unknown>).message as string).match(/(\d+) decisions/)?.[1] || '80')
-          : 80;
-        env.DB.prepare('SELECT email, upgrade_nudge_sent_at FROM accounts WHERE id = ? LIMIT 1')
-          .bind(ctx.account_id)
-          .first<{ email: string; upgrade_nudge_sent_at: string | null }>()
-          .then(async (acct) => {
-            if (acct?.email && !acct.upgrade_nudge_sent_at) {
-              await env.DB.prepare('UPDATE accounts SET upgrade_nudge_sent_at = ? WHERE id = ?')
-                .bind(new Date().toISOString(), ctx.account_id).run();
-              const upgradeHtml = emailCard(`${upgradeDecisionCount} decisions in.`, `
-                <p style="margin:0 0 20px;font-size:14px;color:#999999;line-height:1.6;"><span style="color:#ffffff;font-weight:600;">${upgradeDecisionCount} decisions in.</span> Your agent is starting to learn how you work.</p>
-                <p style="margin:0 0 20px;font-size:14px;color:#999999;line-height:1.6;">On the free tier, Marrow keeps 30 days of decision history. Anything older gets pruned.</p>
-                <p style="margin:0 0 8px;font-size:14px;color:#ffffff;font-weight:600;">On Pro:</p>
-                <p style="margin:0 0 4px;font-size:14px;color:#999999;line-height:1.6;">1 year retention. Private decisions (not contributed to the hive). Priority context — your oldest patterns weighted higher, not dropped.</p>
-                <p style="margin:0 0 20px;font-size:14px;color:#999999;line-height:1.6;">The model you've built over ${upgradeDecisionCount} decisions? It only gets more valuable the longer you keep it.</p>
-                <a href="https://getmarrow.ai/pricing" style="display:inline-block;padding:10px 24px;background:#ffffff;color:#0a0a0a;text-decoration:none;border-radius:0px;font-size:13px;font-weight:600;">Upgrade to Pro →</a>
-              `);
-              sendEmail(env, acct.email, `You've logged ${upgradeDecisionCount} decisions. Here's what you're not seeing.`, upgradeHtml).catch(() => {});
-            }
-          }).catch(() => {});
-      }
-    }
-
-    if (previousCommitted) {
-      response.previous_committed = true;
-    }
-
-    response.api_version = MARROW_API_VERSION;
-
-    // V6.7: marrow_contributed — what Marrow just gave the agent for this decision.
-    // Agent uses this to narrate Marrow's contribution to the user in plain English.
-    // Only includes signals that are non-zero / non-empty; agent decides whether to mention.
-    const intel = (response.intelligence as Record<string, unknown> | undefined) || {};
-    const warnings_count = Array.isArray(response.warnings) ? response.warnings.length : 0;
-    const loop_warnings_count = Array.isArray(response.loop_warnings) ? response.loop_warnings.length : 0;
-    const hive_patterns = typeof intel.patterns_count === 'number' ? intel.patterns_count : 0;
-    const similar_decisions = typeof intel.similar_count === 'number' ? intel.similar_count : 0;
-    const templates_available = Array.isArray(intel.templates) ? intel.templates.length : 0;
-    const has_collective_insight = typeof intel.insight === 'string' && (intel.insight as string).length > 0;
-    const collective_intelligence = (intel.collective && typeof intel.collective === 'object') ? intel.collective : null;
-    const team_context = (intel.team_context && typeof intel.team_context === 'object') ? intel.team_context : null;
-
-    response.marrow_contributed = {
-      warnings_consulted: warnings_count,
-      hive_patterns_surfaced: hive_patterns,
-      similar_decisions_found: similar_decisions,
-      workflow_templates_available: templates_available,
-      loop_detected: loop_warnings_count > 0,
-      collective_intelligence: collective_intelligence ? true : false,
-      team_context_present: team_context ? true : false,
-      // True when Marrow gave the agent *something* materially useful to act on.
-      has_signal: warnings_count > 0 || hive_patterns > 0 || similar_decisions > 0
-                  || templates_available > 0 || loop_warnings_count > 0
-                  || has_collective_insight,
-    };
-
-    const clientSdkVersion = request.headers.get('X-SDK-Version');
-    const sdkUpdateAvailable = clientSdkVersion && clientSdkVersion !== MARROW_SDK_LATEST
-      ? { latest: MARROW_SDK_LATEST, current: clientSdkVersion, message: `Update available: npm install @getmarrow/sdk@${MARROW_SDK_LATEST}` }
-      : undefined;
-    if (sdkUpdateAvailable) response.sdk_update = sdkUpdateAvailable;
-
-    if (canDedupThink) {
-      storeDedupedResponse('think', dedupActorKey, dedupFingerprint, response);
-    }
-
-    // Phase 3: Auto-learn templates (fire-and-forget with 15-min throttle)
-    checkRateLimit(env.DB, 'learn_templates_throttle', 1, 15 * 60 * 1000).then(allowed => {
-      if (allowed) {
-        const patAuto = new PatternsService(env.DB, env.AI);
-        patAuto.learnTemplates().catch((e: unknown) => console.error('[auto-learn think]', e instanceof Error ? e.message : e));
-      }
-    }).catch(() => {});
-
-    return json(response);
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : 'Unknown error';
-    console.error('POST /v1/agent/think error:', msg);
-    return err('Failed to gather intelligence', 500);
-  }
-});
-
-// ============= Gap 2: Agent-Queryable Failure Patterns =============
-router.get('/v1/agent/patterns', async (request: IRequest, env: Env) => {
-  try {
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
-    autoLogDecision({
-      db: env.DB,
-      accountId: ctx.account_id,
-      method: request.method,
-      endpoint: new URL(request.url).pathname,
-      statusCode: 200,
-
-      tier: ctx.tier,
-    }).catch(() => {});
-
-    const url = getUrl(request);
-    const typeFilter = url.searchParams.get('type') || null;
-    // L1 fix: Clamp limit to prevent NaN propagation from invalid input
-    const rawLimit = parseInt(url.searchParams.get('limit') || '20');
-    const limit = isNaN(rawLimit) || rawLimit < 1 ? 20 : Math.min(rawLimit, 100);
-    const db = env.DB;
-    const accountId = ctx.account_id;
-
-    // Failure patterns: group by decision_type, compute failure rate
-    let failureQuery = `
-      SELECT decision_type,
-        COUNT(*) as count,
-        SUM(CASE WHEN outcome_success = 0 THEN 1 ELSE 0 END) as failures,
-        MAX(created_at) as last_seen
-      FROM decisions
-      WHERE account_id = ? AND outcome_recorded_at IS NOT NULL
-    `;
-    const failureBinds: (string | number)[] = [accountId];
-    if (typeFilter) {
-      failureQuery += ' AND decision_type = ?';
-      failureBinds.push(typeFilter);
-    }
-    failureQuery += ' GROUP BY decision_type ORDER BY failures DESC LIMIT ?';
-    failureBinds.push(limit);
-
-    const failureRows = await db.prepare(failureQuery).bind(...failureBinds)
-      .all<{ decision_type: string; count: number; failures: number; last_seen: string }>();
-
-    const failurePatterns = (failureRows.results || [])
-      .filter(r => r.failures > 0)
-      .map(r => ({
-        decision_type: r.decision_type,
-        failure_rate: Math.round((r.failures / r.count) * 100) / 100,
-        count: r.count,
-        last_seen: r.last_seen,
-      }));
-
-    // Recurring decisions: group by decision_type, compute frequency + avg confidence
-    let recurringQuery = `
-      SELECT decision_type,
-        COUNT(*) as frequency,
-        AVG(confidence) as avg_confidence
-      FROM decisions
-      WHERE account_id = ?
-    `;
-    const recurringBinds: (string | number)[] = [accountId];
-    if (typeFilter) {
-      recurringQuery += ' AND decision_type = ?';
-      recurringBinds.push(typeFilter);
-    }
-    recurringQuery += ' GROUP BY decision_type HAVING COUNT(*) > 1 ORDER BY frequency DESC LIMIT ?';
-    recurringBinds.push(limit);
-
-    const recurringRows = await db.prepare(recurringQuery).bind(...recurringBinds)
-      .all<{ decision_type: string; frequency: number; avg_confidence: number }>();
-
-    const recurringDecisions = (recurringRows.results || []).map(r => ({
-      decision_type: r.decision_type,
-      frequency: r.frequency,
-      avg_confidence: Math.round((r.avg_confidence || 0) * 100) / 100,
-      trend: 'stable' as string, // default
-    }));
-
-    // Behavioral drift: compare 7-day vs 30-day success rate from analytics_snapshots
-    const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString();
-
-    const recent7d = await db.prepare(
-      'SELECT AVG(value) as avg_val FROM analytics_snapshots WHERE account_id = ? AND metric_name = ? AND recorded_at > ?'
-    ).bind(accountId, 'success_rate', sevenDaysAgo).first<{ avg_val: number | null }>();
-
-    const recent30d = await db.prepare(
-      'SELECT AVG(value) as avg_val FROM analytics_snapshots WHERE account_id = ? AND metric_name = ? AND recorded_at > ?'
-    ).bind(accountId, 'success_rate', thirtyDaysAgo).first<{ avg_val: number | null }>();
-
-    const sr7d = recent7d?.avg_val ?? 0;
-    const sr30d = recent30d?.avg_val ?? 0;
-    const driftPct = sr30d > 0 ? ((sr7d - sr30d) / sr30d) * 100 : 0;
-
-    const behavioralDrift = {
-      success_rate_7d: Math.round(sr7d * 100) / 100,
-      success_rate_30d: Math.round(sr30d * 100) / 100,
-      drift: (driftPct >= 0 ? '+' : '') + driftPct.toFixed(1) + '%',
-      direction: driftPct > 0 ? 'improving' : driftPct < 0 ? 'declining' : 'stable',
-    };
-
-    // Top failure types
-    const topFailureTypes = failurePatterns
-      .sort((a, b) => b.failure_rate - a.failure_rate)
-      .slice(0, 5)
-      .map(f => f.decision_type);
-
-    return json({
-      failure_patterns: failurePatterns,
-      recurring_decisions: recurringDecisions,
-      behavioral_drift: behavioralDrift,
-      top_failure_types: topFailureTypes,
-      generated_at: new Date().toISOString(),
-    });
-  } catch (e: unknown) {
-    console.error('GET /v1/agent/patterns error:', e);
-    return err('Failed to fetch patterns', 500);
-  }
-});
-
-// ============= Feature 5: Auto-Workflow Suggestions (orient integration) =============
-router.get('/v1/agent/suggestions', async (request: IRequest, env: Env) => {
-  try {
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-    autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/agent/suggestions', statusCode: 200, tier: ctx.tier, sessionId: request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null }).catch(() => {});
-
-    const rlAllowed = await checkRateLimit(env.DB, `agent_suggestions:${ctx.account_id}`, 30, 60 * 1000);
-    if (!rlAllowed) return err('Rate limited', 429);
-
-    const detection = new WorkflowDetectionService(env.DB);
-    const suggestions = await detection.getSuggestions(ctx.account_id);
-
-    return json({ suggested_workflows: suggestions });
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : 'Unknown error';
-    console.error('GET /v1/agent/suggestions error:', msg);
-    return err('Internal server error', 500);
-  }
-});
-
-// Backward-compat alias: /v1/agent/commit routes to think logic with action='commit_only'
-router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
-  try {
-    // T1: Auth
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-    const commitSessionId = request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null;
-
-    // Resolve agent_id: PATH 2 header > PATH 1 auth-derived
-    let commitAgentId: string | null = ctx.agent_id || null;
-    const commitHeaderAgentId = request.headers.get('X-Marrow-Agent-Id');
-    if (commitHeaderAgentId && /^[a-f0-9-]{36}$/.test(commitHeaderAgentId)) {
-      const agentCheck = await env.DB
-        .prepare("SELECT id FROM agents WHERE id = ? AND account_id = ? AND status != 'archived' LIMIT 1")
-        .bind(commitHeaderAgentId, ctx.account_id)
-        .first<{ id: string }>();
-      if (agentCheck) commitAgentId = agentCheck.id;
-    }
-
-    const body = await request.json() as Record<string, unknown>;
-    if (!body.decision_id || typeof body.decision_id !== 'string') {
-      return err('decision_id is required', 400);
-    }
-    if (body.success === undefined || body.success === null) {
-      return err('success is required', 400);
-    }
-    if (!body.outcome || typeof body.outcome !== 'string') {
-      return err('outcome is required', 400);
-    }
-
-    const outcomeQuality = validateActionQuality(String(body.outcome));
-    const strictQualityMode = isStrictQualityMode(env, ctx);
-    if (!outcomeQuality.valid && strictQualityMode) {
-      return actionQualityError(outcomeQuality);
-    }
-
-    const commitDedupActorKey = `${ctx.account_id}:${commitAgentId || commitSessionId || ctx.api_key_id || 'account'}`;
-    const commitDedupFingerprint = `${String(body.decision_id)}:${Boolean(body.success)}:${String(body.outcome)}`;
-    const cachedCommit = getDedupedResponse<Record<string, unknown>>('commit', commitDedupActorKey, commitDedupFingerprint);
-    if (cachedCommit) {
-      return json({ ...cachedCommit, decision_id: String(body.decision_id), deduped: true });
-    }
-
-    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
-    autoLogDecision({
-      db: env.DB,
-      accountId: ctx.account_id,
-      method: request.method,
-      endpoint: new URL(request.url).pathname,
-      statusCode: 200,
-      tier: ctx.tier,
-      sessionId: commitSessionId,
-      body,
-    }).catch(() => {});
-
-    // Route to the same workflow.after logic (backward compat — commit_only mode)
-    const workflow = new WorkflowService(env.DB, env.AI);
-    const result = await workflow.after(
-      {
-        decision_id: String(body.decision_id),
-        success: Boolean(body.success),
-        outcome: String(body.outcome),
-        related_decision_id: body.caused_by ? String(body.caused_by) : undefined,
-        agent_id: commitAgentId ?? undefined,
-      },
-      ctx.account_id
-    );
-
-    // Best-effort backfill session_id if currently NULL on the committed decision
-    if (commitSessionId) {
-      env.DB.prepare('UPDATE decisions SET session_id = ? WHERE id = ? AND account_id = ? AND session_id IS NULL')
-        .bind(commitSessionId, String(body.decision_id), ctx.account_id).run().catch(() => {});
-    }
-
-    // PATH 3: Backfill agent_id + update agent stats on commit
-    if (commitAgentId) {
-      env.DB.prepare('UPDATE decisions SET agent_id = ? WHERE id = ? AND account_id = ? AND agent_id IS NULL')
-        .bind(commitAgentId, String(body.decision_id), ctx.account_id).run().catch(() => {});
-      // Update agent stats: last_active_at + total_decisions
-      env.DB.prepare("UPDATE agents SET last_active_at = datetime('now'), total_decisions = total_decisions + 1, updated_at = datetime('now') WHERE id = ? AND account_id = ?")
-        .bind(commitAgentId, ctx.account_id).run().catch(() => {});
-    }
-
-    // ── Feature 6: Confirm save if this decision was flagged as a potential save ──
-    if (Boolean(body.success)) {
-      const impact = new ImpactService(env.DB);
-      await impact.confirmSave(ctx.account_id, String(body.decision_id), true).catch(() => {});
-    }
-
-    const narrative = await new NarrativeService(env.DB)
-      .getNarrativeForCommit(ctx.account_id, commitAgentId ?? undefined)
-      .catch(() => null);
-
-    env.DB.prepare(
-      `SELECT COUNT(*) AS c FROM decisions WHERE account_id = ? AND outcome_recorded_at IS NOT NULL`
-    )
-      .bind(ctx.account_id)
-      .first<{ c: number }>()
-      .then(async (countRow) => {
-        const totalCommits = countRow?.c || 0;
-        if (totalCommits !== 100) return;
-
-        const baseline = await new BaselineService(env.DB).getAccountImprovement(ctx.account_id).catch(() => null);
-        if (!baseline || baseline.status !== 'active') return;
-
-        // Only fire the milestone email if the user has actually improved.
-        // time_to_success_seconds.delta_pct is negative when faster — positive means regressed or flat.
-        const rawDelta = baseline.time_to_success_seconds.delta_pct;
-        if (rawDelta >= 0) return;
-
-        // Absolute value, rounded to 1 decimal, for the "{{improvement_pct}}% faster" copy.
-        const improvement_pct = Math.abs(Math.round(rawDelta * 10) / 10);
-
-        const account = await env.DB
-          .prepare('SELECT email FROM accounts WHERE id = ? LIMIT 1')
-          .bind(ctx.account_id)
-          .first<{ email: string }>();
-        if (!account?.email) return;
-
-        const emailService = getEmailService(env.DB, env);
-        await emailService.sendTemplate(ctx.account_id, account.email, 'milestone_100', {
-          email: account.email,
-          improvement_pct,
-          decisions_count: totalCommits,
-        });
-      })
-      .catch(() => {});
-
-    // V6.7: marrow_contributed — concrete signals the agent can narrate to the user.
-    // Looks up the just-committed decision's signals (cluster match = pattern reuse,
-    // workflow link = enforced workflow followed). Save attribution comes from
-    // Boolean(body.success) + this account having recent warnings on similar tasks.
-    const committedDecision = await env.DB
-      .prepare(
-        `SELECT cluster_id, related_decision_id FROM decisions WHERE id = ? AND account_id = ? LIMIT 1`
-      )
-      .bind(String(body.decision_id), ctx.account_id)
-      .first<{ cluster_id: string | null; related_decision_id: string | null }>()
-      .catch(() => null);
-
-    const pattern_reused = Boolean(committedDecision?.cluster_id);
-    const linked_to_prior = Boolean(committedDecision?.related_decision_id);
-
-    // A "save" is when the user's previous decision had a warning AND this commit succeeded.
-    // ImpactService.confirmSave already records this above when success=true, so we can
-    // detect it by checking if a save row was just created for this decision.
-    let warning_avoided = false;
-    if (Boolean(body.success)) {
-      const saveRow = await env.DB
-        .prepare(
-          `SELECT id FROM saves WHERE account_id = ? AND decision_id = ? AND confirmed_save = 1 LIMIT 1`
-        )
-        .bind(ctx.account_id, String(body.decision_id))
-        .first<{ id: string }>()
-        .catch(() => null);
-      warning_avoided = Boolean(saveRow);
-    }
-
-    // Phase 2: Best-effort risk score for committed decision (non-blocking)
-    let risk_score: number | null = null;
-    try {
-      const decision = await env.DB
-        .prepare('SELECT decision_type FROM decisions WHERE id = ? AND account_id = ? LIMIT 1')
-        .bind(String(body.decision_id), ctx.account_id)
-        .first<{ decision_type: string }>();
-      if (decision) {
-        const patterns = new PatternsService(env.DB, env.AI);
-        const { risk_score: rs } = await patterns.predictSimilarDecisions(
-          { action: String(body.outcome) }, decision.decision_type, 5
-        );
-        risk_score = rs;
-      }
-    } catch (_e) { /* non-blocking: risk score is best-effort */ }
-
-    const marrow_contributed = {
-      success: Boolean(body.success),
-      pattern_reused,
-      linked_to_prior_decision: linked_to_prior,
-      warning_avoided,
-      has_signal: pattern_reused || warning_avoided || linked_to_prior,
-    };
-
-    // Phase 3: Auto-learn templates after commit (fire-and-forget, 15-min throttle)
-    checkRateLimit(env.DB, 'learn_templates_throttle', 1, 15 * 60 * 1000).then(allowed => {
-      if (allowed) {
-        const patLearn = new PatternsService(env.DB, env.AI);
-        patLearn.learnTemplates().catch((e: unknown) => console.error('[auto-learn commit]', e instanceof Error ? e.message : e));
-      }
-    }).catch(() => {});
-
-    const response: Record<string, unknown> = {
-      committed: true,
-      success_rate: result.new_success_rate ?? 0.75,
-      insight: null,
-      narrative,
-      risk_score,
-      marrow_contributed,
-    };
-
-    if (!outcomeQuality.valid && !strictQualityMode) {
-      response.warnings = [actionQualityWarning(outcomeQuality)];
-    }
-
-    storeDedupedResponse('commit', commitDedupActorKey, commitDedupFingerprint, response);
-
-    return json(response);
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : 'Unknown error';
-    console.error('POST /v1/agent/commit error:', msg);
-    return err('Failed to commit decision', 500);
-  }
-});
-
 // ============= UNIFIED WORKFLOW: ALL 20 TIERS AS ONE =============
 
 router.post('/v1/workflow/before', async (request: IRequest, env: Env) => {
@@ -3137,7 +2292,7 @@ router.post('/v1/workflow/before', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
       tier: ctx.tier,
       body,
@@ -3190,7 +2345,7 @@ router.post('/v1/workflow/after', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
       tier: ctx.tier,
       body,
@@ -3232,7 +2387,7 @@ router.get('/v1/workflow/status', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3261,7 +2416,7 @@ router.post('/v1/webhooks', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3293,7 +2448,7 @@ router.get('/v1/webhooks', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3322,7 +2477,7 @@ router.delete('/v1/webhooks/:id', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3347,7 +2502,7 @@ router.post('/v1/org', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3374,7 +2529,7 @@ router.post('/v1/org/invite', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3414,7 +2569,7 @@ router.put('/v1/org/settings', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3445,7 +2600,7 @@ router.get('/v1/org/members', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3473,7 +2628,7 @@ router.put('/v1/admin/accounts/:accountId/tier', async (request: IRequest, env: 
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3650,7 +2805,7 @@ router.get('/v1/admin/stats', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3723,7 +2878,7 @@ router.get('/v1/admin/trajectory', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3794,7 +2949,7 @@ router.get('/v1/export', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3828,7 +2983,7 @@ router.get('/v1/search', async (request: IRequest, env: Env) => {
       db: env.DB,
       accountId: ctx.account_id,
       method: request.method,
-      endpoint: new URL(request.url).pathname,
+      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
       statusCode: 200,
 
       tier: ctx.tier,
@@ -3885,13 +3040,15 @@ router.post('/v1/internal/trigger-onboarding', async (request: IRequest, env: En
       .first<{ id: string; email: string; name: string }>();
     if (!account) return err('Account not found', 404);
 
-    const decisionService = new DecisionService(env.DB);
-    const count = await decisionService.getDecisionCount(body.account_id);
+    const countRow = await env.DB
+      .prepare('SELECT COUNT(*) as c FROM decisions WHERE account_id = ?')
+      .bind(body.account_id)
+      .first<{ c: number }>();
 
     const html = emailCard('Your agent just logged its first decision 🧠', `
           <p style="margin:0 0 20px;font-size:14px;color:#999;line-height:1.6;">You're in. Marrow is now learning your patterns. Come back in 7 days — you'll see your success rate starting to form.</p>
           <div style="background:#1a1a1a;padding:16px;border-radius:8px;margin:0 0 24px;">
-            <p style="margin:0;font-size:32px;font-weight:700;color:#ffffff;">${count || 1}</p>
+            <p style="margin:0;font-size:32px;font-weight:700;color:#ffffff;">${countRow?.c || 1}</p>
             <p style="margin:4px 0 0;font-size:12px;color:#666;text-transform:uppercase;letter-spacing:1px;">decision logged</p>
           </div>
           <a href="https://getmarrow.ai" style="display:inline-block;padding:10px 20px;background:#ffffff;color:#0a0a0a;text-decoration:none;border-radius:6px;font-size:13px;font-weight:600;">View your dashboard →</a>
@@ -4213,97 +3370,6 @@ router.get('/v1/dashboard', async (request: IRequest, env: Env) => {
   }
 });
 
-// ============= Feature 2: Session End =============
-router.post('/v1/agent/session/end', async (request: IRequest, env: Env) => {
-  try {
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-    autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/agent/session/end', statusCode: 200, tier: ctx.tier, sessionId: request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null }).catch(() => {});
-
-    const rlAllowed = await checkRateLimit(env.DB, `session_end:${ctx.account_id}`, 10, 60 * 1000);
-    if (!rlAllowed) return err('Rate limited', 429);
-
-    const body = await request.json() as Record<string, unknown>;
-    // Validate session_id if provided (must be reasonable length, no injection)
-    const rawSessionId = body.session_id ? String(body.session_id).slice(0, 200) : null;
-    const sessionId = rawSessionId ||
-      request.headers.get('X-Marrow-Session-Id')?.slice(0, 200) || request.headers.get('X-Session-Id')?.slice(0, 200) ||
-      ctx.account_id;
-    const autoCommitOpen = body.auto_commit_open === true;
-
-    const sessionService = new SessionService(env.DB);
-    const result = await sessionService.endSession(sessionId, ctx.account_id, autoCommitOpen);
-
-    if (autoCommitOpen && result.committed > 0) {
-      console.warn('[session/end] auto-committed open decision on explicit caller request', { accountId: ctx.account_id, sessionId, openDecisionId: result.openDecisionId });
-    }
-
-    // V6.7: session_summary — what Marrow contributed across this session.
-    // Counts are facts pulled from the decisions + saves tables for this session_id.
-    // Agent uses session_summary.narrative when wrapping up to surface Marrow's contribution.
-    const summaryRow = await env.DB
-      .prepare(
-        `SELECT
-           COUNT(*) AS decisions_total,
-           SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) AS successes,
-           SUM(CASE WHEN outcome_success = 0 THEN 1 ELSE 0 END) AS failures,
-           SUM(CASE WHEN cluster_id IS NOT NULL THEN 1 ELSE 0 END) AS pattern_reuses
-         FROM decisions
-         WHERE account_id = ? AND session_id = ?`
-      )
-      .bind(ctx.account_id, sessionId)
-      .first<{ decisions_total: number; successes: number; failures: number; pattern_reuses: number }>()
-      .catch(() => null);
-
-    const savesRow = await env.DB
-      .prepare(
-        `SELECT COUNT(*) AS saves
-         FROM saves s
-         JOIN decisions d ON d.id = s.decision_id
-         WHERE d.account_id = ? AND d.session_id = ? AND s.confirmed_save = 1`
-      )
-      .bind(ctx.account_id, sessionId)
-      .first<{ saves: number }>()
-      .catch(() => null);
-
-    const decisions_total = summaryRow?.decisions_total || 0;
-    const successes = summaryRow?.successes || 0;
-    const failures = summaryRow?.failures || 0;
-    const pattern_reuses = summaryRow?.pattern_reuses || 0;
-    const warnings_acted_on = savesRow?.saves || 0;
-
-    // Build a one-line narrative of what Marrow did this session — only mentions
-    // the meaningful contributions, not zeros.
-    const fragments: string[] = [];
-    if (decisions_total > 0) fragments.push(`${decisions_total} decisions logged`);
-    if (warnings_acted_on > 0) fragments.push(`${warnings_acted_on} retr${warnings_acted_on === 1 ? 'y' : 'ies'} avoided via Marrow warnings`);
-    if (pattern_reuses > 0) fragments.push(`${pattern_reuses} pattern reuse${pattern_reuses === 1 ? '' : 's'} from your history`);
-    const narrative = fragments.length > 0 ? fragments.join(', ') + '.' : null;
-
-    const session_summary = {
-      decisions_total,
-      successes,
-      failures,
-      pattern_reuses,
-      warnings_acted_on,
-      narrative,
-      has_signal: decisions_total > 0 && (warnings_acted_on > 0 || pattern_reuses > 0),
-    };
-
-    return json({
-      session_id: sessionId,
-      committed: result.committed,
-      open_decision_id: result.openDecisionId,
-      session_summary,
-    });
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : 'Unknown error';
-    console.error('POST /v1/agent/session/end error:', msg);
-    return err('Internal server error', 500);
-  }
-});
-
 // ============= Feature 5: Accept Detected Workflow =============
 router.post('/v1/workflows/accept-detected', async (request: IRequest, env: Env) => {
   try {
@@ -4457,106 +3523,6 @@ router.get('/v1/digest', async (request: IRequest, env: Env) => {
     return err('Internal server error', 500);
   }
 });
-
-
-
-router.get('/v1/agent/nudge', async (request: IRequest, env: Env) => {
-  try {
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-
-    const rlAllowed = await checkRateLimit(env.DB, `agent_nudge:${ctx.account_id}`, 30, 60 * 1000);
-    if (!rlAllowed) return err('Rate limited', 429);
-
-    autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/agent/nudge', statusCode: 200, tier: ctx.tier }).catch((e) => { safely(() => console.warn('[auto-log]', e), 'auto-log'); });
-
-    const nudge = new NudgeService(env.DB);
-    const result = await nudge.checkNudge(ctx.account_id);
-
-    if (result.nudge && result.metrics) {
-      const m = result.metrics;
-      const impr = m.improvement;
-      const impPct = impr ? Math.abs(Math.round((impr.time_to_success_seconds?.delta_pct || impr.attempts_per_success?.delta_pct || 0) * 10) / 10) : 0;
-      const attPct = impr ? Math.abs(Math.round((impr.attempts_per_success?.delta_pct || 0) * 10) / 10) : 0;
-      const drfPct = impr ? Math.abs(Math.round((impr.drift_rate?.delta_pct || 0) * 10) / 10) : 0;
-      const sucRate = impr?.success_rate ? Math.round(impr.success_rate.current * 100) : 0;
-      const acctId = ctx.account_id;
-      const db = env.DB;
-      const env2 = env;
-      Promise.all([
-        db.prepare("SELECT id FROM emails_sent WHERE account_id = ? AND template_name = ? LIMIT 1").bind(acctId, 'progress_report').first().catch(() => null),
-        db.prepare('SELECT email FROM accounts WHERE id = ? LIMIT 1').bind(acctId).first().catch(() => null),
-      ]).then(([sent, acct]) => {
-        if (!sent && acct?.email) {
-          const es = getEmailService(db, env2);
-          es.sendTemplate(acctId, acct.email, 'progress_report', {
-            improvement_pct: impPct, attempts_pct: attPct, drift_pct: drfPct,
-            pattern_reuse_pct: Math.round(100 - drfPct), success_rate: sucRate,
-            saves_count: m.saves_count ?? 0, decisions_count: m.total_decisions,
-          }).catch((e) => { safely(() => console.warn('[nudge-email]', e), 'nudge-email'); });
-        }
-      }).catch((e) => { safely(() => console.warn('[nudge-email-lookup]', e), 'nudge-email-lookup'); });
-    }
-
-    return json(result);
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : 'Unknown error';
-    console.error('GET /v1/agent/nudge error:', msg);
-    return err('Internal server error', 500);
-  }
-});
-
-// GET /v1/agent/status — quick health check for SDK quickStatus()
-router.get('/v1/agent/status', async (request: IRequest, env: Env) => {
-  try {
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-
-    const rlAllowed = await checkRateLimit(env.DB, `agent_status:${ctx.account_id}`, 60, 60 * 1000);
-    if (!rlAllowed) return err('Rate limited', 429);
-
-    autoLogDecision({
-      db: env.DB, accountId: ctx.account_id, method: request.method,
-      endpoint: '/v1/agent/status', statusCode: 200, tier: ctx.tier,
-      sessionId: request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null,
-    }).catch(() => {});
-
-    const row = await env.DB.prepare(`
-      SELECT COUNT(*) as total,
-             SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) as succ,
-             SUM(CASE WHEN outcome_success = 0 THEN 1 ELSE 0 END) as fail
-      FROM decisions
-      WHERE account_id = ? AND outcome_success IS NOT NULL
-    `).bind(ctx.account_id).first<{ total: number; succ: number; fail: number }>();
-
-    const total = row?.total || 0;
-    const succ = row?.succ || 0;
-    const fail = row?.fail || 0;
-    const successRate = (succ + fail) > 0 ? succ / (succ + fail) : null;
-    const health = fail > succ * 0.5 ? 'degraded' : 'healthy';
-    const message = total === 0
-      ? 'Welcome to Marrow! Log your first decision with think() to get started.'
-      : total < 10
-      ? `Getting started — ${total} decision${total === 1 ? '' : 's'} logged. Keep going for pattern detection.`
-      : `${total} decisions tracked. Success rate: ${Math.round((successRate || 0) * 100)}%.`;
-
-    return json({
-      ok: true,
-      health,
-      message,
-      has_memory: total > 0,
-      low_history: total < 10,
-      decision_count: total,
-      success_rate: successRate,
-    });
-  } catch (e: unknown) {
-    console.error('GET /v1/agent/status error:', e);
-    return err('Internal server error', 500);
-  }
-});
-
 // ============= V5 Phase 1: Fleet Primitives =============
 
 // ---------- Agent Registry ----------
@@ -5389,7 +4355,7 @@ export default {
         .bind(newerThan, olderThan)
         .all<{ id: string; email: string }>();
 
-      const emailService = getEmailService(env.DB, env);
+      const emailService = new EmailService(env.DB, env);
       for (const account of eligible.results || []) {
         try {
           const allowed = await emailService.canSendTemplate(account.id, 'day3_nudge');
