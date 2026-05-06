@@ -3,13 +3,12 @@ import type { Env, RequestContext, ApiResponse, ApiKeyScope, ManagedApiKey } fro
 import { AuthRateLimitError, AuthService, AuthServiceError } from '../services/auth.service';
 import { autoLogDecision } from '../middleware/auto-logger';
 import { checkRateLimit } from '../utils/rate-limit';
-import { createServices } from '../services/context';
 import { safely, safelyAsync } from '../utils/safely';
 import { enforceRoutePolicy, isTestKeyContext } from '../middleware/policy';
 import type { VelocityMetric } from '../services/velocity.service';
 import type { ImprovementResult } from '../services/baseline.service';
 
-export { Router, autoLogDecision, checkRateLimit, createServices, safely, safelyAsync };
+export { Router, autoLogDecision, checkRateLimit, safely, safelyAsync };
 export type { Env, VelocityMetric, ImprovementResult };
 
 const MARROW_API_VERSION = '2026.03.29';
