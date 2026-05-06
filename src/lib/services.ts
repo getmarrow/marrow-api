@@ -115,7 +115,7 @@ export function getServices(env: Env): Services {
       feedback:                new FeedbackService(db),
       causality:               new CausalityService(db),
       priority:                new PriorityService(db),
-      enterprise:              new EnterpriseService(db, ai),
+      enterprise:              new EnterpriseService(db, env.ENCRYPTION_KEY),
       analytics:               new AnalyticsService(db),
       audit:                   new AuditService(db),
       patternRecognition:      new PatternRecognitionService(db),
