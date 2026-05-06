@@ -3,7 +3,7 @@
  * Cloudflare Workers + D1 + itty-router
  */
 import { Router, IRequest } from 'itty-router';
-import { Env, RequestContext } from './types';
+import { Env, RequestContext, ApiResponse, ApiKeyScope, ManagedApiKey } from './types';
 import { AuthRateLimitError, AuthService, AuthServiceError } from './services/auth.service';
 import { DecisionService } from './services/decision.service';
 import { EnterpriseService } from './services/enterprise.service';

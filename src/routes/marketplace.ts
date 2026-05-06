@@ -76,6 +76,27 @@ marketplaceRouter.get('/v1/lessons/:id/versions', authRoute(async (request: IReq
 
 // ============= TEMPLATES =============
 
+// Public browsing endpoint. Keep this before /v1/templates/:slug so "learned"
+// is not interpreted as a template slug.
+marketplaceRouter.get('/v1/templates/learned', withErrorBoundary(async (request: IRequest, env: Env) => {
+  const url = getUrl(request);
+  const limit = Math.min(parseInt(url.searchParams.get('limit') || '20') || 20, 100);
+  const patterns = getServices(env).patterns;
+
+  const countRow = await env.DB
+    .prepare('SELECT COUNT(*) as c FROM learned_templates')
+    .first<{ c: number }>();
+  const refreshed = (countRow?.c || 0) === 0;
+  if (refreshed) {
+    await patterns.learnTemplates().catch((error: unknown) => {
+      console.error('[sync-learn]', error instanceof Error ? error.message : error);
+    });
+  }
+
+  const templates = await patterns.getLearnedTemplates(limit);
+  return ok({ templates, refreshed });
+}));
+
 marketplaceRouter.get('/v1/templates', authRoute(async (request: IRequest, env: Env, _ctx: RequestContext) => {
   const url = getUrl(request);
   const templates = await getServices(env).templates.listTemplates({

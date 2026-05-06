@@ -15,15 +15,6 @@ import { enforceRoutePolicy } from './policy';
 
 type RouteHandler = (request: IRequest, env: Env, ...rest: unknown[]) => Response | Promise<Response>;
 
-/**
- * Extend IRequest with auth context attached by withAuth middleware.
- */
-declare module 'itty-router' {
-  interface IRequest {
-    ctx?: RequestContext;
-  }
-}
-
 export function withAuth(handler: RouteHandler): RouteHandler {
   return async (request: IRequest, env: Env, ...rest: unknown[]): Promise<Response> => {
     const authHeader = request.headers.get('Authorization');
@@ -50,7 +41,7 @@ export function withAuth(handler: RouteHandler): RouteHandler {
       const policyError = enforceRoutePolicy(request, ctx);
       if (policyError) return policyError;
 
-      request.ctx = ctx;
+      (request as IRequest & { ctx?: RequestContext }).ctx = ctx;
       return handler(request, env, ...rest);
     } catch (error: unknown) {
       if (error instanceof AuthRateLimitError) {
