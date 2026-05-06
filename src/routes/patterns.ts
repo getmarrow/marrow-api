@@ -27,7 +27,7 @@ router.post('/v1/decisions/predict', authRoute(async (request: IRequest, env: En
 
 router.get('/v1/patterns', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
   const url = getUrl(request);
-  const patterns = await getServices(env).patternRecognition.recognizePatterns(
+  const patterns = await getServices(env).patterns.recognizePatterns(
     ctx.account_id,
     url.searchParams.get('decision_type') || undefined,
   );
@@ -35,13 +35,13 @@ router.get('/v1/patterns', authRoute(async (request: IRequest, env: Env, ctx: Re
 }));
 
 router.get('/v1/patterns/:id', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
-  const stats = await getServices(env).patternRecognition.getPatternStats(String(request.params?.id), ctx.account_id);
+  const stats = await getServices(env).patterns.getPatternStats(String(request.params?.id), ctx.account_id);
   return ok(stats);
 }));
 
 router.post('/v1/patterns/:id/validate', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
   const body = await request.json() as Record<string, unknown>;
-  const result = await getServices(env).patternRecognition.validatePattern(
+  const result = await getServices(env).patterns.validatePattern(
     String(request.params?.id),
     String(body.decision_id),
     ctx.account_id,

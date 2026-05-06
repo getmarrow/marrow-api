@@ -18,7 +18,6 @@ import { PriorityService }        from '../services/priority.service';
 import { EnterpriseService }      from '../services/enterprise.service';
 import { AnalyticsService }       from '../services/analytics.service';
 import { AuditService }           from '../services/audit.service';
-import { PatternRecognitionService } from '../services/pattern-recognition.service';
 import { TransferService }        from '../services/transfer.service';
 import { BootstrapService }       from '../services/bootstrap.service';
 import { ConsensusService }       from '../services/consensus.service';
@@ -37,7 +36,6 @@ import { ImpactService }          from '../services/impact.service';
 import { DashboardService }       from '../services/dashboard.service';
 import { CollectiveService }      from '../services/collective.service';
 import { WorkflowDetectionService } from '../services/workflow-detection.service';
-import { AgentService }           from '../services/agent.service';
 import { TemplatesService }       from '../services/templates.service';
 import { FleetService }           from '../services/fleet.service';
 import { NarrativeService }       from '../services/narrative.service';
@@ -59,7 +57,7 @@ export interface Services {
   enterprise:              EnterpriseService;
   analytics:               AnalyticsService;
   audit:                   AuditService;
-  patternRecognition:      PatternRecognitionService;
+  patternRecognition:      PatternsService;
   transfer:                TransferService;
   bootstrap:               BootstrapService;
   consensus:               ConsensusService;
@@ -78,7 +76,7 @@ export interface Services {
   dashboard:               DashboardService;
   collective:              CollectiveService;
   workflowDetection:       WorkflowDetectionService;
-  agent:                   AgentService;
+  agent:                   FleetService;
   templates:               TemplatesService;
   fleet:                   FleetService;
   narrative:               NarrativeService;
@@ -107,10 +105,13 @@ export function getServices(env: Env): Services {
   const db: D1Database = env.DB;
   const ai: any = env.AI;
 
+  const patterns = new PatternsService(db, ai);
+  const fleet = new FleetService(db);
+
   const services: Services = {
       auth:                    new AuthService(db),
       decisions:               new DecisionService(db, ai),
-      patterns:                new PatternsService(db, ai),
+      patterns,
       collaboration:           new CollaborationService(db),
       feedback:                new FeedbackService(db),
       causality:               new CausalityService(db),
@@ -118,7 +119,7 @@ export function getServices(env: Env): Services {
       enterprise:              new EnterpriseService(db, env.ENCRYPTION_KEY),
       analytics:               new AnalyticsService(db),
       audit:                   new AuditService(db),
-      patternRecognition:      new PatternRecognitionService(db),
+      patternRecognition:      patterns,
       transfer:                new TransferService(db, ai),
       bootstrap:               new BootstrapService(db),
       consensus:               new ConsensusService(db),
@@ -137,9 +138,9 @@ export function getServices(env: Env): Services {
       dashboard:               new DashboardService(db, ai),
       collective:              new CollectiveService(db),
       workflowDetection:       new WorkflowDetectionService(db),
-      agent:                   new AgentService(db),
+      agent:                   fleet,
       templates:               new TemplatesService(db),
-      fleet:                   new FleetService(db),
+      fleet,
       narrative:               new NarrativeService(db),
       email:                   new EmailService(db, env),
       memory:                  new MemoryService(db),

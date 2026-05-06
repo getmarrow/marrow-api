@@ -125,7 +125,7 @@ router.post('/v1/agents', authRoute(async (request: IRequest, env: Env, ctx: Req
   if (!body?.name || typeof body.name !== 'string') return fail('BAD_REQUEST', 'name is required', 400);
 
   try {
-    const agent = await getServices(env).agent.registerAgent(ctx.account_id, {
+    const agent = await getServices(env).fleet.registerAgent(ctx.account_id, {
       name: body.name as string,
       role: typeof body.role === 'string' ? body.role : undefined,
       specialty: typeof body.specialty === 'string' ? body.specialty : undefined,
@@ -141,7 +141,7 @@ router.post('/v1/agents', authRoute(async (request: IRequest, env: Env, ctx: Req
 
 router.get('/v1/agents', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
   const url = getUrl(request);
-  const agents = await getServices(env).agent.listAgents(ctx.account_id, {
+  const agents = await getServices(env).fleet.listAgents(ctx.account_id, {
     status: url.searchParams.get('status') || 'active',
     limit: parseInt(url.searchParams.get('limit') || '50') || 50,
   });
@@ -152,7 +152,7 @@ router.get('/v1/agents/:id', authRoute(async (request: IRequest, env: Env, ctx: 
   const agentId = String(request.params?.id || '');
   if (!agentId) return fail('BAD_REQUEST', 'Agent ID required', 400);
 
-  const agentSvc = getServices(env).agent;
+  const agentSvc = getServices(env).fleet;
   const agent = await agentSvc.getAgent(agentId, ctx.account_id);
   if (!agent) return fail('NOT_FOUND', 'Agent not found', 404);
 
@@ -168,7 +168,7 @@ router.patch('/v1/agents/:id', authRoute(async (request: IRequest, env: Env, ctx
   if (!body) return fail('BAD_REQUEST', 'Request body required', 400);
 
   try {
-    const updated = await getServices(env).agent.updateAgent(agentId, ctx.account_id, {
+    const updated = await getServices(env).fleet.updateAgent(agentId, ctx.account_id, {
       name: typeof body.name === 'string' ? body.name : undefined,
       role: typeof body.role === 'string' ? body.role : undefined,
       specialty: typeof body.specialty === 'string' ? body.specialty : undefined,
@@ -187,7 +187,7 @@ router.delete('/v1/agents/:id', authRoute(async (request: IRequest, env: Env, ct
   const agentId = String(request.params?.id || '');
   if (!agentId) return fail('BAD_REQUEST', 'Agent ID required', 400);
 
-  const archived = await getServices(env).agent.archiveAgent(agentId, ctx.account_id);
+  const archived = await getServices(env).fleet.archiveAgent(agentId, ctx.account_id);
   if (!archived) return fail('NOT_FOUND', 'Agent not found or already archived', 404);
   return ok({ archived: true });
 }));

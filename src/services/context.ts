@@ -16,7 +16,6 @@ import { PriorityService } from './priority.service';
 import { EnterpriseService } from './enterprise.service';
 import { AnalyticsService } from './analytics.service';
 import { AuditService } from './audit.service';
-import { PatternRecognitionService } from './pattern-recognition.service';
 import { TransferService } from './transfer.service';
 import { BootstrapService } from './bootstrap.service';
 import { ConsensusService } from './consensus.service';
@@ -35,7 +34,6 @@ import { ImpactService } from './impact.service';
 import { DashboardService } from './dashboard.service';
 import { CollectiveService } from './collective.service';
 import { WorkflowDetectionService } from './workflow-detection.service';
-import { AgentService } from './agent.service';
 import { TemplatesService } from './templates.service';
 import { FleetService } from './fleet.service';
 import { NarrativeService } from './narrative.service';
@@ -78,7 +76,7 @@ export class ServiceContext {
   enterprise(){ return this.get('enterprise', () => new EnterpriseService(this.db, this.ai)); }
   analytics() { return this.get('analytics', () => new AnalyticsService(this.db)); }
   audit()     { return this.get('audit', () => new AuditService(this.db)); }
-  patternRecognition() { return this.get('patRecognition', () => new PatternRecognitionService(this.db)); }
+  patternRecognition() { return this.patterns(); }
   transfer()  { return this.get('transfer', () => new TransferService(this.db, this.ai)); }
   bootstrap() { return this.get('bootstrap', () => new BootstrapService(this.db)); }
   consensus() { return this.get('consensus', () => new ConsensusService(this.db)); }
@@ -94,7 +92,7 @@ export class ServiceContext {
   session()   { return this.get('session', () => new SessionService(this.db)); }
   sessions()  { return this.session(); }
   workflowDetection() { return this.get('wfDetection', () => new WorkflowDetectionService(this.db)); }
-  agent()     { return this.get('agent', () => new AgentService(this.db)); }
+  agent()     { return this.fleet(); }
   agents()    { return this.agent(); }
   templates() { return this.get('templates', () => new TemplatesService(this.db)); }
   fleet()     { return this.get('fleet', () => new FleetService(this.db)); }
