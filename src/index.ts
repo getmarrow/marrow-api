@@ -53,6 +53,7 @@ import { getDedupedResponse, storeDedupedResponse } from './middleware/dedup-cac
 import { safely } from './utils/safely';
 import { router as authRouter } from './routes/auth';
 import { router as decisionsRouter } from './routes/decisions';
+import { router as patternsRouter } from './routes/patterns';
 import { router as memoriesRouter } from './routes/memories';
 import { router as agentRouter } from './routes/agent';
 
@@ -176,6 +177,11 @@ function enforceRoutePolicy(request: IRequest, ctx: RequestContext): Response | 
 const router = Router();
 router.all('/v1/keys/*', (request: IRequest, env: Env, ctx: ExecutionContext) => authRouter.handle(request as Request, env, ctx));
 router.all('/v1/auth/*', (request: IRequest, env: Env, ctx: ExecutionContext) => authRouter.handle(request as Request, env, ctx));
+router.all('/v1/decisions/predict', (request: IRequest, env: Env, ctx: ExecutionContext) => patternsRouter.handle(request as Request, env, ctx));
+router.all('/v1/patterns*', (request: IRequest, env: Env, ctx: ExecutionContext) => patternsRouter.handle(request as Request, env, ctx));
+router.all('/v1/trends*', (request: IRequest, env: Env, ctx: ExecutionContext) => patternsRouter.handle(request as Request, env, ctx));
+router.all('/v1/lessons/*', (request: IRequest, env: Env, ctx: ExecutionContext) => patternsRouter.handle(request as Request, env, ctx));
+router.all('/v1/transfer-metrics', (request: IRequest, env: Env, ctx: ExecutionContext) => patternsRouter.handle(request as Request, env, ctx));
 router.all('/decisions*', (request: IRequest, env: Env, ctx: ExecutionContext) => decisionsRouter.handle(request as Request, env, ctx));
 router.all('/v1/decisions*', (request: IRequest, env: Env, ctx: ExecutionContext) => decisionsRouter.handle(request as Request, env, ctx));
 router.all('/v1/feedback*', (request: IRequest, env: Env, ctx: ExecutionContext) => decisionsRouter.handle(request as Request, env, ctx));
@@ -422,207 +428,6 @@ router.get('/v1/decisions/:id/causality', async (request: IRequest, env: Env) =>
     const causalityService = new CausalityService(env.DB);
     const graph = await causalityService.getCausalityGraph(String(request.params?.id), ctx.account_id);
     return json(graph);
-  } catch (e: unknown) { return err('Internal error'); }
-});
-
-// ============= TIER 7: PREDICTIVE =============
-
-router.post('/v1/decisions/predict', async (request: IRequest, env: Env) => {
-  try {
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
-    autoLogDecision({
-      db: env.DB,
-      accountId: ctx.account_id,
-      method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
-      statusCode: 200,
-
-      tier: ctx.tier,
-    }).catch(() => {});
-    const body = await request.json() as Record<string, unknown>;
-    const patterns = new PatternsService(env.DB, env.AI);
-    const { similar } = await patterns.predictSimilarDecisions(
-      body.context as Record<string, unknown>, String(body.decision_type), 5
-    );
-    return json({ similar_decisions: similar });
-  } catch (e: unknown) { return err('Internal error'); }
-});
-
-// ============= TIER 8: PATTERNS & TRENDS =============
-
-router.get('/v1/patterns', async (request: IRequest, env: Env) => {
-  try {
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
-    autoLogDecision({
-      db: env.DB,
-      accountId: ctx.account_id,
-      method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
-      statusCode: 200,
-
-      tier: ctx.tier,
-    }).catch(() => {});
-
-    const url = getUrl(request);
-    const prService = new PatternRecognitionService(env.DB);
-    const patterns = await prService.recognizePatterns(ctx.account_id, url.searchParams.get('decision_type') || undefined);
-    return json(patterns);
-  } catch (e: unknown) { return err('Internal error'); }
-});
-
-router.get('/v1/patterns/:id', async (request: IRequest, env: Env) => {
-  try {
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
-    autoLogDecision({
-      db: env.DB,
-      accountId: ctx.account_id,
-      method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
-      statusCode: 200,
-
-      tier: ctx.tier,
-    }).catch(() => {});
-
-    const prService = new PatternRecognitionService(env.DB);
-    const stats = await prService.getPatternStats(String(request.params?.id), ctx.account_id);
-    return json(stats);
-  } catch (e: unknown) { return err('Internal error'); }
-});
-
-router.post('/v1/patterns/:id/validate', async (request: IRequest, env: Env) => {
-  try {
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
-    autoLogDecision({
-      db: env.DB,
-      accountId: ctx.account_id,
-      method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
-      statusCode: 200,
-
-      tier: ctx.tier,
-    }).catch(() => {});
-
-    const body = await request.json() as Record<string, unknown>;
-    const prService = new PatternRecognitionService(env.DB);
-    const result = await prService.validatePattern(String(request.params?.id), String(body.decision_id), ctx.account_id);
-    return json(result);
-  } catch (e: unknown) { return err('Internal error'); }
-});
-
-router.get('/v1/trends', async (request: IRequest, env: Env) => {
-  try {
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
-    autoLogDecision({
-      db: env.DB,
-      accountId: ctx.account_id,
-      method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
-      statusCode: 200,
-
-      tier: ctx.tier,
-    }).catch(() => {});
-
-    const url = getUrl(request);
-    const patterns = new PatternsService(env.DB, env.AI);
-    const result = await patterns.calculateTrends(ctx.account_id, url.searchParams.get('decision_type') || 'general');
-    return json(result);
-  } catch (e: unknown) { return err('Internal error'); }
-});
-
-// ============= TIER 9: TRANSFER LEARNING =============
-
-router.get('/v1/lessons/transfer', async (request: IRequest, env: Env) => {
-  try {
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
-    autoLogDecision({
-      db: env.DB,
-      accountId: ctx.account_id,
-      method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
-      statusCode: 200,
-
-      tier: ctx.tier,
-    }).catch(() => {});
-
-    const url = getUrl(request);
-    const transferService = new TransferService(env.DB);
-    const lessons = await transferService.getTransferableLessons(
-      url.searchParams.get('from_type') || 'general',
-      url.searchParams.get('to_type') || 'general',
-      parseInt(url.searchParams.get('limit') || '10')
-    );
-    return json(lessons);
-  } catch (e: unknown) { return err('Internal error'); }
-});
-
-router.post('/v1/lessons/:id/transfer-to', async (request: IRequest, env: Env) => {
-  try {
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
-    autoLogDecision({
-      db: env.DB,
-      accountId: ctx.account_id,
-      method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
-      statusCode: 200,
-
-      tier: ctx.tier,
-    }).catch(() => {});
-
-    const body = await request.json() as Record<string, unknown>;
-    const transferService = new TransferService(env.DB);
-    const result = await transferService.transferLesson(
-      String(request.params?.id), ctx.account_id,
-      String(body.from_domain), String(body.to_domain)
-    );
-    return json(result, 201);
-  } catch (e: unknown) { return err('Internal error'); }
-});
-
-router.get('/v1/transfer-metrics', async (request: IRequest, env: Env) => {
-  try {
-    const authResult = await requireAuth(request, env);
-    if (authResult instanceof Response) return authResult;
-    const ctx = authResult as RequestContext;
-    // Auto-log this API call as a decision (non-blocking, fire-and-forget)
-    autoLogDecision({
-      db: env.DB,
-      accountId: ctx.account_id,
-      method: request.method,
-      endpoint: request.url.split(new URL(request.url).origin).pop() || request.url,
-      statusCode: 200,
-
-      tier: ctx.tier,
-    }).catch(() => {});
-
-    const url = getUrl(request);
-    const transferService = new TransferService(env.DB);
-    const metrics = await transferService.calculateTransferMetrics(
-      ctx.account_id,
-      url.searchParams.get('from_domain') || 'general',
-      url.searchParams.get('to_domain') || 'general'
-    );
-    return json(metrics);
   } catch (e: unknown) { return err('Internal error'); }
 });
 
