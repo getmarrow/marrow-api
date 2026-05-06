@@ -27,8 +27,129 @@ function actionQualityError(result: Exclude<ReturnType<typeof validateActionQual
 }
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DEFAULT_RISK_TOLERANCE = 'medium';
+const HIGH_RISK_TERMS = /\b(?:auth|authentication|authorization|billing|cloudflare|customer data|database|db|delete|deploy|deployment|environment|key|migrate|migration|payment|permission|production|prod|revoke|rotate|secret|token|worker)\b/i;
+const MEDIUM_RISK_TERMS = /\b(?:commit|config|configure|dependency|github|install|merge|package|pr|push|release|rollback|upgrade)\b/i;
+
+type RiskLevel = 'low' | 'medium' | 'high';
+type RiskTolerance = 'low' | 'medium' | 'high';
+type GateDecision = 'allow' | 'warn' | 'review_required' | 'block';
+
+interface GateReason {
+  code: string;
+  severity: 'low' | 'medium' | 'high';
+  message: string;
+}
+
+function parseRiskTolerance(value: unknown): RiskTolerance {
+  if (value === 'low' || value === 'medium' || value === 'high') return value;
+  return DEFAULT_RISK_TOLERANCE;
+}
+
+function classifyActionRisk(action: string, description: string, context: unknown): RiskLevel {
+  const text = `${action} ${description} ${JSON.stringify(context || {})}`;
+  if (HIGH_RISK_TERMS.test(text)) return 'high';
+  if (MEDIUM_RISK_TERMS.test(text)) return 'medium';
+  return 'low';
+}
+
+function evaluateGate(input: {
+  action: string;
+  description: string;
+  context: unknown;
+  riskTolerance: RiskTolerance;
+  requiresApproval: boolean;
+}): { allow: boolean; decision: GateDecision; risk_level: RiskLevel; reasons: GateReason[] } {
+  const reasons: GateReason[] = [];
+  const qualityResult = validateActionQuality(input.description || input.action);
+  const riskLevel = classifyActionRisk(input.action, input.description, input.context);
+
+  if (!qualityResult.valid) {
+    reasons.push({
+      code: qualityResult.code,
+      severity: 'high',
+      message: qualityResult.message,
+    });
+    return { allow: false, decision: 'block', risk_level: riskLevel, reasons };
+  }
+
+  if (input.requiresApproval) {
+    reasons.push({
+      code: 'approval_required',
+      severity: 'high',
+      message: 'Action explicitly requires approval before execution',
+    });
+    return { allow: false, decision: 'review_required', risk_level: riskLevel, reasons };
+  }
+
+  if (riskLevel === 'high' && input.riskTolerance !== 'high') {
+    reasons.push({
+      code: 'high_risk_action',
+      severity: 'high',
+      message: 'High-risk action should be reviewed before execution',
+    });
+    return { allow: false, decision: 'review_required', risk_level: riskLevel, reasons };
+  }
+
+  if (riskLevel === 'medium' && input.riskTolerance === 'low') {
+    reasons.push({
+      code: 'medium_risk_action',
+      severity: 'medium',
+      message: 'Medium-risk action exceeds low risk tolerance',
+    });
+    return { allow: true, decision: 'warn', risk_level: riskLevel, reasons };
+  }
+
+  if (riskLevel !== 'low') {
+    reasons.push({
+      code: `${riskLevel}_risk_action`,
+      severity: riskLevel,
+      message: `${riskLevel[0].toUpperCase()}${riskLevel.slice(1)}-risk action detected`,
+    });
+    return { allow: true, decision: 'warn', risk_level: riskLevel, reasons };
+  }
+
+  return { allow: true, decision: 'allow', risk_level: riskLevel, reasons };
+}
 
 export const router = Router();
+
+router.post('/v1/workflow/gate', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const body = await request.json() as Record<string, unknown>;
+  if (!body.action || typeof body.action !== 'string') {
+    return fail('BAD_REQUEST', 'Missing required field: action', 400);
+  }
+
+  const action = body.action.trim();
+  if (!action) return fail('BAD_REQUEST', 'Missing required field: action', 400);
+
+  const description = typeof body.description === 'string' ? body.description.trim() : '';
+  const riskTolerance = parseRiskTolerance(body.risk_tolerance);
+  const strictQualityMode = isStrictQualityMode(env, ctx);
+  const result = evaluateGate({
+    action,
+    description,
+    context: body.context,
+    riskTolerance,
+    requiresApproval: body.requires_approval === true,
+  });
+
+  return ok({
+    ...result,
+    action,
+    decision_type: typeof body.decision_type === 'string' ? body.decision_type : null,
+    agent_id: request.headers.get('X-Marrow-Agent-Id') || null,
+    session_id: request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null,
+    policy: {
+      mode: strictQualityMode ? 'strict' : 'advisory',
+      risk_tolerance: riskTolerance,
+      side_effects: 'none',
+    },
+    next: {
+      recommended_endpoint: result.allow ? '/v1/workflow/before' : null,
+    },
+  });
+}));
 
 router.post('/v1/workflow/before', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
   const body = await request.json() as Record<string, unknown>;
