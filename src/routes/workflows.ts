@@ -30,6 +30,14 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const DEFAULT_RISK_TOLERANCE = 'medium';
 const HIGH_RISK_TERMS = /\b(?:auth|authentication|authorization|billing|cloudflare|customer data|database|db|delete|deploy|deployment|environment|key|migrate|migration|payment|permission|production|prod|revoke|rotate|secret|token|worker)\b/i;
 const MEDIUM_RISK_TERMS = /\b(?:commit|config|configure|dependency|github|install|merge|package|pr|push|release|rollback|upgrade)\b/i;
+const MAX_SCAN_TEXT_LENGTH = 1024;
+const MAX_RISK_INPUT_LENGTH = 4096;
+const MAX_CONTEXT_DEPTH = 4;
+const MAX_CONTEXT_ENTRIES = 25;
+const MAX_CONTEXT_STRING_LENGTH = 256;
+const MAX_CONTEXT_KEY_LENGTH = 64;
+const MAX_HINT_LENGTH = 128;
+const HINT_ID_REGEX = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 type RiskLevel = 'low' | 'medium' | 'high';
 type RiskTolerance = 'low' | 'medium' | 'high';
@@ -46,8 +54,55 @@ function parseRiskTolerance(value: unknown): RiskTolerance {
   return DEFAULT_RISK_TOLERANCE;
 }
 
+function truncateText(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function summarizeContextForRisk(context: unknown, depth = 0): string {
+  if (context == null) return '';
+  if (typeof context === 'string') return truncateText(context, MAX_CONTEXT_STRING_LENGTH);
+  if (typeof context === 'number' || typeof context === 'boolean' || typeof context === 'bigint') return String(context);
+  if (typeof context !== 'object') return '';
+  if (depth >= MAX_CONTEXT_DEPTH) return '[truncated]';
+
+  if (Array.isArray(context)) {
+    const items = context
+      .slice(0, MAX_CONTEXT_ENTRIES)
+      .map((value) => summarizeContextForRisk(value, depth + 1))
+      .filter(Boolean);
+    const suffix = context.length > MAX_CONTEXT_ENTRIES ? ',...' : '';
+    return `[${items.join(',')}${suffix}]`;
+  }
+
+  const objectContext = context as Record<string, unknown>;
+  const entries: string[] = [];
+  let entryCount = 0;
+  for (const key in objectContext) {
+    if (!Object.prototype.hasOwnProperty.call(objectContext, key)) continue;
+    entryCount += 1;
+    if (entries.length >= MAX_CONTEXT_ENTRIES) continue;
+
+    const value = summarizeContextForRisk(objectContext[key], depth + 1);
+    if (value) entries.push(`${truncateText(key, MAX_CONTEXT_KEY_LENGTH)}:${value}`);
+  }
+
+  const suffix = entryCount > MAX_CONTEXT_ENTRIES ? ',...' : '';
+  return `{${entries.join(',')}${suffix}}`;
+}
+
+function sanitizeHintId(value: string | null): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > MAX_HINT_LENGTH) return null;
+  return HINT_ID_REGEX.test(trimmed) ? trimmed : null;
+}
+
 function classifyActionRisk(action: string, description: string, context: unknown): RiskLevel {
-  const text = `${action} ${description} ${JSON.stringify(context || {})}`;
+  const text = truncateText(
+    `${truncateText(action, MAX_SCAN_TEXT_LENGTH)} ${truncateText(description, MAX_SCAN_TEXT_LENGTH)} ${summarizeContextForRisk(context)}`,
+    MAX_RISK_INPUT_LENGTH,
+  );
   if (HIGH_RISK_TERMS.test(text)) return 'high';
   if (MEDIUM_RISK_TERMS.test(text)) return 'medium';
   return 'low';
@@ -115,6 +170,9 @@ function evaluateGate(input: {
 export const router = Router();
 
 router.post('/v1/workflow/gate', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const rlAllowed = await checkRateLimit(env.DB, `workflow_gate:${ctx.account_id}`, 120, 60 * 1000);
+  if (!rlAllowed) return fail('RATE_LIMITED', 'Rate limited', 429);
+
   const body = await request.json() as Record<string, unknown>;
   if (!body.action || typeof body.action !== 'string') {
     return fail('BAD_REQUEST', 'Missing required field: action', 400);
@@ -134,12 +192,13 @@ router.post('/v1/workflow/gate', authRoute(async (request: IRequest, env: Env, c
     requiresApproval: body.requires_approval === true,
   });
 
+  const agentIdHint = sanitizeHintId(request.headers.get('X-Marrow-Agent-Id'));
+  const sessionIdHint = sanitizeHintId(request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id'));
+
   return ok({
     ...result,
-    action,
-    decision_type: typeof body.decision_type === 'string' ? body.decision_type : null,
-    agent_id: request.headers.get('X-Marrow-Agent-Id') || null,
-    session_id: request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null,
+    agent_id: agentIdHint,
+    session_id: sessionIdHint,
     policy: {
       mode: strictQualityMode ? 'strict' : 'advisory',
       risk_tolerance: riskTolerance,
