@@ -106,6 +106,28 @@ describe('GET /v1/analytics/value-report', () => {
     ).run();
   }
 
+  async function insertBaseline(table: 'account_baselines' | 'agent_baselines', id: string, triggerReason: string, agentId?: string) {
+    const now = new Date().toISOString();
+    if (table === 'agent_baselines') {
+      await db.prepare(`
+        INSERT INTO agent_baselines
+          (id, account_id, agent_id, captured_at, first_decision_at, days_in_window,
+           decisions_in_window, attempts_per_success, time_to_success_seconds,
+           drift_rate, success_rate, trigger_reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(id, REAL_ACCOUNT_ID, agentId, now, now, 1, 2, 2, 10, 0.1, 0.5, triggerReason).run();
+      return;
+    }
+
+    await db.prepare(`
+      INSERT INTO account_baselines
+        (id, account_id, captured_at, first_decision_at, days_in_window,
+         decisions_in_window, attempts_per_success, time_to_success_seconds,
+         drift_rate, success_rate, trigger_reason)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(id, REAL_ACCOUNT_ID, now, now, 1, 3, 3, 20, 0.2, 0.6, triggerReason).run();
+  }
+
   it('returns an agent-native owner summary and machine-readable metrics', async () => {
     await seedDecisions();
 
@@ -137,16 +159,29 @@ describe('GET /v1/analytics/value-report', () => {
     expect(body.data.fleet.top_agents[0].agent_id).toBe('jarvis');
   });
 
-  it('ignores invalid agent id filters', async () => {
+  it('rejects invalid agent id filters', async () => {
     await seedDecisions();
 
     const res = await authedFetch('/v1/analytics/value-report?period=7&agent_id=bad/slash');
 
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.code).toBe('BAD_REQUEST');
+    expect(body.error).toBe('Invalid agent_id');
+  });
+
+  it('uses agent-scoped improvement for agent reports', async () => {
+    await seedDecisions();
+    await insertBaseline('account_baselines', 'account-baseline', 'account_marker');
+    await insertBaseline('agent_baselines', 'jarvis-baseline', 'agent_marker', 'jarvis');
+
+    const res = await authedFetch('/v1/analytics/value-report?period=7&agent_id=jarvis');
+
     expect(res.status).toBe(200);
     const body = await res.json() as any;
-    expect(body.data.scope.agent_id).toBeNull();
-    expect(body.data.metrics.decisions.total).toBe(3);
-    expect(body.data.fleet.active_agents).toBe(2);
+    expect(body.data.scope.agent_id).toBe('jarvis');
+    expect(body.data.improvement.status).toBe('active');
+    expect(body.data.improvement.trigger_reason).toBe('agent_marker');
   });
 
   it('does not reflect raw action, context, or outcome text in reports', async () => {
