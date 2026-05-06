@@ -44,6 +44,7 @@ import { MemoryService }          from '../services/memory.service';
 import { VelocityService }        from '../services/velocity.service';
 import { BaselineService }        from '../services/baseline.service';
 import { NudgeService }           from '../services/nudge.service';
+import { ValueReportService }     from '../services/value-report.service';
 import { WorkflowService }        from '../workflow';
 
 export interface Services {
@@ -85,6 +86,7 @@ export interface Services {
   velocity:                VelocityService;
   baseline:                BaselineService;
   nudge:                   NudgeService;
+  valueReport:             ValueReportService;
   workflow:                WorkflowService;
 }
 
@@ -147,6 +149,7 @@ export function getServices(env: Env): Services {
       velocity:                new VelocityService(db),
       baseline:                new BaselineService(db),
       nudge:                   new NudgeService(db),
+      valueReport:             new ValueReportService(db),
       workflow:                new WorkflowService(db, ai),
   };
 
