@@ -19,7 +19,7 @@ import { autoLogDecision, classifyDecisionQuality } from '../middleware/auto-log
 import { actionQualityWarning, isStrictQualityMode, validateActionQuality } from '../middleware/action-validator';
 import { getDedupedResponse, storeDedupedResponse } from '../middleware/dedup-cache';
 import { safely } from '../utils/safely';
-import { ServiceContext } from '../services/context';
+import { getServices, type Services } from '../lib/services';
 
 const MARROW_API_VERSION = '2026.03.29';
 const MARROW_SDK_LATEST = '3.0.4';
@@ -109,7 +109,7 @@ function enforceRoutePolicy(request: IRequest, ctx: RequestContext): Response | 
   return hasAnyScope(ctx, required) ? null : err('Insufficient scope', 403);
 }
 
-function getSvc(env: any): ServiceContext { return env._svc; }
+function getSvc(env: Env): Services { return getServices(env); }
 
 async function requireAuth(request: IRequest, env: Env): Promise<RequestContext | Response> {
   const authHeader = request.headers.get('Authorization');
@@ -118,7 +118,7 @@ async function requireAuth(request: IRequest, env: Env): Promise<RequestContext 
   }
 
   try {
-    const authService = new AuthService(env.DB);
+    const authService = getSvc(env).auth;
     const ctx = await authService.validateToken(authHeader, {
       ip: request.headers.get('cf-connecting-ip'),
       userAgent: request.headers.get('user-agent'),
@@ -242,7 +242,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
       ? classifyDecisionQuality(action)
       : { quality: 'trivial' as const, filtered: true, reason: 'trivial_action' as const };
 
-    const piiService = new PiiService();
+    const piiService = getSvc(env).pii;
     const strippedAction = piiService.stripString(action);
     const sanitized = strippedAction !== action;
 
@@ -312,7 +312,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
 
     let orgPiiStripTeam = false;
     if (ctx.tier === 'enterprise') {
-      const orgSvc = new OrgService(env.DB);
+      const orgSvc = getSvc(env).org;
       const org = await orgSvc.getOrgForAccount(ctx.account_id);
       if (org) {
         orgPiiStripTeam = !!org.pii_strip_team;
@@ -412,7 +412,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
     let upgradeHint: Record<string, unknown> | null = null;
     if (ctx.tier === 'free') {
       try {
-        const decisionService = getSvc(env).decisions();
+        const decisionService = getSvc(env).decisions;
         const count = await decisionService.getDecisionCount(ctx.account_id);
         const freeLimit = 500;
         const retentionDays = 30;
@@ -470,7 +470,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
     }
 
     try {
-      const decisionService = getSvc(env).decisions();
+      const decisionService = getSvc(env).decisions;
       const count = await decisionService.getDecisionCount(ctx.account_id);
       let onboardingHint: string | null = null;
       if (count <= 3) {
@@ -497,7 +497,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
         created_at: string; decision_type: string; session_id: string;
       }>();
       if (teamRows.results && teamRows.results.length > 0) {
-        const pii = new PiiService();
+        const pii = getSvc(env).pii;
         const teamContext = (teamRows.results || []).map(r => {
           let actionText = r.decision_type;
           try {
@@ -520,7 +520,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
     } catch (_e) {}
 
     try {
-      const collective = new CollectiveService(env.DB);
+      const collective = getSvc(env).collective;
       const collectiveInsight = await collective.getCollectiveInsight(type);
       if (collectiveInsight) {
         (response.intelligence as Record<string, unknown>).collective = collectiveInsight;
@@ -528,7 +528,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
     } catch (_e) {}
 
     if (actionableInsights.some(i => i.severity === 'critical')) {
-      const impact = new ImpactService(env.DB);
+      const impact = getSvc(env).impact;
       const topCritical = actionableInsights.find(i => i.severity === 'critical');
       if (topCritical) {
         await impact.recordPotentialSave(
@@ -609,7 +609,7 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
 
     checkRateLimit(env.DB, 'learn_templates_throttle', 1, 15 * 60 * 1000).then(allowed => {
       if (allowed) {
-        const patAuto = getSvc(env).patterns();
+        const patAuto = getSvc(env).patterns;
         patAuto.learnTemplates().catch((e: unknown) => console.error('[auto-learn think]', e instanceof Error ? e.message : e));
       }
     }).catch(() => {});
@@ -746,7 +746,7 @@ router.get('/v1/agent/suggestions', async (request: IRequest, env: Env) => {
     const rlAllowed = await checkRateLimit(env.DB, `agent_suggestions:${ctx.account_id}`, 30, 60 * 1000);
     if (!rlAllowed) return err('Rate limited', 429);
 
-    const detection = new WorkflowDetectionService(env.DB);
+    const detection = getSvc(env).workflowDetection;
     const suggestions = await detection.getSuggestions(ctx.account_id);
 
     return json({ suggested_workflows: suggestions });
@@ -834,11 +834,11 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
     }
 
     if (Boolean(body.success)) {
-      const impact = new ImpactService(env.DB);
+      const impact = getSvc(env).impact;
       await impact.confirmSave(ctx.account_id, String(body.decision_id), true).catch(() => {});
     }
 
-    const narrative = await new NarrativeService(env.DB)
+    const narrative = await getSvc(env).narrative
       .getNarrativeForCommit(ctx.account_id, commitAgentId ?? undefined)
       .catch(() => null);
 
@@ -851,7 +851,7 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
         const totalCommits = countRow?.c || 0;
         if (totalCommits !== 100) return;
 
-        const baseline = await getSvc(env).baseline().getAccountImprovement(ctx.account_id).catch(() => null);
+        const baseline = await getSvc(env).baseline.getAccountImprovement(ctx.account_id).catch(() => null);
         if (!baseline || baseline.status !== 'active') return;
 
         const rawDelta = baseline.time_to_success_seconds.delta_pct;
@@ -865,7 +865,7 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
           .first<{ email: string }>();
         if (!account?.email) return;
 
-        const emailService = getEmailService(env.DB, env);
+        const emailService = getSvc(env).email;
         await emailService.sendTemplate(ctx.account_id, account.email, 'milestone_100', {
           email: account.email,
           improvement_pct,
@@ -904,7 +904,7 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
         .bind(String(body.decision_id), ctx.account_id)
         .first<{ decision_type: string }>();
       if (decision) {
-        const patterns = getSvc(env).patterns();
+        const patterns = getSvc(env).patterns;
         const { risk_score: rs } = await patterns.predictSimilarDecisions(
           { action: String(body.outcome) }, decision.decision_type, 5
         );
@@ -922,7 +922,7 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
 
     checkRateLimit(env.DB, 'learn_templates_throttle', 1, 15 * 60 * 1000).then(allowed => {
       if (allowed) {
-        const patLearn = getSvc(env).patterns();
+        const patLearn = getSvc(env).patterns;
         patLearn.learnTemplates().catch((e: unknown) => console.error('[auto-learn commit]', e instanceof Error ? e.message : e));
       }
     }).catch(() => {});
@@ -967,7 +967,7 @@ router.post('/v1/agent/session/end', async (request: IRequest, env: Env) => {
       ctx.account_id;
     const autoCommitOpen = body.auto_commit_open === true;
 
-    const sessionService = new SessionService(env.DB);
+    const sessionService = getSvc(env).session;
     const result = await sessionService.endSession(sessionId, ctx.account_id, autoCommitOpen);
 
     if (autoCommitOpen && result.committed > 0) {
@@ -1045,7 +1045,7 @@ router.get('/v1/agent/nudge', async (request: IRequest, env: Env) => {
 
     autoLogDecision({ db: env.DB, accountId: ctx.account_id, method: request.method, endpoint: '/v1/agent/nudge', statusCode: 200, tier: ctx.tier }).catch((e) => { safely(() => console.warn('[auto-log]', e), 'auto-log'); });
 
-    const nudge = new NudgeService(env.DB);
+    const nudge = getSvc(env).nudge;
     const result = await nudge.checkNudge(ctx.account_id);
 
     if (result.nudge && result.metrics) {
@@ -1063,7 +1063,7 @@ router.get('/v1/agent/nudge', async (request: IRequest, env: Env) => {
         db.prepare('SELECT email FROM accounts WHERE id = ? LIMIT 1').bind(acctId).first().catch(() => null),
       ]).then(([sent, acct]) => {
         if (!sent && acct?.email) {
-          const es = new EmailService(db, env2);
+          const es = getSvc(env2).email;
           es.sendTemplate(acctId, acct.email, 'progress_report', {
             improvement_pct: impPct, attempts_pct: attPct, drift_pct: drfPct,
             pattern_reuse_pct: Math.round(100 - drfPct), success_rate: sucRate,
