@@ -5,6 +5,7 @@ import { ok, fail } from '../lib/response';
 import { withAuth } from '../middleware/auth';
 import { withErrorBoundary } from '../middleware/error-boundary';
 import { checkRateLimit } from '../utils/rate-limit';
+import { ValueReportInputError } from '../services/value-report.service';
 
 function getUrl(request: IRequest): URL {
   return new URL(request.url);
@@ -58,11 +59,18 @@ router.get('/v1/analytics/value-report', authRoute(async (request: IRequest, env
 
   const url = getUrl(request);
   const period = Number(url.searchParams.get('period') || '7');
-  const result = await getServices(env).valueReport.build(ctx.account_id, {
-    periodDays: period,
-    agentId: url.searchParams.get('agent_id'),
-  });
-  return ok(result);
+  try {
+    const result = await getServices(env).valueReport.build(ctx.account_id, {
+      periodDays: period,
+      agentId: url.searchParams.get('agent_id'),
+    });
+    return ok(result);
+  } catch (error) {
+    if (error instanceof ValueReportInputError) {
+      return fail('BAD_REQUEST', error.message, 400);
+    }
+    throw error;
+  }
 }));
 
 router.get('/v1/export', authRoute(async (_request: IRequest, env: Env, ctx: RequestContext) => {

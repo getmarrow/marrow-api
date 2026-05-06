@@ -6,6 +6,13 @@ const MAX_PERIOD_DAYS = 90;
 const MAX_DECISIONS_SCANNED = 500;
 const AGENT_ID_REGEX = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
+export class ValueReportInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ValueReportInputError';
+  }
+}
+
 interface DecisionReportRow {
   decision_type: string;
   outcome_success: number | null;
@@ -70,10 +77,12 @@ export class ValueReportService {
     const start = new Date(end.getTime() - days * 86400000);
     const startIso = start.toISOString();
 
+    const baseline = new BaselineService(this.db);
     const [rows, saves, improvement] = await Promise.all([
       this.getDecisionRows(accountId, startIso, agentId),
       new ImpactService(this.db).getSavesCount(accountId, startIso),
-      new BaselineService(this.db).getAccountImprovement(accountId).catch(() => ({ status: 'unavailable' })),
+      (agentId ? baseline.getAgentImprovement(accountId, agentId) : baseline.getAccountImprovement(accountId))
+        .catch(() => ({ status: 'unavailable' })),
     ]);
 
     const decisionStats = this.countDecisions(rows);
@@ -247,7 +256,7 @@ export class ValueReportService {
   private sanitizeAgentId(value: string | null): string | null {
     if (!value) return null;
     const trimmed = value.trim();
-    if (!AGENT_ID_REGEX.test(trimmed)) return null;
+    if (!AGENT_ID_REGEX.test(trimmed)) throw new ValueReportInputError('Invalid agent_id');
     return trimmed;
   }
 
