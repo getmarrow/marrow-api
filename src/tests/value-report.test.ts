@@ -400,3 +400,199 @@ describe('GET /v1/analytics/agent-status', () => {
     expect(res.status).toBe(401);
   });
 });
+
+describe('POST /v1/analytics/decision-brief', () => {
+  let db: D1Database;
+
+  beforeEach(() => {
+    db = createMockD1();
+  });
+
+  function env() {
+    return {
+      DB: db,
+      ENCRYPTION_KEY: TEST_ENCRYPTION_KEY,
+      ENVIRONMENT: 'test',
+    } as any;
+  }
+
+  function ctx(): ExecutionContext {
+    return {
+      waitUntil() {},
+      passThroughOnException() {},
+    } as unknown as ExecutionContext;
+  }
+
+  async function authedPost(body: Record<string, unknown>) {
+    return worker.fetch(
+      new Request('https://api.getmarrow.ai/v1/analytics/decision-brief', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${REAL_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      }),
+      env(),
+      ctx(),
+    );
+  }
+
+  async function insertDecision(
+    id: string,
+    decisionType: string,
+    sessionId: string,
+    agentId: string,
+    outcomeSuccess: number | null,
+    context: Record<string, unknown> = { action: `private action ${id}` },
+    outcome = `private outcome ${id}`,
+  ) {
+    const now = new Date().toISOString();
+    await db.prepare(`
+      INSERT INTO decisions
+        (id, account_id, decision_type, context, outcome, confidence, visibility,
+         outcome_success, outcome_recorded_at, session_id, agent_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      id,
+      REAL_ACCOUNT_ID,
+      decisionType,
+      JSON.stringify(context),
+      outcome,
+      0.8,
+      'private',
+      outcomeSuccess,
+      outcomeSuccess === null ? null : now,
+      sessionId,
+      agentId,
+      now,
+      now,
+    ).run();
+  }
+
+  it('returns one pre-action bundle for risky deploy work', async () => {
+    await insertDecision(
+      'deploy-fail-1',
+      'deploy',
+      'jarvis-session',
+      'jarvis-agent',
+      0,
+      { action: 'failed deploy with private-token-value' },
+      'failed with private stack trace',
+    );
+    await insertDecision('deploy-ok-1', 'deploy', 'jarvis-session', 'jarvis-agent', 1);
+
+    const res = await authedPost({
+      action: 'publish SDK and MCP packages to npm and update production docs',
+      type: 'deploy',
+      role: 'deploy',
+      agent_id: 'jarvis-agent',
+      session_id: 'release-2026-05-07',
+      surfaces: ['github', 'npm', 'docs', 'production'],
+      period: 30,
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.data.risk.level).toBe('high');
+    expect(body.data.workflow.recommended).toBe('safe-deploy-publish');
+    expect(body.data.handoff.required).toBe(true);
+    expect(body.data.freshness.surfaces).toEqual(['github', 'npm', 'docs', 'production']);
+    expect(body.data.quality.minimum_checks).toContain('dry_run_or_report_only');
+    expect(body.data.quality.minimum_checks).toContain('live_docs_verify');
+    expect(body.data.proof_pack.fields).toContain('rollback_target');
+    expect(body.data.source_of_truth.docs_required).toBe(true);
+    expect(body.data.next_actions.join(' ')).toContain('dry-run');
+  });
+
+  it('does not expose raw prior action, context, or outcome text', async () => {
+    await insertDecision(
+      'private-brief-fail',
+      'deploy',
+      'jarvis-session',
+      'jarvis-agent',
+      0,
+      { action: 'private-token-value should not leak' },
+      'private stack trace should not leak',
+    );
+
+    const res = await authedPost({
+      action: 'deploy worker',
+      type: 'deploy',
+      role: 'deploy',
+      agent_id: 'jarvis-agent',
+    });
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(text).not.toContain('private-token-value');
+    expect(text).not.toContain('private stack trace');
+  });
+
+  it('rejects invalid scoped inputs', async () => {
+    const res = await authedPost({
+      action: 'deploy worker',
+      agent_id: 'bad/slash',
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.code).toBe('BAD_REQUEST');
+    expect(body.error).toBe('Invalid agent_id');
+  });
+
+  it('rejects invalid session ids and surfaces', async () => {
+    const badSession = await authedPost({
+      action: 'deploy worker',
+      session_id: 'bad/slash',
+    });
+    expect(badSession.status).toBe(400);
+    expect((await badSession.json() as any).error).toBe('Invalid session_id');
+
+    const badSurface = await authedPost({
+      action: 'deploy worker',
+      surfaces: ['github', 'bad/slash'],
+    });
+    expect(badSurface.status).toBe(400);
+    expect((await badSurface.json() as any).error).toBe('Invalid surface');
+  });
+
+  it('uses handoff contract markers for review work', async () => {
+    const res = await authedPost({
+      action: 'final review before merge',
+      role: 'review',
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.data.handoff.checkpoint_markers).toContain('REPORT_DONE');
+    expect(body.data.handoff.checkpoint_markers).not.toContain('REVIEW_DONE');
+    expect(body.data.workflow.steps).toContain('log intent');
+    expect(body.data.workflow.steps).toContain('commit result');
+  });
+
+  it('requires an action', async () => {
+    const res = await authedPost({
+      role: 'deploy',
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.code).toBe('BAD_REQUEST');
+    expect(body.error).toBe('action is required');
+  });
+
+  it('requires authorization', async () => {
+    const res = await worker.fetch(
+      new Request('https://api.getmarrow.ai/v1/analytics/decision-brief', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'deploy worker' }),
+      }),
+      env(),
+      ctx(),
+    );
+
+    expect(res.status).toBe(401);
+  });
+});
