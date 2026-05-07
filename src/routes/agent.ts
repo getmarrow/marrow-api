@@ -22,7 +22,7 @@ import { safely } from '../utils/safely';
 import { getServices, type Services } from '../lib/services';
 
 const MARROW_API_VERSION = '2026.03.29';
-const MARROW_SDK_LATEST = '3.7.14';
+const MARROW_SDK_LATEST = '3.7.15';
 const MARROW_MCP_LATEST = '3.9.16';
 
 function json<T>(data: T, status = 200, headers?: Record<string, string>): Response {

@@ -43,7 +43,7 @@ import { router as emailRouter } from './routes/email';
 // ============= Helpers =============
 
 const MARROW_API_VERSION = '2026.03.29';
-const MARROW_SDK_LATEST = '3.7.14';
+const MARROW_SDK_LATEST = '3.7.15';
 const MARROW_MCP_LATEST = '3.9.16';
 
 function escapeHtml(s: string): string {
