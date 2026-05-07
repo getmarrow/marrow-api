@@ -122,7 +122,7 @@ export class ValueReportService {
     const baseline = new BaselineService(this.db);
     const [rows, saves, improvement] = await Promise.all([
       this.getDecisionRows(accountId, startIso, agentId),
-      new ImpactService(this.db).getSavesCount(accountId, startIso),
+      new ImpactService(this.db).getSavesCount(accountId, startIso, agentId),
       (agentId ? baseline.getAgentImprovement(accountId, agentId) : baseline.getAccountImprovement(accountId))
         .catch(() => ({ status: 'unavailable' })),
     ]);
@@ -179,7 +179,7 @@ export class ValueReportService {
 
     const [rows, saves] = await Promise.all([
       this.getDecisionRows(accountId, startIso, agentId),
-      new ImpactService(this.db).getSavesCount(accountId, startIso),
+      new ImpactService(this.db).getSavesCount(accountId, startIso, agentId),
     ]);
 
     const decisionStats = this.countDecisions(rows);

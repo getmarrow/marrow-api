@@ -128,6 +128,15 @@ describe('GET /v1/analytics/value-report', () => {
     `).bind(id, REAL_ACCOUNT_ID, now, now, 1, 3, 3, 20, 0.2, 0.6, triggerReason).run();
   }
 
+  async function insertSave(id: string, decisionId: string) {
+    const now = new Date().toISOString();
+    await db.prepare(`
+      INSERT INTO saves
+        (id, account_id, decision_id, warning_type, warning_message, confirmed_save, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(id, REAL_ACCOUNT_ID, decisionId, 'loop', 'warning text', 1, now).run();
+  }
+
   it('returns an agent-native owner summary and machine-readable metrics', async () => {
     await seedDecisions();
 
@@ -182,6 +191,20 @@ describe('GET /v1/analytics/value-report', () => {
     expect(body.data.scope.agent_id).toBe('jarvis');
     expect(body.data.improvement.status).toBe('active');
     expect(body.data.improvement.trigger_reason).toBe('agent_marker');
+  });
+
+  it('uses agent-scoped saves for agent reports', async () => {
+    await seedDecisions();
+    await insertSave('jarvis-save', 'deploy-ok');
+    await insertSave('darvis-save', 'backend-ok');
+
+    const res = await authedFetch('/v1/analytics/value-report?period=7&agent_id=jarvis');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.data.scope.agent_id).toBe('jarvis');
+    expect(body.data.metrics.saves.period).toBe(1);
+    expect(body.data.metrics.saves.total).toBe(1);
   });
 
   it('does not reflect raw action, context, or outcome text in reports', async () => {
@@ -269,6 +292,15 @@ describe('GET /v1/analytics/agent-status', () => {
     ).run();
   }
 
+  async function insertSave(id: string, decisionId: string) {
+    const now = new Date().toISOString();
+    await db.prepare(`
+      INSERT INTO saves
+        (id, account_id, decision_id, warning_type, warning_message, confirmed_save, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(id, REAL_ACCOUNT_ID, decisionId, 'loop', 'warning text', 1, now).run();
+  }
+
   it('returns inactive status before Marrow sees agent decisions', async () => {
     const res = await authedFetch('/v1/analytics/agent-status?period=7');
 
@@ -319,6 +351,23 @@ describe('GET /v1/analytics/agent-status', () => {
     expect(body.data.signals.success_rate).toBe(1);
     expect(body.data.signals.active_agents).toBe(1);
     expect(body.data.quality.enough_signal).toBe(true);
+  });
+
+  it('scopes saves and prevented-failure proof to the requested agent', async () => {
+    await insertDecision('jarvis-ok-1', 'deploy', 'jarvis-session', 'jarvis', 1);
+    await insertDecision('jarvis-ok-2', 'deploy', 'jarvis-session', 'jarvis', 1);
+    await insertDecision('jarvis-ok-3', 'deploy', 'jarvis-session', 'jarvis', 1);
+    await insertDecision('darvis-ok-1', 'backend', 'darvis-session', 'darvis', 1);
+    await insertSave('darvis-save', 'darvis-ok-1');
+
+    const res = await authedFetch('/v1/analytics/agent-status?period=7&agent_id=jarvis');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.data.scope.agent_id).toBe('jarvis');
+    expect(body.data.signals.saves.period).toBe(0);
+    expect(body.data.signals.saves.total).toBe(0);
+    expect(body.data.proof.has_prevented_failures).toBe(false);
   });
 
   it('rejects invalid agent id filters', async () => {
