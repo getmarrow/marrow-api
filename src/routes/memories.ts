@@ -4,8 +4,8 @@ import { AuthRateLimitError, AuthService, AuthServiceError } from '../services/a
 import { MemoryService } from '../services/memory.service';
 
 const MARROW_API_VERSION = '2026.03.29';
-const MARROW_SDK_LATEST = '3.0.4';
-const MARROW_MCP_LATEST = '3.0.7';
+const MARROW_SDK_LATEST = '3.7.14';
+const MARROW_MCP_LATEST = '3.9.16';
 
 function json<T>(data: T, status = 200, headers?: Record<string, string>): Response {
   return new Response(JSON.stringify({ data }), {
