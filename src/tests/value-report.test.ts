@@ -81,7 +81,7 @@ describe('GET /v1/analytics/value-report', () => {
     outcome: string,
     sessionId: string,
     agentId: string,
-    outcomeSuccess: number,
+    outcomeSuccess: number | null,
     timestamp: string,
   ) {
     await db.prepare(`
@@ -199,6 +199,151 @@ describe('GET /v1/analytics/value-report', () => {
   it('requires authorization', async () => {
     const res = await worker.fetch(
       new Request('https://api.getmarrow.ai/v1/analytics/value-report'),
+      env(),
+      ctx(),
+    );
+
+    expect(res.status).toBe(401);
+  });
+});
+
+describe('GET /v1/analytics/agent-status', () => {
+  let db: D1Database;
+
+  beforeEach(() => {
+    db = createMockD1();
+  });
+
+  function env() {
+    return {
+      DB: db,
+      ENCRYPTION_KEY: TEST_ENCRYPTION_KEY,
+      ENVIRONMENT: 'test',
+    } as any;
+  }
+
+  function ctx(): ExecutionContext {
+    return {
+      waitUntil() {},
+      passThroughOnException() {},
+    } as unknown as ExecutionContext;
+  }
+
+  async function authedFetch(path: string) {
+    return worker.fetch(
+      new Request(`https://api.getmarrow.ai${path}`, {
+        headers: { Authorization: `Bearer ${REAL_API_KEY}` },
+      }),
+      env(),
+      ctx(),
+    );
+  }
+
+  async function insertDecision(
+    id: string,
+    decisionType: string,
+    sessionId: string,
+    agentId: string,
+    outcomeSuccess: number | null,
+  ) {
+    const now = new Date().toISOString();
+    await db.prepare(`
+      INSERT INTO decisions
+        (id, account_id, decision_type, context, outcome, confidence, visibility,
+         outcome_success, outcome_recorded_at, session_id, agent_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      id,
+      REAL_ACCOUNT_ID,
+      decisionType,
+      JSON.stringify({ action: `private action ${id}` }),
+      `private outcome ${id}`,
+      0.8,
+      'private',
+      outcomeSuccess,
+      outcomeSuccess === null ? null : now,
+      sessionId,
+      agentId,
+      now,
+      now,
+    ).run();
+  }
+
+  it('returns inactive status before Marrow sees agent decisions', async () => {
+    const res = await authedFetch('/v1/analytics/agent-status?period=7');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.data.active).toBe(false);
+    expect(body.data.state).toBe('inactive');
+    expect(body.data.signals.decisions_logged).toBe(0);
+    expect(body.data.quality.enough_signal).toBe(false);
+    expect(body.data.proof.raw_data_exposed).toBe(false);
+    expect(body.data.next_actions[0]).toContain('API key');
+  });
+
+  it('shows active but needs outcomes when decisions lack committed results', async () => {
+    await insertDecision('uncommitted-1', 'deploy', 'jarvis-session', 'jarvis', null);
+    await insertDecision('uncommitted-2', 'deploy', 'jarvis-session', 'jarvis', null);
+    await insertDecision('uncommitted-3', 'backend', 'darvis-session', 'darvis', null);
+
+    const res = await authedFetch('/v1/analytics/agent-status?period=7');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.data.active).toBe(true);
+    expect(body.data.state).toBe('needs_outcomes');
+    expect(body.data.signals.decisions_logged).toBe(3);
+    expect(body.data.signals.outcomes_recorded).toBe(0);
+    expect(body.data.quality.measurement_risk).toBe('high');
+    expect(body.data.next_actions.join(' ')).toContain('Commit outcomes');
+  });
+
+  it('reports proving value when an agent has enough recorded signal', async () => {
+    await insertDecision('jarvis-ok-1', 'deploy', 'jarvis-session', 'jarvis', 1);
+    await insertDecision('jarvis-ok-2', 'deploy', 'jarvis-session', 'jarvis', 1);
+    await insertDecision('jarvis-ok-3', 'deploy', 'jarvis-session', 'jarvis', 1);
+    await insertDecision('jarvis-ok-4', 'backend', 'jarvis-session', 'jarvis', 1);
+    await insertDecision('jarvis-ok-5', 'backend', 'jarvis-session', 'jarvis', 1);
+    await insertDecision('darvis-fail', 'backend', 'darvis-session', 'darvis', 0);
+
+    const res = await authedFetch('/v1/analytics/agent-status?period=7&agent_id=jarvis');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.data.scope.agent_id).toBe('jarvis');
+    expect(body.data.active).toBe(true);
+    expect(body.data.state).toBe('proving_value');
+    expect(body.data.signals.decisions_logged).toBe(5);
+    expect(body.data.signals.outcome_coverage).toBe(1);
+    expect(body.data.signals.success_rate).toBe(1);
+    expect(body.data.signals.active_agents).toBe(1);
+    expect(body.data.quality.enough_signal).toBe(true);
+  });
+
+  it('rejects invalid agent id filters', async () => {
+    const res = await authedFetch('/v1/analytics/agent-status?period=7&agent_id=bad/slash');
+
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.code).toBe('BAD_REQUEST');
+    expect(body.error).toBe('Invalid agent_id');
+  });
+
+  it('does not expose raw action, context, or outcome text', async () => {
+    await insertDecision('private-proof', 'deploy', 'jarvis-session', 'jarvis', 1);
+
+    const res = await authedFetch('/v1/analytics/agent-status?period=7');
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(text).not.toContain('private action');
+    expect(text).not.toContain('private outcome');
+  });
+
+  it('requires authorization', async () => {
+    const res = await worker.fetch(
+      new Request('https://api.getmarrow.ai/v1/analytics/agent-status'),
       env(),
       ctx(),
     );

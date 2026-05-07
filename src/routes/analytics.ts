@@ -73,6 +73,26 @@ router.get('/v1/analytics/value-report', authRoute(async (request: IRequest, env
   }
 }));
 
+router.get('/v1/analytics/agent-status', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const rlAllowed = await checkRateLimit(env.DB, `agent_status:${ctx.account_id}`, 30, 60 * 1000);
+  if (!rlAllowed) return fail('RATE_LIMITED', 'Rate limited', 429);
+
+  const url = getUrl(request);
+  const period = Number(url.searchParams.get('period') || '7');
+  try {
+    const result = await getServices(env).valueReport.buildAgentStatus(ctx.account_id, {
+      periodDays: period,
+      agentId: url.searchParams.get('agent_id'),
+    });
+    return ok(result);
+  } catch (error) {
+    if (error instanceof ValueReportInputError) {
+      return fail('BAD_REQUEST', error.message, 400);
+    }
+    throw error;
+  }
+}));
+
 router.get('/v1/export', authRoute(async (_request: IRequest, env: Env, ctx: RequestContext) => {
   if (ctx.tier === 'free') return fail('FORBIDDEN', 'Export requires Pro or Enterprise tier', 403);
 
