@@ -93,6 +93,30 @@ router.get('/v1/analytics/agent-status', authRoute(async (request: IRequest, env
   }
 }));
 
+router.post('/v1/analytics/decision-brief', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const rlAllowed = await checkRateLimit(env.DB, `decision_brief:${ctx.account_id}`, 30, 60 * 1000);
+  if (!rlAllowed) return fail('RATE_LIMITED', 'Rate limited', 429);
+
+  const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+  try {
+    const result = await getServices(env).valueReport.buildDecisionBrief(ctx.account_id, {
+      action: typeof body.action === 'string' ? body.action : '',
+      type: typeof body.type === 'string' ? body.type : '',
+      role: typeof body.role === 'string' ? body.role : '',
+      periodDays: typeof body.period === 'number' || typeof body.period === 'string' ? Number(body.period) : undefined,
+      agentId: typeof body.agent_id === 'string' ? body.agent_id : null,
+      sessionId: typeof body.session_id === 'string' ? body.session_id : null,
+      surfaces: body.surfaces,
+    });
+    return ok(result);
+  } catch (error) {
+    if (error instanceof ValueReportInputError) {
+      return fail('BAD_REQUEST', error.message, 400);
+    }
+    throw error;
+  }
+}));
+
 router.get('/v1/export', authRoute(async (_request: IRequest, env: Env, ctx: RequestContext) => {
   if (ctx.tier === 'free') return fail('FORBIDDEN', 'Export requires Pro or Enterprise tier', 403);
 

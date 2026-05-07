@@ -224,3 +224,74 @@ Build phases:
 - Phase 1: API endpoint.
 - Phase 2: SDK/MCP startup check helper.
 - Phase 3: policy gate consumes status before autonomous execution.
+
+## 7. Agent Decision Brief
+
+Problem: agents do not need more dashboards. They need a compact operating brief at the moment they are about to act. The brief should reuse Marrow's existing decision, workflow, value, and fleet signals to keep the agent on track without becoming a generic observability product.
+
+Endpoint:
+
+- `POST /v1/analytics/decision-brief`
+
+Design rule:
+
+- Prefer one backend call before meaningful work. `decision-brief` is the agent's pre-action bundle so agents do not need to stitch together `agent-status`, `value-report`, workflow, fleet, and source-of-truth checks for normal operation.
+- Follow-up calls are only for execution-specific actions such as `think`, `commit`, workflow advancement, or explicit owner reporting.
+
+Request:
+
+```json
+{
+  "action": "publish SDK and MCP packages to npm",
+  "type": "deploy",
+  "agent_id": "jarvis-agent",
+  "session_id": "release-2026-05-07",
+  "role": "deploy",
+  "surfaces": ["github", "npm", "docs", "production"],
+  "period": 30
+}
+```
+
+Output:
+
+- `summary`: agent-ready explanation of the risk and operating mode.
+- `risk`: pre-action risk level, deterministic reasons, and prior failure categories without raw decision text.
+- `workflow`: recommended playbook steps.
+- `handoff`: whether checkpoint/result handoff is required and which markers to use.
+- `freshness`: which source-of-truth surfaces must be rechecked before acting.
+- `quality`: minimum checks and whether an outcome commit is required.
+- `role_playbook`: role-specific guidance for deploy, audit, patch, review, or general work.
+- `failure_alerts`: repeated failure patterns by decision type only.
+- `proof_pack`: fields the agent must include in its final owner/report handoff.
+- `source_of_truth`: expected public/private surfaces that must stay current.
+- `fleet_reliability`: light fleet signal based on recent activity and outcome coverage.
+- `next_actions`: concrete steps the agent should take now.
+
+Product boundary:
+
+- This is not a generic planner, dashboard, or vector-memory endpoint.
+- It is an agent-native decision guardrail that composes existing Marrow signals.
+- It exists to reduce repeated mistakes, stale-context work, bad handoffs, and unverified production changes.
+
+The ten user-facing capabilities are implemented as one operating loop:
+
+- pre-action risk check
+- workflow memory and playbooks
+- cross-agent handoff requirements
+- freshness checks
+- decision quality scoring expectations
+- role-specific playbooks
+- failure pattern alerts
+- proof pack generation
+- source-of-truth enforcement
+- agent/fleet reliability hints
+
+Phase 1 acceptance:
+
+- Deterministic response, no LLM dependency.
+- No raw action, context, or outcome text from prior decisions is exposed.
+- Invalid `agent_id` and `session_id` filters fail closed.
+- High-risk actions produce explicit dry-run, verify, rollback/proof-pack guidance.
+- SDK exposes `decisionBrief()`.
+- MCP exposes `marrow_decision_brief`.
+- Public docs describe this as the recommended pre-action call for risky work.
