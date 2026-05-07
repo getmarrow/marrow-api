@@ -186,3 +186,41 @@ Why first:
 - It reuses existing Marrow metrics.
 - It requires no migration.
 - It becomes the reporting payload later SDK/MCP loop helpers can return.
+
+## 6. Day-1 Passive Agent Status
+
+Problem: after installing Marrow, an owner should not have to inspect a human dashboard to know whether their agents are using it correctly. Agents need a small, deterministic status endpoint they can call at startup, before risky work, and after workflow batches.
+
+Goal: let an agent prove Marrow is active, collecting enough signal, and producing measurable value without exposing raw action, context, or outcome text.
+
+Endpoint:
+
+- `GET /v1/analytics/agent-status`
+
+Query:
+
+- `period`: days, clamped to 1-90, default 7.
+- `agent_id`: optional, filters to `agent_id` or `session_id`.
+
+Output:
+
+- `active`: whether Marrow has seen decisions in the period.
+- `state`: `inactive`, `warming_up`, `needs_outcomes`, `learning`, or `proving_value`.
+- `summary`: agent-ready explanation that can be relayed to an owner.
+- `signals`: decisions logged, outcomes recorded, coverage, success rate, saves, active agents, and first/last decision timestamps.
+- `quality`: whether there is enough signal to trust value claims and whether outcome coverage creates measurement risk.
+- `proof`: non-sensitive proof that Marrow is collecting recent workflow signal.
+- `next_actions`: concrete steps the agent should take next.
+
+Security:
+
+- No raw `action`, `context`, or `outcome` text.
+- Authenticated and rate limited.
+- Scope to caller account.
+- Invalid agent filters fail closed.
+
+Build phases:
+
+- Phase 1: API endpoint.
+- Phase 2: SDK/MCP startup check helper.
+- Phase 3: policy gate consumes status before autonomous execution.

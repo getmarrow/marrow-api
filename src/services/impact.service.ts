@@ -44,10 +44,33 @@ export class ImpactService {
   }
 
   /**
-   * getSavesCount: Total confirmed saves for an account within a time window.
+   * getSavesCount: Total confirmed saves for an account or one agent within a time window.
    */
-  async getSavesCount(accountId: string, since?: string): Promise<{ thisWeek: number; total: number }> {
+  async getSavesCount(accountId: string, since?: string, agentId?: string | null): Promise<{ thisWeek: number; total: number }> {
     const weekAgo = since || new Date(Date.now() - 7 * 86400000).toISOString();
+
+    if (agentId) {
+      const thisWeek = await this.db.prepare(`
+        SELECT COUNT(*) as c
+        FROM saves s
+        JOIN decisions d ON d.id = s.decision_id AND d.account_id = s.account_id
+        WHERE s.account_id = ? AND s.confirmed_save = 1 AND s.created_at > ?
+          AND (d.agent_id = ? OR d.session_id = ?)
+      `).bind(accountId, weekAgo, agentId, agentId).first<{ c: number }>();
+
+      const total = await this.db.prepare(`
+        SELECT COUNT(*) as c
+        FROM saves s
+        JOIN decisions d ON d.id = s.decision_id AND d.account_id = s.account_id
+        WHERE s.account_id = ? AND s.confirmed_save = 1
+          AND (d.agent_id = ? OR d.session_id = ?)
+      `).bind(accountId, agentId, agentId).first<{ c: number }>();
+
+      return {
+        thisWeek: thisWeek?.c || 0,
+        total: total?.c || 0,
+      };
+    }
 
     const thisWeek = await this.db.prepare(`
       SELECT COUNT(*) as c FROM saves

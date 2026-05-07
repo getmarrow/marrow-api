@@ -67,6 +67,48 @@ export interface ValueReport {
   improvement: Record<string, unknown>;
 }
 
+type AgentStatusState = 'inactive' | 'warming_up' | 'needs_outcomes' | 'learning' | 'proving_value';
+type MeasurementRisk = 'low' | 'medium' | 'high';
+
+export interface AgentStatusReport {
+  period: {
+    days: number;
+    start: string;
+    end: string;
+  };
+  scope: {
+    agent_id: string | null;
+  };
+  active: boolean;
+  state: AgentStatusState;
+  summary: string;
+  signals: {
+    decisions_logged: number;
+    outcomes_recorded: number;
+    outcome_coverage: number;
+    success_rate: number;
+    saves: {
+      period: number;
+      total: number;
+    };
+    active_agents: number;
+    first_decision_at: string | null;
+    last_decision_at: string | null;
+  };
+  quality: {
+    enough_signal: boolean;
+    measurement_risk: MeasurementRisk;
+  };
+  proof: {
+    recent_decision_count: number;
+    last_decision_at: string | null;
+    has_recent_outcomes: boolean;
+    has_prevented_failures: boolean;
+    raw_data_exposed: false;
+  };
+  next_actions: string[];
+}
+
 export class ValueReportService {
   constructor(private db: D1Database) {}
 
@@ -80,7 +122,7 @@ export class ValueReportService {
     const baseline = new BaselineService(this.db);
     const [rows, saves, improvement] = await Promise.all([
       this.getDecisionRows(accountId, startIso, agentId),
-      new ImpactService(this.db).getSavesCount(accountId, startIso),
+      new ImpactService(this.db).getSavesCount(accountId, startIso, agentId),
       (agentId ? baseline.getAgentImprovement(accountId, agentId) : baseline.getAccountImprovement(accountId))
         .catch(() => ({ status: 'unavailable' })),
     ]);
@@ -126,6 +168,80 @@ export class ValueReportService {
       recommendations,
       improvement: improvement as Record<string, unknown>,
     };
+  }
+
+  async buildAgentStatus(accountId: string, options: ValueReportOptions = {}): Promise<AgentStatusReport> {
+    const days = this.clampPeriod(options.periodDays);
+    const agentId = this.sanitizeAgentId(options.agentId || null);
+    const end = new Date();
+    const start = new Date(end.getTime() - days * 86400000);
+    const startIso = start.toISOString();
+
+    const [rows, saves] = await Promise.all([
+      this.getDecisionRows(accountId, startIso, agentId),
+      new ImpactService(this.db).getSavesCount(accountId, startIso, agentId),
+    ]);
+
+    const decisionStats = this.countDecisions(rows);
+    const successRate = decisionStats.recorded > 0 ? decisionStats.successful / decisionStats.recorded : 0;
+    const outcomeCoverage = decisionStats.total > 0 ? decisionStats.recorded / decisionStats.total : 0;
+    const state = this.agentStatusState(decisionStats, outcomeCoverage, saves.thisWeek);
+    const measurementRisk = this.measurementRisk(decisionStats.total, outcomeCoverage);
+    const activeAgentCount = this.activeAgentCount(rows);
+    const decisionTimes = this.decisionTimes(rows);
+
+    const report = {
+      period: {
+        days,
+        start: startIso,
+        end: end.toISOString(),
+      },
+      scope: {
+        agent_id: agentId,
+      },
+      active: decisionStats.total > 0,
+      state,
+      summary: this.buildAgentStatusSummary({
+        days,
+        agentId,
+        state,
+        decisionsLogged: decisionStats.total,
+        outcomeCoverage,
+        savesPeriod: saves.thisWeek,
+      }),
+      signals: {
+        decisions_logged: decisionStats.total,
+        outcomes_recorded: decisionStats.recorded,
+        outcome_coverage: this.round(outcomeCoverage),
+        success_rate: this.round(successRate),
+        saves: {
+          period: saves.thisWeek,
+          total: saves.total,
+        },
+        active_agents: activeAgentCount,
+        first_decision_at: decisionTimes.first,
+        last_decision_at: decisionTimes.last,
+      },
+      quality: {
+        enough_signal: decisionStats.recorded >= 3 && outcomeCoverage >= 0.5,
+        measurement_risk: measurementRisk,
+      },
+      proof: {
+        recent_decision_count: decisionStats.total,
+        last_decision_at: decisionTimes.last,
+        has_recent_outcomes: decisionStats.recorded > 0,
+        has_prevented_failures: saves.thisWeek > 0,
+        raw_data_exposed: false as const,
+      },
+      next_actions: this.buildAgentStatusNextActions({
+        state,
+        decisionStats,
+        outcomeCoverage,
+        savesPeriod: saves.thisWeek,
+      }),
+    };
+
+    return report;
   }
 
   private async getDecisionRows(accountId: string, startIso: string, agentId: string | null): Promise<DecisionReportRow[]> {
@@ -245,6 +361,89 @@ export class ValueReportService {
       recommendations.push('Keep using the safety loop and review value reports after each major workflow.');
     }
     return recommendations.slice(0, 4);
+  }
+
+  private agentStatusState(
+    decisionStats: CountBucket & { recorded: number },
+    outcomeCoverage: number,
+    savesPeriod: number,
+  ): AgentStatusState {
+    if (decisionStats.total === 0) return 'inactive';
+    if (decisionStats.total < 3) return 'warming_up';
+    if (outcomeCoverage < 0.5) return 'needs_outcomes';
+    if (savesPeriod > 0 || decisionStats.recorded >= 5) return 'proving_value';
+    return 'learning';
+  }
+
+  private measurementRisk(totalDecisions: number, outcomeCoverage: number): MeasurementRisk {
+    if (totalDecisions === 0) return 'high';
+    if (outcomeCoverage < 0.3) return 'high';
+    if (outcomeCoverage < 0.7) return 'medium';
+    return 'low';
+  }
+
+  private activeAgentCount(rows: DecisionReportRow[]): number {
+    const agents = new Set<string>();
+    for (const row of rows) {
+      agents.add(String(row.agent_id || row.session_id || 'unknown'));
+    }
+    return agents.size;
+  }
+
+  private decisionTimes(rows: DecisionReportRow[]): { first: string | null; last: string | null } {
+    if (rows.length === 0) return { first: null, last: null };
+    return {
+      first: rows[rows.length - 1].created_at,
+      last: rows[0].created_at,
+    };
+  }
+
+  private buildAgentStatusSummary(input: {
+    days: number;
+    agentId: string | null;
+    state: AgentStatusState;
+    decisionsLogged: number;
+    outcomeCoverage: number;
+    savesPeriod: number;
+  }): string {
+    const subject = input.agentId ? `Agent ${input.agentId}` : 'Your agent fleet';
+    if (input.state === 'inactive') {
+      return `${subject} has not logged Marrow decisions in the last ${input.days} days. Verify the SDK, MCP, or workflow hook is installed before relying on value claims.`;
+    }
+    const coveragePct = Math.round(input.outcomeCoverage * 100);
+    return `${subject} is connected to Marrow with ${input.decisionsLogged} decisions logged over ${input.days} days, ${coveragePct}% outcome coverage, and ${input.savesPeriod} known failure${input.savesPeriod === 1 ? '' : 's'} avoided.`;
+  }
+
+  private buildAgentStatusNextActions(input: {
+    state: AgentStatusState;
+    decisionStats: CountBucket & { recorded: number };
+    outcomeCoverage: number;
+    savesPeriod: number;
+  }): string[] {
+    if (input.state === 'inactive') {
+      return [
+        'Verify the Marrow API key and agent identity are loaded.',
+        'Log one decision through the SDK, MCP, or workflow endpoint.',
+      ];
+    }
+
+    const actions: string[] = [];
+    if (input.state === 'warming_up') {
+      actions.push('Keep logging decisions until Marrow has enough signal to compare outcomes.');
+    }
+    if (input.outcomeCoverage < 0.5) {
+      actions.push('Commit outcomes for recent decisions so Marrow can measure improvement.');
+    }
+    if (input.decisionStats.recorded >= 3 && input.decisionStats.failed > 0) {
+      actions.push('Review failed decision categories before similar autonomous work.');
+    }
+    if (input.savesPeriod === 0) {
+      actions.push('Run high-risk work through the safety loop so Marrow can prevent repeated failures.');
+    }
+    if (actions.length === 0) {
+      actions.push('Continue using Marrow passively and pull value reports after major workflow batches.');
+    }
+    return actions.slice(0, 4);
   }
 
   private clampPeriod(value: unknown): number {
