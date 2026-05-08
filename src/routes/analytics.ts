@@ -15,6 +15,19 @@ function authRoute(handler: (request: IRequest, env: Env, ctx: RequestContext) =
   return withErrorBoundary(withAuth(async (request: IRequest, env: Env) => handler(request, env, request.ctx as RequestContext)));
 }
 
+function boundAgentIds(ctx: RequestContext): string[] | null {
+  if (ctx.agent_ids && ctx.agent_ids.length > 0) return ctx.agent_ids;
+  if (ctx.agent_id) return [ctx.agent_id];
+  return null;
+}
+
+function scopedAgentId(ctx: RequestContext, requested: string | null): string | Response | null {
+  const bound = boundAgentIds(ctx);
+  if (!bound) return requested;
+  if (requested && !bound.includes(requested)) return fail('FORBIDDEN', 'Agent-bound key cannot access another agent.', 403);
+  return requested || bound[0] || null;
+}
+
 const ALLOWED_ORIGINS = [
   'https://getmarrow.ai',
   'https://www.getmarrow.ai',
@@ -59,10 +72,12 @@ router.get('/v1/analytics/value-report', authRoute(async (request: IRequest, env
 
   const url = getUrl(request);
   const period = Number(url.searchParams.get('period') || '7');
+  const agentId = scopedAgentId(ctx, url.searchParams.get('agent_id'));
+  if (agentId instanceof Response) return agentId;
   try {
     const result = await getServices(env).valueReport.build(ctx.account_id, {
       periodDays: period,
-      agentId: url.searchParams.get('agent_id'),
+      agentId,
     });
     return ok(result);
   } catch (error) {
@@ -79,10 +94,12 @@ router.get('/v1/analytics/agent-status', authRoute(async (request: IRequest, env
 
   const url = getUrl(request);
   const period = Number(url.searchParams.get('period') || '7');
+  const agentId = scopedAgentId(ctx, url.searchParams.get('agent_id'));
+  if (agentId instanceof Response) return agentId;
   try {
     const result = await getServices(env).valueReport.buildAgentStatus(ctx.account_id, {
       periodDays: period,
-      agentId: url.searchParams.get('agent_id'),
+      agentId,
     });
     return ok(result);
   } catch (error) {
@@ -93,19 +110,37 @@ router.get('/v1/analytics/agent-status', authRoute(async (request: IRequest, env
   }
 }));
 
+router.get('/v1/analytics/agent-performance', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const rlAllowed = await checkRateLimit(env.DB, `agent_performance:${ctx.account_id}`, 30, 60 * 1000);
+  if (!rlAllowed) return fail('RATE_LIMITED', 'Rate limited', 429);
+
+  const url = getUrl(request);
+  const period = Number(url.searchParams.get('period') || '7');
+  const agentId = scopedAgentId(ctx, url.searchParams.get('agent_id'));
+  if (agentId instanceof Response) return agentId;
+  const result = await getServices(env).fleetLearning.buildAgentPerformance(ctx.account_id, {
+    periodDays: period,
+    agentId,
+  });
+  return ok(result);
+}));
+
 router.post('/v1/analytics/decision-brief', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
   const rlAllowed = await checkRateLimit(env.DB, `decision_brief:${ctx.account_id}`, 30, 60 * 1000);
   if (!rlAllowed) return fail('RATE_LIMITED', 'Rate limited', 429);
 
   const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+  const agentId = scopedAgentId(ctx, typeof body.agent_id === 'string' ? body.agent_id : null);
+  if (agentId instanceof Response) return agentId;
+  const bound = boundAgentIds(ctx);
   try {
     const result = await getServices(env).valueReport.buildDecisionBrief(ctx.account_id, {
       action: typeof body.action === 'string' ? body.action : '',
       type: typeof body.type === 'string' ? body.type : '',
       role: typeof body.role === 'string' ? body.role : '',
       periodDays: typeof body.period === 'number' || typeof body.period === 'string' ? Number(body.period) : undefined,
-      agentId: typeof body.agent_id === 'string' ? body.agent_id : null,
-      sessionId: typeof body.session_id === 'string' ? body.session_id : null,
+      agentId,
+      sessionId: bound ? null : typeof body.session_id === 'string' ? body.session_id : null,
       surfaces: body.surfaces,
     });
     return ok(result);

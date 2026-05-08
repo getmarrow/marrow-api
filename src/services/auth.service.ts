@@ -492,6 +492,14 @@ export class AuthService {
 
   private parseAgentIds(raw: string | null | undefined): string[] {
     if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.map((agentId) => String(agentId || '').trim()).filter(Boolean).slice(0, 100);
+      }
+    } catch {
+      // Fall back to legacy comma-separated storage.
+    }
     return raw
       .split(',')
       .map((agentId) => agentId.trim())

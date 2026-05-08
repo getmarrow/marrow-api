@@ -43,8 +43,8 @@ import { router as emailRouter } from './routes/email';
 // ============= Helpers =============
 
 const MARROW_API_VERSION = '2026.03.29';
-const MARROW_SDK_LATEST = '3.7.16';
-const MARROW_MCP_LATEST = '3.9.17';
+const MARROW_SDK_LATEST = '3.7.17';
+const MARROW_MCP_LATEST = '3.9.18';
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');

@@ -45,6 +45,7 @@ import { VelocityService }        from '../services/velocity.service';
 import { BaselineService }        from '../services/baseline.service';
 import { NudgeService }           from '../services/nudge.service';
 import { ValueReportService }     from '../services/value-report.service';
+import { FleetLearningService }   from '../services/fleet-learning.service';
 import { WorkflowService }        from '../workflow';
 
 export interface Services {
@@ -87,6 +88,7 @@ export interface Services {
   baseline:                BaselineService;
   nudge:                   NudgeService;
   valueReport:             ValueReportService;
+  fleetLearning:           FleetLearningService;
   workflow:                WorkflowService;
 }
 
@@ -150,6 +152,7 @@ export function getServices(env: Env): Services {
       baseline:                new BaselineService(db),
       nudge:                   new NudgeService(db),
       valueReport:             new ValueReportService(db),
+      fleetLearning:           new FleetLearningService(db),
       workflow:                new WorkflowService(db, ai),
   };
 

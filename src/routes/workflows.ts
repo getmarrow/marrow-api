@@ -15,6 +15,18 @@ function authRoute(handler: (request: IRequest, env: Env, ctx: RequestContext) =
   return withErrorBoundary(withAuth(async (request: IRequest, env: Env) => handler(request, env, request.ctx as RequestContext)));
 }
 
+function boundAgentIds(ctx: RequestContext): string[] | null {
+  if (ctx.agent_ids && ctx.agent_ids.length > 0) return ctx.agent_ids;
+  if (ctx.agent_id) return [ctx.agent_id];
+  return null;
+}
+
+function scopedHeaderAgent(ctx: RequestContext, headerAgent: string | null): string | null {
+  const bound = boundAgentIds(ctx);
+  if (!bound) return headerAgent;
+  return bound[0] || null;
+}
+
 function actionQualityError(result: Exclude<ReturnType<typeof validateActionQuality>, { valid: true }>): Response {
   return new Response(JSON.stringify({
     error: result.code,
@@ -192,18 +204,50 @@ router.post('/v1/workflow/gate', authRoute(async (request: IRequest, env: Env, c
     requiresApproval: body.requires_approval === true,
   });
 
-  const agentIdHint = sanitizeHintId(request.headers.get('X-Marrow-Agent-Id'));
+  const agentIdHint = sanitizeHintId(scopedHeaderAgent(ctx, request.headers.get('X-Marrow-Agent-Id')));
   const sessionIdHint = sanitizeHintId(request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id'));
+  const services = getServices(env);
+  const policy = {
+    mode: strictQualityMode ? 'strict' : 'advisory',
+    risk_tolerance: riskTolerance,
+    side_effects: 'metadata_log_only',
+  };
+  const accessAgentIds = boundAgentIds(ctx);
+  const canReadShared = await services.fleetLearning.canReadSharedFleet(ctx.account_id, accessAgentIds);
+  const [gateEvent, lessons, deploymentMemory] = await Promise.all([
+    services.fleetLearning.recordRiskGate(ctx.account_id, {
+      agent_id: agentIdHint,
+      session_id: sessionIdHint,
+      action,
+      risk_level: result.risk_level,
+      decision: result.decision,
+      allow: result.allow,
+      reasons: result.reasons,
+      policy,
+    }).catch(() => null),
+    services.fleetLearning.listLessons(ctx.account_id, {
+      query: action,
+      agent_id: canReadShared ? null : accessAgentIds?.[0],
+      access_agent_ids: accessAgentIds,
+      limit: 3,
+    }).catch(() => []),
+    result.risk_level !== 'low'
+      ? services.fleetLearning.listDeploymentMemories(ctx.account_id, {
+        agent_id: canReadShared ? null : accessAgentIds?.[0],
+        access_agent_ids: accessAgentIds,
+        limit: 3,
+      }).catch(() => [])
+      : Promise.resolve([]),
+  ]);
 
   return ok({
     ...result,
     agent_id: agentIdHint,
     session_id: sessionIdHint,
-    policy: {
-      mode: strictQualityMode ? 'strict' : 'advisory',
-      risk_tolerance: riskTolerance,
-      side_effects: 'none',
-    },
+    gate_event_id: gateEvent?.id || null,
+    policy,
+    prior_lessons: lessons,
+    deployment_playbooks: deploymentMemory,
     next: {
       recommended_endpoint: result.allow ? '/v1/workflow/before' : null,
     },
@@ -249,8 +293,9 @@ router.post('/v1/workflow/after', authRoute(async (request: IRequest, env: Env, 
     return actionQualityError(qualityResult);
   }
 
-  const workflowAfterAgentId = request.headers.get('X-Marrow-Agent-Id');
-  const result = await getServices(env).workflow.after({
+  const workflowAfterAgentId = scopedHeaderAgent(ctx, request.headers.get('X-Marrow-Agent-Id'));
+  const services = getServices(env);
+  const result = await services.workflow.after({
     decision_id: String(body.decision_id || ''),
     success: Boolean(body.success),
     outcome: String(body.outcome || ''),
@@ -259,6 +304,8 @@ router.post('/v1/workflow/after', authRoute(async (request: IRequest, env: Env, 
   }, ctx.account_id);
 
   const response: Record<string, unknown> = { ...result };
+  const lesson = await services.fleetLearning.learnFromDecision(ctx.account_id, String(body.decision_id || '')).catch(() => null);
+  if (lesson) response.fleet_lesson = lesson;
   if (!qualityResult.valid && !strictQualityMode) {
     response.warnings = [actionQualityWarning(qualityResult)];
   }

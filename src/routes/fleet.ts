@@ -14,6 +14,20 @@ function authRoute(handler: (request: IRequest, env: Env, ctx: RequestContext) =
   return withErrorBoundary(withAuth(async (request: IRequest, env: Env) => handler(request, env, request.ctx as RequestContext)));
 }
 
+function boundAgentIds(ctx: RequestContext): string[] | null {
+  if (ctx.agent_ids && ctx.agent_ids.length > 0) return ctx.agent_ids;
+  if (ctx.agent_id) return [ctx.agent_id];
+  return null;
+}
+
+function requestedAgentId(ctx: RequestContext, requested?: string | null, fallback?: string | null): string | Response | null {
+  const bound = boundAgentIds(ctx);
+  const candidate = requested || fallback || null;
+  if (!bound) return candidate;
+  if (candidate && !bound.includes(candidate)) return fail('FORBIDDEN', 'Agent-bound key cannot access another agent.', 403);
+  return candidate || bound[0] || null;
+}
+
 export const router = Router();
 
 router.post('/v1/webhooks', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
@@ -158,6 +172,188 @@ router.get('/v1/agents/:id', authRoute(async (request: IRequest, env: Env, ctx: 
 
   const stats = await agentSvc.getAgentStats(agentId, ctx.account_id);
   return ok({ ...agent, stats });
+}));
+
+router.get('/v1/fleet/lessons', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const allowed = await checkRateLimit(env.DB, `fleet_lessons_read:${ctx.account_id}`, 60, 60 * 1000);
+  if (!allowed) return fail('RATE_LIMITED', 'Rate limited', 429);
+  const url = getUrl(request);
+  const agentId = requestedAgentId(ctx, url.searchParams.get('agent_id'));
+  if (agentId instanceof Response) return agentId;
+  const accessAgentIds = boundAgentIds(ctx);
+  const canReadShared = await getServices(env).fleetLearning.canReadSharedFleet(ctx.account_id, accessAgentIds);
+  const lessons = await getServices(env).fleetLearning.listLessons(ctx.account_id, {
+    query: url.searchParams.get('query'),
+    lesson_type: url.searchParams.get('type'),
+    agent_id: canReadShared ? agentId : agentId || accessAgentIds?.[0],
+    access_agent_ids: accessAgentIds,
+    limit: Number(url.searchParams.get('limit') || '10'),
+  });
+  return ok({ lessons, count: lessons.length });
+}));
+
+router.post('/v1/fleet/lessons', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const allowed = await checkRateLimit(env.DB, `fleet_lessons_write:${ctx.account_id}`, 30, 60 * 1000);
+  if (!allowed) return fail('RATE_LIMITED', 'Rate limited', 429);
+  const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+  if (!body.summary || typeof body.summary !== 'string') return fail('BAD_REQUEST', 'summary is required', 400);
+  const accessAgentIds = boundAgentIds(ctx);
+  if (!(await getServices(env).fleetLearning.canWriteFleet(ctx.account_id, accessAgentIds))) {
+    return fail('FORBIDDEN', 'Agent is not allowed to contribute fleet lessons.', 403);
+  }
+  const agentId = requestedAgentId(
+    ctx,
+    typeof body.agent_id === 'string' ? body.agent_id : null,
+    request.headers.get('X-Marrow-Agent-Id')
+  );
+  if (agentId instanceof Response) return agentId;
+  const lesson = await getServices(env).fleetLearning.recordLesson(ctx.account_id, {
+    source_decision_id: typeof body.source_decision_id === 'string' ? body.source_decision_id : null,
+    agent_id: agentId,
+    lesson_type: typeof body.lesson_type === 'string' ? body.lesson_type : null,
+    title: typeof body.title === 'string' ? body.title : null,
+    summary: body.summary,
+    action_pattern: typeof body.action_pattern === 'string' ? body.action_pattern : null,
+    outcome_success: typeof body.outcome_success === 'boolean' ? body.outcome_success : null,
+    confidence: typeof body.confidence === 'number' ? body.confidence : null,
+    visibility: typeof body.visibility === 'string' ? body.visibility : null,
+    tags: body.tags,
+  });
+  return ok({ lesson }, 201);
+}));
+
+router.post('/v1/fleet/lessons/:id/reuse', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const lesson = await getServices(env).fleetLearning.markLessonReused(ctx.account_id, String(request.params?.id || ''), boundAgentIds(ctx));
+  if (!lesson) return fail('NOT_FOUND', 'Lesson not found', 404);
+  return ok({ lesson });
+}));
+
+router.post('/v1/fleet/deployment-memory', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const allowed = await checkRateLimit(env.DB, `deployment_memory_write:${ctx.account_id}`, 30, 60 * 1000);
+  if (!allowed) return fail('RATE_LIMITED', 'Rate limited', 429);
+  const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+  const accessAgentIds = boundAgentIds(ctx);
+  if (!(await getServices(env).fleetLearning.canWriteFleet(ctx.account_id, accessAgentIds))) {
+    return fail('FORBIDDEN', 'Agent is not allowed to contribute deployment memory.', 403);
+  }
+  const agentId = requestedAgentId(ctx, typeof body.agent_id === 'string' ? body.agent_id : null, request.headers.get('X-Marrow-Agent-Id'));
+  if (agentId instanceof Response) return agentId;
+  const memory = await getServices(env).fleetLearning.recordDeploymentMemory(ctx.account_id, {
+    agent_id: agentId,
+    workflow_id: typeof body.workflow_id === 'string' ? body.workflow_id : null,
+    release_id: typeof body.release_id === 'string' ? body.release_id : null,
+    pr_url: typeof body.pr_url === 'string' ? body.pr_url : null,
+    commit_sha: typeof body.commit_sha === 'string' ? body.commit_sha : null,
+    environment: typeof body.environment === 'string' ? body.environment : null,
+    status: typeof body.status === 'string' ? body.status : null,
+    tests: body.tests,
+    smoke_result: typeof body.smoke_result === 'string' ? body.smoke_result : null,
+    rollback_plan: typeof body.rollback_plan === 'string' ? body.rollback_plan : null,
+    prod_health: typeof body.prod_health === 'string' ? body.prod_health : null,
+    incident_summary: typeof body.incident_summary === 'string' ? body.incident_summary : null,
+  });
+  return ok({ memory }, 201);
+}));
+
+router.get('/v1/fleet/deployment-memory', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const allowed = await checkRateLimit(env.DB, `deployment_memory_read:${ctx.account_id}`, 60, 60 * 1000);
+  if (!allowed) return fail('RATE_LIMITED', 'Rate limited', 429);
+  const url = getUrl(request);
+  const accessAgentIds = boundAgentIds(ctx);
+  const canReadShared = await getServices(env).fleetLearning.canReadSharedFleet(ctx.account_id, accessAgentIds);
+  const memories = await getServices(env).fleetLearning.listDeploymentMemories(ctx.account_id, {
+    environment: url.searchParams.get('environment'),
+    status: url.searchParams.get('status'),
+    agent_id: canReadShared ? null : accessAgentIds?.[0],
+    access_agent_ids: accessAgentIds,
+    limit: Number(url.searchParams.get('limit') || '10'),
+  });
+  return ok({ memories, count: memories.length });
+}));
+
+router.post('/v1/fleet/handoffs', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const allowed = await checkRateLimit(env.DB, `handoffs_write:${ctx.account_id}`, 60, 60 * 1000);
+  if (!allowed) return fail('RATE_LIMITED', 'Rate limited', 429);
+  const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+  if (!body.to_agent_id || typeof body.to_agent_id !== 'string') return fail('BAD_REQUEST', 'to_agent_id is required', 400);
+  if (!body.task || typeof body.task !== 'string') return fail('BAD_REQUEST', 'task is required', 400);
+  const fromAgent = requestedAgentId(ctx, typeof body.from_agent_id === 'string' ? body.from_agent_id : null, request.headers.get('X-Marrow-Agent-Id'));
+  if (fromAgent instanceof Response) return fromAgent;
+  const handoff = await getServices(env).fleetLearning.createHandoff(ctx.account_id, {
+    workflow_id: typeof body.workflow_id === 'string' ? body.workflow_id : null,
+    from_agent_id: fromAgent,
+    to_agent_id: body.to_agent_id,
+    task: body.task,
+    checkpoint: typeof body.checkpoint === 'string' ? body.checkpoint : null,
+    stale_after_seconds: typeof body.stale_after_seconds === 'number' ? body.stale_after_seconds : null,
+  });
+  return ok({ handoff }, 201);
+}));
+
+router.patch('/v1/fleet/handoffs/:id', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const allowed = await checkRateLimit(env.DB, `handoffs_write:${ctx.account_id}`, 60, 60 * 1000);
+  if (!allowed) return fail('RATE_LIMITED', 'Rate limited', 429);
+  const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+  const accessAgentIds = boundAgentIds(ctx);
+  if (accessAgentIds) {
+    const scoped = await getServices(env).fleetLearning.listHandoffs(ctx.account_id, { agent_id: accessAgentIds[0], limit: 100 });
+    if (!scoped.some((handoff) => handoff.id === String(request.params?.id || ''))) {
+      return fail('FORBIDDEN', 'Agent-bound key cannot update this handoff.', 403);
+    }
+  }
+  const handoff = await getServices(env).fleetLearning.updateHandoff(ctx.account_id, String(request.params?.id || ''), {
+    status: typeof body.status === 'string' ? body.status : null,
+    checkpoint: typeof body.checkpoint === 'string' ? body.checkpoint : undefined,
+    result_summary: typeof body.result_summary === 'string' ? body.result_summary : undefined,
+  });
+  if (!handoff) return fail('NOT_FOUND', 'Handoff not found', 404);
+  return ok({ handoff });
+}));
+
+router.get('/v1/fleet/handoffs/status', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const allowed = await checkRateLimit(env.DB, `handoffs_read:${ctx.account_id}`, 60, 60 * 1000);
+  if (!allowed) return fail('RATE_LIMITED', 'Rate limited', 429);
+  const url = getUrl(request);
+  const agentId = requestedAgentId(ctx, url.searchParams.get('agent_id'));
+  if (agentId instanceof Response) return agentId;
+  const handoffs = await getServices(env).fleetLearning.listHandoffs(ctx.account_id, {
+    status: url.searchParams.get('status'),
+    agent_id: agentId,
+    limit: Number(url.searchParams.get('limit') || '20'),
+  });
+  const summary = handoffs.reduce((acc: Record<string, number>, handoff) => {
+    const key = handoff.stale ? 'stale' : handoff.status;
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  return ok({ handoffs, summary });
+}));
+
+router.put('/v1/fleet/memory-permissions', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const allowed = await checkRateLimit(env.DB, `memory_permissions_write:${ctx.account_id}`, 20, 60 * 1000);
+  if (!allowed) return fail('RATE_LIMITED', 'Rate limited', 429);
+  if (boundAgentIds(ctx)) return fail('FORBIDDEN', 'Agent-bound keys cannot manage fleet memory permissions.', 403);
+  const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+  if (!body.agent_id || typeof body.agent_id !== 'string') return fail('BAD_REQUEST', 'agent_id is required', 400);
+  if (!body.permission || typeof body.permission !== 'string') return fail('BAD_REQUEST', 'permission is required', 400);
+  const permission = await getServices(env).fleetLearning.setMemoryPermission(ctx.account_id, {
+    agent_id: body.agent_id,
+    scope: typeof body.scope === 'string' ? body.scope : null,
+    permission: body.permission,
+    resource_type: typeof body.resource_type === 'string' ? body.resource_type : null,
+    resource_id: typeof body.resource_id === 'string' ? body.resource_id : null,
+  });
+  return ok({ permission });
+}));
+
+router.get('/v1/fleet/memory-permissions', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+  const allowed = await checkRateLimit(env.DB, `memory_permissions_read:${ctx.account_id}`, 60, 60 * 1000);
+  if (!allowed) return fail('RATE_LIMITED', 'Rate limited', 429);
+  const url = getUrl(request);
+  const agentId = requestedAgentId(ctx, url.searchParams.get('agent_id'));
+  if (agentId instanceof Response) return agentId;
+  const permissions = await getServices(env).fleetLearning.listMemoryPermissions(ctx.account_id, agentId);
+  return ok({ permissions, count: permissions.length });
 }));
 
 router.patch('/v1/agents/:id', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {

@@ -39,7 +39,8 @@ class InMemoryDB {
       'snapshot_metadata', 'snapshot_diffs', 'restore_jobs', 'migration_guides',
       'deprecation_warnings', 'lesson_versions', 'versions',
       'learned_templates', 'memories', 'memory_shares', 'account_baselines', 'agent_baselines', 'saves',
-      'orgs', 'org_members', 'api_key_audit_log', 'rate_limits'
+      'orgs', 'org_members', 'api_key_audit_log', 'rate_limits',
+      'fleet_lessons', 'risk_gate_events', 'deployment_memories', 'agent_handoffs', 'fleet_memory_permissions'
     ];
     for (const name of tableNames) {
       this.tables.set(name, new Map());

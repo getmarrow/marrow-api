@@ -34,6 +34,12 @@ describe('GET /v1/analytics/value-report', () => {
     );
   }
 
+  async function bindPrimaryKeyToAgents(agentIds: string[]) {
+    await db.prepare('UPDATE api_keys SET agent_ids = ? WHERE account_id = ?')
+      .bind(agentIds.join(','), REAL_ACCOUNT_ID)
+      .run();
+  }
+
   async function seedDecisions() {
     const now = new Date().toISOString();
     await insertDecision(
@@ -219,6 +225,20 @@ describe('GET /v1/analytics/value-report', () => {
     expect(text).not.toContain('private prod details');
   });
 
+  it('scopes agent-bound keys to their own value report data', async () => {
+    await seedDecisions();
+    await bindPrimaryKeyToAgents(['jarvis']);
+
+    const own = await authedFetch('/v1/analytics/value-report?period=7');
+    expect(own.status).toBe(200);
+    const ownBody = await own.json() as any;
+    expect(ownBody.data.scope.agent_id).toBe('jarvis');
+    expect(ownBody.data.fleet.top_agents.every((agent: any) => agent.agent_id === 'jarvis')).toBe(true);
+
+    const other = await authedFetch('/v1/analytics/value-report?period=7&agent_id=darvis');
+    expect(other.status).toBe(403);
+  });
+
   it('requires authorization', async () => {
     const res = await worker.fetch(
       new Request('https://api.getmarrow.ai/v1/analytics/value-report'),
@@ -260,6 +280,12 @@ describe('GET /v1/analytics/agent-status', () => {
       env(),
       ctx(),
     );
+  }
+
+  async function bindPrimaryKeyToAgents(agentIds: string[]) {
+    await db.prepare('UPDATE api_keys SET agent_ids = ? WHERE account_id = ?')
+      .bind(agentIds.join(','), REAL_ACCOUNT_ID)
+      .run();
   }
 
   async function insertDecision(
@@ -390,6 +416,21 @@ describe('GET /v1/analytics/agent-status', () => {
     expect(text).not.toContain('private outcome');
   });
 
+  it('scopes agent-bound keys to their own agent status data', async () => {
+    await insertDecision('jarvis-ok-bound', 'deploy', 'jarvis-session', 'jarvis', 1);
+    await insertDecision('darvis-ok-bound', 'backend', 'darvis-session', 'darvis', 1);
+    await bindPrimaryKeyToAgents(['jarvis']);
+
+    const own = await authedFetch('/v1/analytics/agent-status?period=7');
+    expect(own.status).toBe(200);
+    const ownBody = await own.json() as any;
+    expect(ownBody.data.scope.agent_id).toBe('jarvis');
+    expect(ownBody.data.signals.active_agents).toBe(1);
+
+    const other = await authedFetch('/v1/analytics/agent-status?period=7&agent_id=darvis');
+    expect(other.status).toBe(403);
+  });
+
   it('requires authorization', async () => {
     const res = await worker.fetch(
       new Request('https://api.getmarrow.ai/v1/analytics/agent-status'),
@@ -436,6 +477,12 @@ describe('POST /v1/analytics/decision-brief', () => {
       env(),
       ctx(),
     );
+  }
+
+  async function bindPrimaryKeyToAgents(agentIds: string[]) {
+    await db.prepare('UPDATE api_keys SET agent_ids = ? WHERE account_id = ?')
+      .bind(agentIds.join(','), REAL_ACCOUNT_ID)
+      .run();
   }
 
   async function insertDecision(
@@ -580,6 +627,27 @@ describe('POST /v1/analytics/decision-brief', () => {
     const body = await res.json() as any;
     expect(body.code).toBe('BAD_REQUEST');
     expect(body.error).toBe('action is required');
+  });
+
+  it('rejects cross-agent decision briefs for agent-bound keys', async () => {
+    await insertDecision('jarvis-ok-bound', 'deploy', 'jarvis-session', 'jarvis', 1);
+    await insertDecision('barvis-fail-bound', 'audit', 'barvis-session', 'barvis', 0);
+    await bindPrimaryKeyToAgents(['jarvis']);
+
+    const own = await authedPost({
+      action: 'deploy worker',
+      role: 'deploy',
+    });
+    expect(own.status).toBe(200);
+    const ownBody = await own.json() as any;
+    expect(ownBody.data.scope.agent_id).toBe('jarvis');
+
+    const other = await authedPost({
+      action: 'review audit failure',
+      agent_id: 'barvis',
+      role: 'audit',
+    });
+    expect(other.status).toBe(403);
   });
 
   it('requires authorization', async () => {
