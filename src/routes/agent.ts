@@ -22,8 +22,8 @@ import { safely } from '../utils/safely';
 import { getServices, type Services } from '../lib/services';
 
 const MARROW_API_VERSION = '2026.03.29';
-const MARROW_SDK_LATEST = '3.7.15';
-const MARROW_MCP_LATEST = '3.9.16';
+const MARROW_SDK_LATEST = '3.7.16';
+const MARROW_MCP_LATEST = '3.9.17';
 
 function json<T>(data: T, status = 200, headers?: Record<string, string>): Response {
   return new Response(JSON.stringify({ data }), {
@@ -1102,27 +1102,98 @@ router.get('/v1/agent/status', async (request: IRequest, env: Env) => {
              SUM(CASE WHEN outcome_success = 0 THEN 1 ELSE 0 END) as fail
       FROM decisions
       WHERE account_id = ? AND outcome_success IS NOT NULL
-    `).bind(ctx.account_id).first<{ total: number; succ: number; fail: number }>();
+    `).bind(ctx.account_id).first<{
+      total: number;
+      succ: number;
+      fail: number;
+    }>();
 
-    const total = row?.total || 0;
+    const allRow = await env.DB.prepare(`
+      SELECT COUNT(*) as total
+      FROM decisions
+      WHERE account_id = ?
+    `).bind(ctx.account_id).first<{ total: number }>();
+
+    const firstEventRow = await env.DB.prepare(`
+      SELECT created_at
+      FROM decisions
+      WHERE account_id = ?
+      ORDER BY created_at ASC
+      LIMIT 1
+    `).bind(ctx.account_id).first<{ created_at: string }>();
+
+    const lastEventRow = await env.DB.prepare(`
+      SELECT created_at
+      FROM decisions
+      WHERE account_id = ?
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).bind(ctx.account_id).first<{ created_at: string }>();
+
+    const recentRow = await env.DB.prepare(`
+      SELECT COUNT(*) as total
+      FROM decisions
+      WHERE account_id = ? AND created_at >= datetime('now', '-24 hours')
+    `).bind(ctx.account_id).first<{ total: number }>();
+
+    const allDecisions = allRow?.total || 0;
     const succ = row?.succ || 0;
     const fail = row?.fail || 0;
+    const outcomes = row?.total || 0;
     const successRate = (succ + fail) > 0 ? succ / (succ + fail) : null;
-    const health = fail > succ * 0.5 ? 'degraded' : 'healthy';
-    const message = total === 0
-      ? 'Welcome to Marrow! Log your first decision with think() to get started.'
-      : total < 10
-      ? `Getting started — ${total} decision${total === 1 ? '' : 's'} logged. Keep going for pattern detection.`
-      : `${total} decisions tracked. Success rate: ${Math.round((successRate || 0) * 100)}%.`;
+    const outcomeCoverage = allDecisions > 0 ? outcomes / allDecisions : 0;
+    const recentDecisions = recentRow?.total || 0;
+    const firstEventAt = firstEventRow?.created_at || null;
+    const lastEventAt = lastEventRow?.created_at || null;
+    const enabled = allDecisions > 0;
+    const missedHooks: string[] = [];
+    if (!enabled) missedHooks.push('decisions');
+    if (enabled && outcomeCoverage < 0.35) missedHooks.push('outcomes');
+    if (enabled && recentDecisions === 0) missedHooks.push('recent_activity');
+
+    const recommendedFix = !enabled
+      ? 'Install MCP hooks or SDK passive runtime, then run a Marrow self-test.'
+      : outcomeCoverage < 0.35
+      ? 'Outcome capture is low. Ensure PostToolUse hooks or SDK guarded command/tool wrappers are enabled.'
+      : recentDecisions === 0
+      ? 'Marrow is configured but has no recent events. Run the installer self-test or verify the active agent has MARROW_API_KEY.'
+      : null;
+
+    const health = !enabled || missedHooks.length > 0 || fail > succ * 0.5 ? 'degraded' : 'healthy';
+    const message = allDecisions === 0
+      ? 'Marrow is reachable, but no passive decisions have been logged yet.'
+      : allDecisions < 10
+      ? `Marrow is active — ${allDecisions} decision${allDecisions === 1 ? '' : 's'} logged. Keep going for stronger pattern detection.`
+      : `Marrow is active — ${allDecisions} decisions tracked. Outcome coverage: ${Math.round(outcomeCoverage * 100)}%.`;
 
     return json({
       ok: true,
+      enabled,
       health,
       message,
-      has_memory: total > 0,
-      low_history: total < 10,
-      decision_count: total,
+      has_memory: allDecisions > 0,
+      low_history: allDecisions < 10,
+      decision_count: allDecisions,
+      outcome_count: outcomes,
       success_rate: successRate,
+      first_event_at: firstEventAt,
+      last_event_at: lastEventAt,
+      recent_decisions_24h: recentDecisions,
+      capture_coverage: {
+        decisions: enabled,
+        outcomes: outcomeCoverage,
+        tools: outcomeCoverage > 0 ? 'detected' : 'unknown',
+        commands: outcomeCoverage > 0 ? 'detected' : 'unknown',
+        deploys: 'unknown',
+        publishes: 'unknown',
+      },
+      missed_hooks: missedHooks,
+      recommended_fix: recommendedFix,
+      proof: {
+        raw_data_exposed: false,
+        last_event_at: lastEventAt,
+        recent_decisions_24h: recentDecisions,
+      },
     });
   } catch (e: unknown) {
     console.error('GET /v1/agent/status error:', e);
