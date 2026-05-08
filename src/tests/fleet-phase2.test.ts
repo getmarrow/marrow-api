@@ -176,6 +176,18 @@ describe('Fleet moat phase 2', () => {
     });
     expect(permission.status).toBe(200);
 
+    const updatedPermission = await authedFetch('/v1/fleet/memory-permissions', {
+      method: 'PUT',
+      body: JSON.stringify({ agent_id: 'barvis', permission: 'shared', scope: 'security' }),
+    });
+    expect(updatedPermission.status).toBe(200);
+
+    const permissions = await authedFetch('/v1/fleet/memory-permissions?agent_id=barvis');
+    const permissionsBody = await permissions.json() as any;
+    expect(permissions.status).toBe(200);
+    expect(permissionsBody.data.count).toBe(1);
+    expect(permissionsBody.data.permissions[0].permission).toBe('shared');
+
     const perf = await authedFetch('/v1/analytics/agent-performance?period=7');
     const perfBody = await perf.json() as any;
     expect(perf.status).toBe(200);

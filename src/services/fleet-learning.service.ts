@@ -489,7 +489,7 @@ export class FleetLearningService {
     if (!agentId) throw new Error('agent_id is required');
     const scope = this.sanitizeText(input.scope || 'fleet', 80) || 'fleet';
     const resourceType = this.sanitizeText(input.resource_type || 'memory', 80) || 'memory';
-    const resourceId = this.sanitizeOptional(input.resource_id, 128);
+    const resourceId = this.sanitizeOptional(input.resource_id, 128) || '';
     const permission = this.safeChoice(input.permission, ['read-only', 'contribute-only', 'private', 'shared', 'production-critical'], 'read-only') as MemoryPermission;
 
     await this.db.prepare(`

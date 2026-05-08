@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS fleet_memory_permissions (
   scope TEXT NOT NULL DEFAULT 'fleet',
   permission TEXT NOT NULL,
   resource_type TEXT NOT NULL DEFAULT 'memory',
-  resource_id TEXT,
+  resource_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(account_id, agent_id, scope, resource_type, resource_id),
