@@ -97,6 +97,28 @@ marketplaceRouter.get('/v1/templates/learned', withErrorBoundary(async (request:
   return ok({ templates, refreshed });
 }));
 
+marketplaceRouter.post('/v1/templates/detect', authRoute(async (request: IRequest, env: Env, _ctx: RequestContext) => {
+  const body = await request.json?.() as Record<string, unknown> | undefined;
+  if (!body?.action || typeof body.action !== 'string') return fail('BAD_REQUEST', 'action is required', 400);
+
+  try {
+    const result = await getServices(env).templates.detectTemplate({
+      action: body.action,
+      type: typeof body.type === 'string' ? body.type : undefined,
+      surfaces: Array.isArray(body.surfaces) ? body.surfaces.filter((surface): surface is string => typeof surface === 'string') : undefined,
+      risk_level: typeof body.risk_level === 'string' ? body.risk_level : undefined,
+      context: body.context && typeof body.context === 'object' && !Array.isArray(body.context)
+        ? body.context as Record<string, unknown>
+        : undefined,
+      limit: typeof body.limit === 'number' ? body.limit : undefined,
+    });
+    return ok(result);
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : 'Internal error';
+    return fail('BAD_REQUEST', msg, 400);
+  }
+}));
+
 marketplaceRouter.get('/v1/templates', authRoute(async (request: IRequest, env: Env, _ctx: RequestContext) => {
   const url = getUrl(request);
   const templates = await getServices(env).templates.listTemplates({
