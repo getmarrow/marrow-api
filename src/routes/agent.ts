@@ -63,6 +63,32 @@ function actionQualityError(result: Exclude<ReturnType<typeof validateActionQual
   });
 }
 
+function boundAgentIds(ctx: RequestContext): string[] | null {
+  if (ctx.agent_ids && ctx.agent_ids.length > 0) return ctx.agent_ids;
+  if (ctx.agent_id) return [ctx.agent_id];
+  return null;
+}
+
+async function forbidForeignDecisionForBoundAgent(
+  db: D1Database,
+  ctx: RequestContext,
+  decisionId: string,
+): Promise<Response | null> {
+  const bound = boundAgentIds(ctx);
+  if (!bound) return null;
+  const row = await db.prepare(`
+    SELECT agent_id, session_id
+    FROM decisions
+    WHERE account_id = ? AND id = ?
+    LIMIT 1
+  `).bind(ctx.account_id, decisionId).first<{ agent_id: string | null; session_id: string | null }>();
+  if (!row) return err('Decision not found or unauthorized', 404);
+  if ((row.agent_id && bound.includes(row.agent_id)) || (row.session_id && bound.includes(row.session_id))) {
+    return null;
+  }
+  return err('Agent-bound key cannot commit another agent decision', 403);
+}
+
 function hasAnyScope(ctx: RequestContext, scopes: ApiKeyScope[]): boolean {
   const granted = ctx.scopes || ['full'];
   return granted.includes('full') || scopes.some((scope) => granted.includes(scope));
@@ -286,6 +312,8 @@ router.post('/v1/agent/think', async (request: IRequest, env: Env) => {
 
     if (previousDecisionId && previousOutcome !== null && previousSuccess !== null) {
       try {
+        const scopedDecisionError = await forbidForeignDecisionForBoundAgent(env.DB, ctx, previousDecisionId);
+        if (scopedDecisionError) return scopedDecisionError;
         const commitResult = await workflow.after(
           {
             decision_id: previousDecisionId,
@@ -797,6 +825,9 @@ router.post('/v1/agent/commit', async (request: IRequest, env: Env) => {
     if (cachedCommit) {
       return json({ ...cachedCommit, decision_id: String(body.decision_id), deduped: true });
     }
+
+    const scopedDecisionError = await forbidForeignDecisionForBoundAgent(env.DB, ctx, String(body.decision_id));
+    if (scopedDecisionError) return scopedDecisionError;
 
     autoLogDecision({
       db: env.DB,

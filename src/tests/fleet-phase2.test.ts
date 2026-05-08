@@ -55,6 +55,30 @@ describe('Fleet moat phase 2', () => {
     ).run();
   }
 
+  async function seedOpenDecision(id: string, type: string, agentId = 'jarvis', action = `${type} production worker`, outcome = '') {
+    const ts = new Date().toISOString();
+    await db.prepare(`
+      INSERT INTO decisions
+        (id, account_id, decision_type, context, outcome, confidence, visibility,
+         outcome_success, outcome_recorded_at, session_id, agent_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      id,
+      REAL_ACCOUNT_ID,
+      type,
+      JSON.stringify({ action }),
+      outcome,
+      0.82,
+      'private',
+      null,
+      null,
+      `${agentId}-session`,
+      agentId,
+      ts,
+      ts,
+    ).run();
+  }
+
   async function bindPrimaryKeyToAgents(agentIds: string[]) {
     await db.prepare('UPDATE api_keys SET agent_ids = ? WHERE account_id = ?')
       .bind(agentIds.join(','), REAL_ACCOUNT_ID)
@@ -250,5 +274,51 @@ describe('Fleet moat phase 2', () => {
     const gateBody = await gate.json() as any;
     expect(gate.status).toBe(200);
     expect(gateBody.data.agent_id).toBe('jarvis');
+  });
+
+  it('blocks agent-bound outcome commits for other agents and keeps auto-learned lessons private/categorical', async () => {
+    await seedOpenDecision('barvis-open', 'audit', 'barvis', 'audit private-project-alpha', 'private barvis outcome');
+    await seedOpenDecision('jarvis-open', 'deploy', 'jarvis', 'deploy private-project-beta', 'private jarvis outcome');
+    await bindPrimaryKeyToAgents(['jarvis']);
+
+    const foreignWorkflowCommit = await authedFetch('/v1/workflow/after', {
+      method: 'POST',
+      body: JSON.stringify({
+        decision_id: 'barvis-open',
+        success: true,
+        outcome: 'barvis private outcome should not be writable',
+      }),
+    });
+    expect(foreignWorkflowCommit.status).toBe(403);
+
+    const foreignAgentCommit = await authedFetch('/v1/agent/commit', {
+      method: 'POST',
+      body: JSON.stringify({
+        decision_id: 'barvis-open',
+        success: true,
+        outcome: 'barvis private outcome should not be writable',
+      }),
+    });
+    expect(foreignAgentCommit.status).toBe(403);
+
+    const ownCommit = await authedFetch('/v1/workflow/after', {
+      method: 'POST',
+      body: JSON.stringify({
+        decision_id: 'jarvis-open',
+        success: false,
+        outcome: 'private-project-beta stack trace must not become lesson text',
+      }),
+    });
+    const ownBody = await ownCommit.json() as any;
+    expect(ownCommit.status).toBe(200);
+    expect(ownBody.data.fleet_lesson).toBeTruthy();
+    expect(ownBody.data.fleet_lesson.visibility).toBe('private');
+    expect(JSON.stringify(ownBody)).not.toContain('private-project-beta');
+    expect(ownBody.data.fleet_lesson.summary).toContain('Failed deploy outcome recorded');
+
+    const lessons = await authedFetch('/v1/fleet/lessons?query=deploy');
+    const lessonsBody = await lessons.json() as any;
+    expect(lessons.status).toBe(200);
+    expect(JSON.stringify(lessonsBody)).not.toContain('private-project-beta');
   });
 });

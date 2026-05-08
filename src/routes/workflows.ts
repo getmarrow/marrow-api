@@ -27,6 +27,26 @@ function scopedHeaderAgent(ctx: RequestContext, headerAgent: string | null): str
   return bound[0] || null;
 }
 
+async function forbidForeignDecisionForBoundAgent(
+  db: D1Database,
+  ctx: RequestContext,
+  decisionId: string,
+): Promise<Response | null> {
+  const bound = boundAgentIds(ctx);
+  if (!bound) return null;
+  const row = await db.prepare(`
+    SELECT agent_id, session_id
+    FROM decisions
+    WHERE account_id = ? AND id = ?
+    LIMIT 1
+  `).bind(ctx.account_id, decisionId).first<{ agent_id: string | null; session_id: string | null }>();
+  if (!row) return fail('NOT_FOUND', 'Decision not found or unauthorized', 404);
+  if ((row.agent_id && bound.includes(row.agent_id)) || (row.session_id && bound.includes(row.session_id))) {
+    return null;
+  }
+  return fail('FORBIDDEN', 'Agent-bound key cannot commit another agent decision', 403);
+}
+
 function actionQualityError(result: Exclude<ReturnType<typeof validateActionQuality>, { valid: true }>): Response {
   return new Response(JSON.stringify({
     error: result.code,
@@ -295,6 +315,8 @@ router.post('/v1/workflow/after', authRoute(async (request: IRequest, env: Env, 
 
   const workflowAfterAgentId = scopedHeaderAgent(ctx, request.headers.get('X-Marrow-Agent-Id'));
   const services = getServices(env);
+  const scopedDecisionError = await forbidForeignDecisionForBoundAgent(env.DB, ctx, String(body.decision_id || ''));
+  if (scopedDecisionError) return scopedDecisionError;
   const result = await services.workflow.after({
     decision_id: String(body.decision_id || ''),
     success: Boolean(body.success),
@@ -304,7 +326,7 @@ router.post('/v1/workflow/after', authRoute(async (request: IRequest, env: Env, 
   }, ctx.account_id);
 
   const response: Record<string, unknown> = { ...result };
-  const lesson = await services.fleetLearning.learnFromDecision(ctx.account_id, String(body.decision_id || '')).catch(() => null);
+  const lesson = await services.fleetLearning.learnFromDecision(ctx.account_id, String(body.decision_id || ''), boundAgentIds(ctx)).catch(() => null);
   if (lesson) response.fleet_lesson = lesson;
   if (!qualityResult.valid && !strictQualityMode) {
     response.warnings = [actionQualityWarning(qualityResult)];

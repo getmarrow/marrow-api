@@ -190,7 +190,7 @@ export class FleetLearningService {
     return lesson;
   }
 
-  async learnFromDecision(accountId: string, decisionId: string): Promise<FleetLesson | null> {
+  async learnFromDecision(accountId: string, decisionId: string, accessAgentIds?: string[] | null): Promise<FleetLesson | null> {
     const row = await this.db.prepare(`
       SELECT id, decision_type, context, outcome, confidence, outcome_success, agent_id, session_id, created_at
       FROM decisions
@@ -199,26 +199,33 @@ export class FleetLearningService {
     `).bind(accountId, decisionId).first<DecisionOutcomeRow>();
 
     if (!row || row.outcome_success === null || row.outcome_success === undefined) return null;
+    if (!this.canAccessAgentRow(row.agent_id || row.session_id, accessAgentIds || null)) return null;
 
     const existing = await this.db.prepare(`
       SELECT id FROM fleet_lessons
       WHERE account_id = ? AND source_decision_id = ?
       LIMIT 1
     `).bind(accountId, decisionId).first<{ id: string }>();
-    if (existing?.id) return this.getLesson(accountId, existing.id);
+    if (existing?.id) {
+      const lesson = await this.getLesson(accountId, existing.id);
+      return lesson && this.canAccessLesson(lesson, accessAgentIds || null) ? lesson : null;
+    }
 
     const success = Number(row.outcome_success) === 1;
-    const action = this.extractAction(row.context);
+    const decisionType = this.sanitizeText(row.decision_type || 'decision', 80) || 'decision';
     return this.recordLesson(accountId, {
       source_decision_id: row.id,
       agent_id: row.agent_id || row.session_id,
       lesson_type: success ? 'success' : 'failure',
-      title: `${success ? 'Reuse' : 'Avoid'} ${this.sanitizeText(row.decision_type || 'decision', 80)} pattern`,
-      summary: this.sanitizeText(row.outcome || (success ? 'Successful outcome recorded.' : 'Failed outcome recorded.'), 1000),
-      action_pattern: action || row.decision_type,
+      title: `${success ? 'Reuse' : 'Review'} ${decisionType} pattern`,
+      summary: success
+        ? `Successful ${decisionType} outcome recorded. Reuse this pattern only after matching checks pass.`
+        : `Failed ${decisionType} outcome recorded. Review this pattern before similar work.`,
+      action_pattern: decisionType,
       outcome_success: success,
       confidence: row.confidence,
-      tags: [row.decision_type, success ? 'worked' : 'failed'],
+      visibility: 'private',
+      tags: [decisionType, success ? 'worked' : 'failed', 'auto-learned'],
     });
   }
 
