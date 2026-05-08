@@ -121,6 +121,34 @@ describe('Fleet moat phase 2', () => {
     expect(body.data.deployment_playbooks.length).toBeGreaterThan(0);
   });
 
+  it('redacts token-shaped values before persisting workflow gate actions', async () => {
+    const tokenTail = 'abcdefghijklmnopqrstuvwxyz1234567890';
+    const githubToken = `ghp_${tokenTail}`;
+    const marrowToken = `mrw_live_${tokenTail}`;
+    const openAiToken = `sk-${tokenTail}`;
+    const fakeNpmToken = `npm_${tokenTail}`;
+    const gate = await authedFetch('/v1/workflow/gate', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: `rotate --token ${githubToken} and MARROW_API_KEY=${marrowToken}`,
+        context: {
+          authorization: `Bearer ${openAiToken}`,
+          nested: { npmToken: fakeNpmToken },
+        },
+        risk_tolerance: 'high',
+      }),
+    });
+    const body = await gate.json() as any;
+    expect(gate.status).toBe(200);
+    expect(JSON.stringify(body)).not.toContain('abcdefghijklmnopqrstuvwxyz1234567890');
+
+    const stored = await db.prepare('SELECT action FROM risk_gate_events WHERE id = ?')
+      .bind(body.data.gate_event_id)
+      .first<{ action: string }>();
+    expect(stored?.action).toContain('[redacted]');
+    expect(stored?.action).not.toContain('abcdefghijklmnopqrstuvwxyz1234567890');
+  });
+
   it('tracks handoffs, deployment memory, permissions, and agent performance', async () => {
     await seedDecision('deploy-ok', 'deploy', 1);
     await seedDecision('audit-fail', 'audit', 0, 'barvis');

@@ -751,7 +751,11 @@ export class FleetLearningService {
 
   private sanitizeText(value: string, maxLength: number): string {
     return String(value || '')
+      .replace(/(\B--(?:password|pass|secret|api-key|apikey|token|auth|access-token|client-secret|private-key|key)=)([^\s"'`]+|"[^"]*"|'[^']*')/gi, '$1[redacted]')
+      .replace(/(\B--(?:password|pass|secret|api-key|apikey|token|auth|access-token|client-secret|private-key|key)\s+)([^\s"'`]+|"[^"]*"|'[^']*')/gi, '$1[redacted]')
       .replace(/\b(?:mrw|sk|ghp|github_pat|npm)_[A-Za-z0-9_./-]{12,}\b/g, '[redacted]')
+      .replace(/\bcfut_[A-Za-z0-9_-]{12,}\b/g, '[redacted]')
+      .replace(/\b[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}\b/g, '[redacted]')
       .replace(/\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{12,}\b/gi, '[redacted-auth]')
       .replace(/\b(?:api[_-]?key|token|secret|password|passwd|pwd|authorization)\s*[:=]\s*["']?[^"'\s,;]{8,}/gi, '[redacted-secret]')
       .replace(/\b[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{12,}\b/g, '[redacted-jwt]')
