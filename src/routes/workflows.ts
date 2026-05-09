@@ -201,7 +201,7 @@ function evaluateGate(input: {
 
 export const router = Router();
 
-router.post('/v1/workflow/gate', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
+async function handleWorkflowGate(request: IRequest, env: Env, ctx: RequestContext): Promise<Response> {
   const rlAllowed = await checkRateLimit(env.DB, `workflow_gate:${ctx.account_id}`, 120, 60 * 1000);
   if (!rlAllowed) return fail('RATE_LIMITED', 'Rate limited', 429);
 
@@ -272,7 +272,10 @@ router.post('/v1/workflow/gate', authRoute(async (request: IRequest, env: Env, c
       recommended_endpoint: result.allow ? '/v1/workflow/before' : null,
     },
   });
-}));
+}
+
+router.post('/v1/workflow/gate', authRoute(handleWorkflowGate));
+router.post('/v1/workflows/gate', authRoute(handleWorkflowGate));
 
 router.post('/v1/workflow/before', authRoute(async (request: IRequest, env: Env, ctx: RequestContext) => {
   const body = await request.json() as Record<string, unknown>;

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import worker from '../index';
 import { createMockD1, REAL_API_KEY, TEST_ENCRYPTION_KEY } from './helpers';
+import { sha256 } from '../utils/crypto';
 
 describe('Route extraction wiring', () => {
   let db: D1Database;
@@ -35,6 +36,15 @@ describe('Route extraction wiring', () => {
   async function authedFetch(path: string, init: RequestInit = {}) {
     const headers = new Headers(init.headers || {});
     headers.set('Authorization', `Bearer ${REAL_API_KEY}`);
+    if (init.body && !headers.has('Content-Type')) {
+      headers.set('Content-Type', 'application/json');
+    }
+    return apiFetch(path, { ...init, headers });
+  }
+
+  async function authedFetchWithKey(path: string, apiKey: string, init: RequestInit = {}) {
+    const headers = new Headers(init.headers || {});
+    headers.set('Authorization', `Bearer ${apiKey}`);
     if (init.body && !headers.has('Content-Type')) {
       headers.set('Content-Type', 'application/json');
     }
@@ -241,6 +251,165 @@ describe('Route extraction wiring', () => {
     expect(body.data.next_action).toBe('npx @getmarrow/install --yes');
     expect(body.data.recommended_fix).toContain('Missing hook: outcomes');
     expect(body.data.auto_outcome_closure.state).toBe('needs_hook');
+  });
+
+  it('returns one-call runtime guidance with proof-pack enforcement', async () => {
+    const ts = new Date().toISOString();
+    await db.prepare(`
+      INSERT INTO workflow_templates
+        (id, name, slug, description, industry, category, author, steps, install_count, avg_success_rate, tags, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      'tpl-runtime-deploy',
+      'Runtime Deploy',
+      'runtime-deploy',
+      'Deploy safely with tests, rollback, and smoke checks.',
+      'software',
+      'deploy',
+      'system',
+      JSON.stringify([{ step: 1, name: 'Dry run', description: 'Run dry-run.' }]),
+      1,
+      0.9,
+      JSON.stringify(['deploy', 'production']),
+      ts,
+      ts,
+    ).run();
+
+    const res = await authedFetch('/v1/agent/runtime', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'Deploy production API after tests and smoke checks',
+        type: 'deploy',
+        role: 'deploy',
+        surfaces: ['github', 'cloudflare', 'production'],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.data.status).toBeTruthy();
+    expect(body.data.decision_brief.workflow.recommended).toBe('safe-deploy-publish');
+    expect(body.data.risk_gate.decision).toBe('review_required');
+    expect(body.data.proof_pack.required).toBe(true);
+    expect(body.data.proof_pack.enforced).toBe(true);
+    expect(body.data.proof_pack.missing).toContain('rollback_target');
+    expect(body.data.exact_next_action).toContain('Collect proof fields');
+    expect(body.data.template_suggestion.matched).toBe(true);
+  });
+
+  it('redacts legacy uuid-format Marrow keys from runtime responses', async () => {
+    const leakedKey = 'mrw_123e4567-e89b-12d3-a456-426614174000_abcdefabcdefabcdefabcdefabcdefab';
+    const res = await authedFetch('/v1/agent/runtime', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: `Deploy production API with ${leakedKey} and https://example.com/deploy?token=secret-value`,
+        type: 'deploy',
+        surfaces: ['production', 'github'],
+        context: { nested: { token: leakedKey, url: `https://example.com/path?key=${leakedKey}` } },
+        proof: { summary: `checked ${leakedKey}`, checks: ['unit'], outcome: 'pending' },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain(leakedKey);
+    expect(text).not.toContain('secret-value');
+    expect(text).toContain('[REDACTED_MARROW_KEY]');
+  });
+
+  it('redacts oauth and signed-url query secrets from runtime responses', async () => {
+    const res = await authedFetch('/v1/agent/runtime', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'Review https://example.com/callback?code=oauthsecret123&X-Amz-Signature=signedsecret456&safe=ok',
+        type: 'audit',
+        context: {
+          url: 'https://storage.example.com/object?X-Amz-Credential=credentialsecret789&X-Amz-Security-Token=sessionsecret123&key_id=keysecret789',
+        },
+        proof: {
+          summary: 'Checked https://example.com?authorization_code=authsecret123&client_secret=clientsecret456&key-id=keydashsecret123',
+        },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain('oauthsecret123');
+    expect(text).not.toContain('signedsecret456');
+    expect(text).not.toContain('credentialsecret789');
+    expect(text).not.toContain('sessionsecret123');
+    expect(text).not.toContain('authsecret123');
+    expect(text).not.toContain('clientsecret456');
+    expect(text).not.toContain('keysecret789');
+    expect(text).not.toContain('keydashsecret123');
+    expect(text).toContain('safe=ok');
+  });
+
+  it('scopes runtime and status telemetry for agent-bound keys', async () => {
+    const ts = new Date().toISOString();
+    const boundKey = 'mrw_123e4567-e89b-12d3-a456-426614174000_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    await db.prepare(`
+      INSERT INTO api_keys
+        (id, account_id, key_hash, status, created_at, scopes, key_type, agent_ids)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      'key-agent-a',
+      'empirebuu',
+      await sha256(boundKey),
+      'active',
+      ts,
+      JSON.stringify(['decisions:read', 'decisions:write']),
+      'live',
+      JSON.stringify(['agent-a']),
+    ).run();
+
+    for (const [id, agentId] of [['decision-agent-a', 'agent-a'], ['decision-agent-b', 'agent-b']]) {
+      await db.prepare(`
+        INSERT INTO decisions
+          (id, account_id, agent_id, decision_type, context, outcome, confidence, outcome_success, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        id,
+        'empirebuu',
+        agentId,
+        'deploy',
+        `status ${agentId}`,
+        'done',
+        0.9,
+        1,
+        ts,
+        ts,
+      ).run();
+    }
+
+    const status = await authedFetchWithKey('/v1/agent/status', boundKey);
+    expect(status.status).toBe(200);
+    const statusBody = await status.json() as any;
+    expect(statusBody.data.decision_count).toBe(1);
+    expect(statusBody.data.outcome_count).toBe(1);
+    expect(statusBody.data.proof.scoped_to_bound_agent).toBe(true);
+
+    const runtime = await authedFetchWithKey('/v1/agent/runtime', boundKey, {
+      method: 'POST',
+      body: JSON.stringify({ action: 'Check deployment status', agent_id: 'agent-a' }),
+    });
+    expect(runtime.status).toBe(200);
+    const runtimeBody = await runtime.json() as any;
+    expect(runtimeBody.data.status.decision_count).toBe(1);
+    expect(runtimeBody.data.status.outcome_count).toBe(1);
+
+    const forbidden = await authedFetchWithKey('/v1/agent/runtime', boundKey, {
+      method: 'POST',
+      body: JSON.stringify({ action: 'Check another agent', agent_id: 'agent-b' }),
+    });
+    expect(forbidden.status).toBe(403);
+  });
+
+  it('supports plural workflow gate alias for agent ergonomics', async () => {
+    const res = await authedFetch('/v1/workflows/gate', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'Deploy production worker safely' }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.data.risk_level).toBe('high');
   });
 
   it('keeps selected public utility routes unauthenticated', async () => {

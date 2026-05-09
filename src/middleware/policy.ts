@@ -23,6 +23,9 @@ export function getRequiredScopes(path: string, method: string): ApiKeyScope[] |
   if (path === '/v1/memories/import') return method === 'GET' ? ['memories:read'] : ['memories:import', 'memories:write'];
   if (path === '/v1/memories/export' || path === '/v1/memories/retrieve') return ['memories:read', 'memories:export'];
   if (path.startsWith('/v1/memories')) return method === 'GET' ? ['memories:read'] : ['memories:write'];
+  if (path === '/v1/agent/status') return ['decisions:read'];
+  if (path === '/v1/agent/runtime') return method === 'GET' ? ['decisions:read'] : ['decisions:read', 'decisions:write'];
+  if (path === '/v1/workflow/gate' || path === '/v1/workflows/gate') return ['decisions:write'];
   if (path === '/v1/agent/think' || path === '/v1/agent/commit' || path === '/v1/agent/nudge' || path.startsWith('/v1/decisions') || path.startsWith('/decisions')) {
     return method === 'GET' ? ['decisions:read'] : ['decisions:write'];
   }

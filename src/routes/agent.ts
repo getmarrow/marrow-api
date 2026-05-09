@@ -22,13 +22,43 @@ import { safely } from '../utils/safely';
 import { getServices, type Services } from '../lib/services';
 
 const MARROW_API_VERSION = '2026.03.29';
-const MARROW_SDK_LATEST = '3.7.19';
-const MARROW_MCP_LATEST = '3.9.20';
+const MARROW_SDK_LATEST = '3.7.20';
+const MARROW_MCP_LATEST = '3.9.21';
 const MARROW_INSTALL_COMMAND = 'npx @getmarrow/install --yes';
 const MARROW_DOCTOR_COMMAND = 'npx @getmarrow/install doctor';
 const MARROW_MCP_SETUP_COMMAND = 'npx @getmarrow/mcp setup';
 const MARROW_SDK_INSTALL_COMMAND = 'npm install @getmarrow/sdk';
 const MARROW_SDK_RUNTIME_COMMAND = "const marrow = new MarrowClient(process.env.MARROW_API_KEY); const runtime = marrow.createPassiveRuntime(); runtime.install();";
+
+function redactSensitiveText(value: string): string {
+  return value
+    .replace(/(\B--(?:password|pass|secret|api-key|apikey|token|auth|access-token|client-secret|private-key|key)=)([^\s"'`]+|"[^"]*"|'[^']*')/gi, '$1[REDACTED]')
+    .replace(/(\B--(?:password|pass|secret|api-key|apikey|token|auth|access-token|client-secret|private-key|key)\s+)([^\s"'`]+|"[^"]*"|'[^']*')/gi, '$1[REDACTED]')
+    .replace(/\b(Bearer|Token|ApiKey|API_KEY|MARROW_API_KEY|MARROW_KEY)\s+[\w.\-+/=]{12,}\b/gi, '$1 [REDACTED]')
+    .replace(/\b([A-Z0-9_]*(?:SECRET|TOKEN|API[_-]?KEY|CREDENTIAL|PASSWORD|PRIVATE[_-]?KEY)[A-Z0-9_]*)\s*[:=]\s*['"]?[^'"\s,;]{6,}/gi, '$1=[REDACTED]')
+    .replace(/\bmrw_(?:live|test)_[A-Za-z0-9_\-]{8,}\b/g, '[REDACTED_MARROW_KEY]')
+    .replace(/\bmrw_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_[A-Fa-f0-9]{16,}\b/gi, '[REDACTED_MARROW_KEY]')
+    .replace(/\b(?:sk|pk|ghp|github_pat|npm|cfut)_[A-Za-z0-9_\-]{12,}\b/g, '[REDACTED_TOKEN]')
+    .replace(/([?&])([^=&#\s]*(?:code|token|secret|signature|sig|credential|password|session|auth|api[_-]?key|apikey|client[_-]?secret|(?:^|[-_])key|key(?:[-_]|$))[^=&#\s]*=)[^&#\s]*/gi, '$1$2[redacted]')
+    .replace(/([?&](?:token|key|secret|password|auth|signature|sig|session)=)[^&#\s]*/gi, '$1[redacted]');
+}
+
+function redactSensitiveValue(value: unknown, depth = 0): unknown {
+  if (depth > 4) return '[redacted-depth]';
+  if (typeof value === 'string') return redactSensitiveText(value);
+  if (typeof value === 'number' || typeof value === 'boolean' || value == null) return value;
+  if (Array.isArray(value)) return value.slice(0, 20).map((item) => redactSensitiveValue(item, depth + 1));
+  if (typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>).slice(0, 40)) {
+      out[key] = /(?:secret|token|api[_-]?key|password|credential|authorization|private[_-]?key)/i.test(key)
+        ? '[redacted]'
+        : redactSensitiveValue(item, depth + 1);
+    }
+    return out;
+  }
+  return String(value);
+}
 
 function json<T>(data: T, status = 200, headers?: Record<string, string>): Response {
   return new Response(JSON.stringify({ data }), {
@@ -105,6 +135,9 @@ function getRequiredScopes(path: string, method: string): ApiKeyScope[] | 'full'
   if (path === '/v1/memories/import') return method === 'GET' ? ['memories:read'] : ['memories:import', 'memories:write'];
   if (path === '/v1/memories/export' || path === '/v1/memories/retrieve') return ['memories:read', 'memories:export'];
   if (path.startsWith('/v1/memories')) return method === 'GET' ? ['memories:read'] : ['memories:write'];
+  if (path === '/v1/agent/status') return ['decisions:read'];
+  if (path === '/v1/agent/runtime') return method === 'GET' ? ['decisions:read'] : ['decisions:read', 'decisions:write'];
+  if (path === '/v1/workflow/gate' || path === '/v1/workflows/gate') return ['decisions:write'];
   if (path === '/v1/agent/think' || path === '/v1/agent/commit' || path === '/v1/agent/nudge' || path.startsWith('/v1/decisions') || path.startsWith('/decisions')) {
     return method === 'GET' ? ['decisions:read'] : ['decisions:write'];
   }
@@ -1117,6 +1150,366 @@ router.get('/v1/agent/nudge', async (request: IRequest, env: Env) => {
   }
 });
 
+function parseRuntimeSurfaces(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((surface): surface is string => typeof surface === 'string')
+    .map((surface) => surface.trim().toLowerCase())
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+function inferRuntimeType(action: string, explicitType: unknown): string {
+  if (typeof explicitType === 'string' && explicitType.trim()) return explicitType.trim().slice(0, 64);
+  if (/\b(deploy|release|publish|npm|cloudflare|production|prod)\b/i.test(action)) return 'deploy';
+  if (/\b(merge|pull request|pr|github)\b/i.test(action)) return 'merge';
+  if (/\b(secret|token|key|credential|rotate|revoke)\b/i.test(action)) return 'security';
+  return 'general';
+}
+
+function requiredProofFields(input: { action: string; type: string; surfaces: string[]; riskLevel: string }): string[] {
+  const text = `${input.action} ${input.type} ${input.surfaces.join(' ')}`.toLowerCase();
+  const fields = new Set(['summary', 'checks', 'outcome']);
+  const highRisk = input.riskLevel === 'high' || /\b(production|prod|deploy|publish|merge|migration|secret|token|key|security|cloudflare|npm|github)\b/.test(text);
+  if (highRisk) {
+    ['blockers', 'commits_prs_shas', 'rollback_target', 'handoff_result_file'].forEach((field) => fields.add(field));
+  }
+  if (/\b(deploy|cloudflare|worker|pages|production|prod)\b/.test(text)) fields.add('deployment_and_smoke');
+  if (/\b(npm|publish|package|registry)\b/.test(text)) fields.add('package_versions');
+  if (/\b(secret|token|key|credential|security|audit|rotate|revoke)\b/.test(text)) fields.add('security_scan');
+  return Array.from(fields);
+}
+
+function buildProofPack(input: {
+  action: string;
+  type: string;
+  surfaces: string[];
+  riskLevel: string;
+  proof: Record<string, unknown>;
+}) {
+  const fields = requiredProofFields(input);
+  const missing = fields.filter((field) => {
+    const value = input.proof[field];
+    if (Array.isArray(value)) return value.length === 0;
+    return value === undefined || value === null || String(value).trim() === '';
+  });
+  const required = fields.length > 3 || input.riskLevel === 'high';
+  return {
+    required,
+    enforced: required,
+    fields,
+    missing,
+    complete: missing.length === 0,
+    commit_endpoint: '/v1/agent/commit',
+    rule: required
+      ? 'Do not mark this action complete until every required proof field is present and the outcome is committed.'
+      : 'Commit a concise outcome when the action completes.',
+  };
+}
+
+function scopedDecisionWhere(ctx: RequestContext): { clause: string; params: string[] } {
+  const bound = boundAgentIds(ctx);
+  if (!bound || bound.length === 0) return { clause: '', params: [] };
+  const parts: string[] = [];
+  const params: string[] = [];
+  for (const id of bound) {
+    parts.push('agent_id = ?');
+    params.push(id);
+    parts.push('session_id = ?');
+    params.push(id);
+  }
+  return { clause: ` AND (${parts.join(' OR ')})`, params };
+}
+
+async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
+  const scope = scopedDecisionWhere(ctx);
+  const [row, allRow, firstEventRow, lastEventRow, recentRow] = await Promise.all([
+    env.DB.prepare(`
+      SELECT COUNT(*) as total,
+             SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) as succ,
+             SUM(CASE WHEN outcome_success = 0 THEN 1 ELSE 0 END) as fail
+      FROM decisions
+      WHERE account_id = ? AND outcome_success IS NOT NULL${scope.clause}
+    `).bind(ctx.account_id, ...scope.params).first<{ total: number; succ: number; fail: number }>(),
+    env.DB.prepare(`SELECT COUNT(*) as total FROM decisions WHERE account_id = ?${scope.clause}`).bind(ctx.account_id, ...scope.params).first<{ total: number }>(),
+    env.DB.prepare(`SELECT created_at FROM decisions WHERE account_id = ?${scope.clause} ORDER BY created_at ASC LIMIT 1`).bind(ctx.account_id, ...scope.params).first<{ created_at: string }>(),
+    env.DB.prepare(`SELECT created_at FROM decisions WHERE account_id = ?${scope.clause} ORDER BY created_at DESC LIMIT 1`).bind(ctx.account_id, ...scope.params).first<{ created_at: string }>(),
+    env.DB.prepare(`SELECT COUNT(*) as total FROM decisions WHERE account_id = ? AND created_at >= datetime('now', '-24 hours')${scope.clause}`).bind(ctx.account_id, ...scope.params).first<{ total: number }>(),
+  ]);
+
+  const allDecisions = allRow?.total || 0;
+  const succ = row?.succ || 0;
+  const fail = row?.fail || 0;
+  const outcomes = row?.total || 0;
+  const successRate = (succ + fail) > 0 ? succ / (succ + fail) : null;
+  const outcomeCoverage = allDecisions > 0 ? outcomes / allDecisions : 0;
+  const recentDecisions = recentRow?.total || 0;
+  const firstEventAt = firstEventRow?.created_at || null;
+  const lastEventAt = lastEventRow?.created_at || null;
+  const enabled = allDecisions > 0;
+  const missedHooks: string[] = [];
+  if (!enabled) missedHooks.push('decisions');
+  if (enabled && outcomeCoverage < 0.35) missedHooks.push('outcomes');
+  if (enabled && recentDecisions === 0) missedHooks.push('recent_activity');
+
+  const fixCommands = missedHooks.includes('decisions')
+    ? [MARROW_INSTALL_COMMAND, MARROW_DOCTOR_COMMAND]
+    : missedHooks.includes('outcomes')
+    ? [MARROW_INSTALL_COMMAND, MARROW_MCP_SETUP_COMMAND, MARROW_SDK_INSTALL_COMMAND]
+    : missedHooks.includes('recent_activity')
+    ? [MARROW_DOCTOR_COMMAND]
+    : [];
+  const recommendedFix = !enabled
+    ? `Install MCP hooks or SDK passive runtime, then run a Marrow self-test. Run: ${MARROW_INSTALL_COMMAND}`
+    : outcomeCoverage < 0.35
+    ? `Outcome capture is low. Missing hook: outcomes. Run: ${MARROW_INSTALL_COMMAND}. MCP-only fix: ${MARROW_MCP_SETUP_COMMAND}. SDK fix: install createPassiveRuntime() and wrap command/tool/deploy/publish calls.`
+    : recentDecisions === 0
+    ? `Marrow is configured but has no recent events. Run: ${MARROW_DOCTOR_COMMAND}, then verify the active agent has MARROW_API_KEY.`
+    : null;
+  const health = !enabled || missedHooks.length > 0 || fail > succ * 0.5 ? 'degraded' : 'healthy';
+  const hookStatus = {
+    decisions: {
+      state: enabled ? 'detected' : 'missing',
+      missing: !enabled,
+      fix_command: MARROW_INSTALL_COMMAND,
+      detail: enabled
+        ? 'Marrow is receiving decision events.'
+        : 'No decision events have been logged for this account or agent scope yet.',
+    },
+    outcomes: {
+      state: !enabled ? 'unknown' : outcomeCoverage >= 0.35 ? 'detected' : 'missing',
+      missing: enabled && outcomeCoverage < 0.35,
+      coverage: outcomeCoverage,
+      fix_command: MARROW_INSTALL_COMMAND,
+      sdk_fix_command: MARROW_SDK_INSTALL_COMMAND,
+      sdk_fix_snippet: MARROW_SDK_RUNTIME_COMMAND,
+      mcp_fix_command: MARROW_MCP_SETUP_COMMAND,
+      detail: !enabled
+        ? 'Outcome coverage is unknown until at least one decision is logged.'
+        : outcomeCoverage < 0.35
+        ? 'Outcome closure is low. Enable PostToolUse hooks or SDK passive runtime wrappers so tool, command, deploy, and publish actions auto-commit success/failure.'
+        : 'Outcomes are being captured for recent passive actions.',
+    },
+    recent_activity: {
+      state: !enabled ? 'unknown' : recentDecisions > 0 ? 'detected' : 'missing',
+      missing: enabled && recentDecisions === 0,
+      fix_command: MARROW_DOCTOR_COMMAND,
+      detail: enabled && recentDecisions === 0
+        ? 'Marrow has history but no events in the last 24 hours for this account or agent scope.'
+        : 'Recent activity is present or not applicable yet.',
+    },
+    tools: {
+      state: outcomeCoverage > 0 ? 'detected' : 'unknown',
+      missing: false,
+      fix_command: MARROW_MCP_SETUP_COMMAND,
+      detail: 'Tool capture is inferred from outcome-bearing passive events.',
+    },
+    commands: {
+      state: outcomeCoverage > 0 ? 'detected' : 'unknown',
+      missing: false,
+      fix_command: MARROW_SDK_INSTALL_COMMAND,
+      sdk_fix_snippet: MARROW_SDK_RUNTIME_COMMAND,
+      detail: 'Command capture is available through SDK passive runtime command wrappers and MCP PostToolUse hooks.',
+    },
+    deploys: {
+      state: 'unknown',
+      missing: false,
+      fix_command: MARROW_SDK_INSTALL_COMMAND,
+      sdk_fix_snippet: MARROW_SDK_RUNTIME_COMMAND,
+      detail: 'Deploy capture is available through runtime.deploy(), runtime.command(), or MCP PostToolUse hooks.',
+    },
+    publishes: {
+      state: 'unknown',
+      missing: false,
+      fix_command: MARROW_SDK_INSTALL_COMMAND,
+      sdk_fix_snippet: MARROW_SDK_RUNTIME_COMMAND,
+      detail: 'Publish capture is available through runtime.publish(), runtime.command(), or MCP PostToolUse hooks.',
+    },
+  };
+  const message = allDecisions === 0
+    ? 'Marrow is reachable, but no passive decisions have been logged yet.'
+    : allDecisions < 10
+    ? `Marrow is active — ${allDecisions} decision${allDecisions === 1 ? '' : 's'} logged. Keep going for stronger pattern detection.`
+    : `Marrow is active — ${allDecisions} decisions tracked. Outcome coverage: ${Math.round(outcomeCoverage * 100)}%.`;
+
+  return {
+    ok: true,
+    enabled,
+    health,
+    message,
+    has_memory: allDecisions > 0,
+    low_history: allDecisions < 10,
+    decision_count: allDecisions,
+    outcome_count: outcomes,
+    success_rate: successRate,
+    first_event_at: firstEventAt,
+    last_event_at: lastEventAt,
+    recent_decisions_24h: recentDecisions,
+    capture_coverage: {
+      decisions: enabled,
+      outcomes: outcomeCoverage,
+      tools: outcomeCoverage > 0 ? 'detected' : 'unknown',
+      commands: outcomeCoverage > 0 ? 'detected' : 'unknown',
+      deploys: 'unknown',
+      publishes: 'unknown',
+    },
+    missed_hooks: missedHooks,
+    hook_status: hookStatus,
+    recommended_fix: recommendedFix,
+    fix_commands: fixCommands,
+    next_action: fixCommands[0] || null,
+    auto_outcome_closure: {
+      enabled: enabled && outcomeCoverage >= 0.35,
+      state: !enabled ? 'inactive' : outcomeCoverage >= 0.35 ? 'active' : 'needs_hook',
+      coverage: outcomeCoverage,
+      expectation: 'Every captured tool, command, deploy, and publish action should auto-commit success or failure through MCP PostToolUse hooks or SDK passive runtime wrappers.',
+    },
+    proof: {
+      raw_data_exposed: false,
+      scoped_to_bound_agent: Boolean(boundAgentIds(ctx)),
+      last_event_at: lastEventAt,
+      recent_decisions_24h: recentDecisions,
+    },
+  };
+}
+
+router.post('/v1/agent/runtime', async (request: IRequest, env: Env) => {
+  try {
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const ctx = authResult as RequestContext;
+
+    const rlAllowed = await checkRateLimit(env.DB, `agent_runtime:${ctx.account_id}`, 60, 60 * 1000);
+    if (!rlAllowed) return err('Rate limited', 429);
+
+    const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+    const rawAction = typeof body.action === 'string' ? body.action.trim() : '';
+    if (!rawAction) return err('action is required', 400);
+    if (rawAction.length > 1000) return err('action must be under 1000 characters', 400);
+    const action = redactSensitiveText(rawAction);
+    const redactedContext = body.context && typeof body.context === 'object' && !Array.isArray(body.context)
+      ? redactSensitiveValue(body.context) as Record<string, unknown>
+      : undefined;
+    const redactedProof = body.proof && typeof body.proof === 'object' && !Array.isArray(body.proof)
+      ? redactSensitiveValue(body.proof) as Record<string, unknown>
+      : {};
+
+    const bound = boundAgentIds(ctx);
+    const requestedAgentId = typeof body.agent_id === 'string' ? body.agent_id : null;
+    if (bound && requestedAgentId && !bound.includes(requestedAgentId)) {
+      return err('Agent-bound key cannot access another agent.', 403);
+    }
+    const agentId = requestedAgentId || bound?.[0] || ctx.agent_id || null;
+    const sessionId = typeof body.session_id === 'string'
+      ? body.session_id
+      : request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null;
+    const surfaces = parseRuntimeSurfaces(body.surfaces);
+    const type = inferRuntimeType(action, body.type);
+    const role = typeof body.role === 'string' ? body.role : type === 'deploy' ? 'deploy' : 'agent';
+    const services = getSvc(env);
+
+    const status = await buildAgentStatusPayload(env, ctx);
+    const decisionBrief = await services.valueReport.buildDecisionBrief(ctx.account_id, {
+      action,
+      type,
+      role,
+      periodDays: typeof body.period === 'number' || typeof body.period === 'string' ? Number(body.period) : undefined,
+      agentId,
+      sessionId,
+      surfaces,
+    });
+    const riskLevel = decisionBrief.risk?.level || 'low';
+    const proofPack = buildProofPack({
+      action,
+      type,
+      surfaces,
+      riskLevel,
+      proof: redactedProof,
+    });
+    const canReadShared = await services.fleetLearning.canReadSharedFleet(ctx.account_id, bound || undefined);
+    const [lessons, deploymentMemory, templateSuggestion] = await Promise.all([
+      services.fleetLearning.listLessons(ctx.account_id, {
+        query: action,
+        agent_id: canReadShared ? null : bound?.[0],
+        access_agent_ids: bound || undefined,
+        limit: 5,
+      }).catch(() => []),
+      riskLevel !== 'low'
+        ? services.fleetLearning.listDeploymentMemories(ctx.account_id, {
+          agent_id: canReadShared ? null : bound?.[0],
+          access_agent_ids: bound || undefined,
+          limit: 3,
+        }).catch(() => [])
+        : Promise.resolve([]),
+      services.templates.detectTemplate({
+        action,
+        type,
+        surfaces,
+        risk_level: riskLevel,
+        context: redactedContext,
+        limit: 3,
+      }).catch((error: unknown) => ({
+        matched: false,
+        error: error instanceof Error ? error.message : 'template detection failed',
+      })),
+    ]);
+
+    const proofIncomplete = proofPack.required && !proofPack.complete;
+    const riskGate = {
+      allow: riskLevel !== 'high' && !proofIncomplete,
+      decision: riskLevel === 'high' || proofIncomplete ? 'review_required' : riskLevel === 'medium' ? 'warn' : 'allow',
+      risk_level: riskLevel,
+      reasons: [
+        ...decisionBrief.risk.reasons.map((reason) => ({ code: reason, severity: riskLevel, message: reason })),
+        ...(proofIncomplete ? [{ code: 'proof_pack_incomplete', severity: 'high', message: 'Required proof pack fields are missing.' }] : []),
+      ],
+      policy: {
+        mode: 'agent_runtime',
+        side_effects: 'metadata_log_only',
+      },
+    };
+    const beforeYouAct = lessons.length > 0
+      ? `Before continuing, use prior lesson: ${lessons[0].lesson || lessons[0].action_pattern || lessons[0].id}`
+      : deploymentMemory.length > 0
+      ? `Before continuing, use deployment playbook: ${deploymentMemory[0].release_id || deploymentMemory[0].id}`
+      : decisionBrief.next_actions[0] || null;
+    const exactNextAction = (proofIncomplete ? `Collect proof fields: ${proofPack.missing.join(', ')}` : null)
+      || status.next_action
+      || beforeYouAct
+      || 'Proceed, then commit the outcome.';
+
+    autoLogDecision({
+      db: env.DB,
+      accountId: ctx.account_id,
+      method: request.method,
+      endpoint: '/v1/agent/runtime',
+      statusCode: 200,
+      tier: ctx.tier,
+      sessionId,
+    }).catch(() => {});
+
+    return json({
+      ok: true,
+      action,
+      agent_id: agentId,
+      session_id: sessionId,
+      status,
+      decision_brief: decisionBrief,
+      risk_gate: riskGate,
+      relevant_lessons: lessons,
+      deployment_playbooks: deploymentMemory,
+      template_suggestion: templateSuggestion,
+      proof_pack: proofPack,
+      before_you_act: beforeYouAct,
+      exact_next_action: exactNextAction,
+      auto_outcome_closure: status.auto_outcome_closure,
+    });
+  } catch (e: unknown) {
+    console.error('POST /v1/agent/runtime error:', e);
+    return err('Internal server error', 500);
+  }
+});
+
 router.get('/v1/agent/status', async (request: IRequest, env: Env) => {
   try {
     const authResult = await requireAuth(request, env);
@@ -1132,182 +1525,7 @@ router.get('/v1/agent/status', async (request: IRequest, env: Env) => {
       sessionId: request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null,
     }).catch(() => {});
 
-    const row = await env.DB.prepare(`
-      SELECT COUNT(*) as total,
-             SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) as succ,
-             SUM(CASE WHEN outcome_success = 0 THEN 1 ELSE 0 END) as fail
-      FROM decisions
-      WHERE account_id = ? AND outcome_success IS NOT NULL
-    `).bind(ctx.account_id).first<{
-      total: number;
-      succ: number;
-      fail: number;
-    }>();
-
-    const allRow = await env.DB.prepare(`
-      SELECT COUNT(*) as total
-      FROM decisions
-      WHERE account_id = ?
-    `).bind(ctx.account_id).first<{ total: number }>();
-
-    const firstEventRow = await env.DB.prepare(`
-      SELECT created_at
-      FROM decisions
-      WHERE account_id = ?
-      ORDER BY created_at ASC
-      LIMIT 1
-    `).bind(ctx.account_id).first<{ created_at: string }>();
-
-    const lastEventRow = await env.DB.prepare(`
-      SELECT created_at
-      FROM decisions
-      WHERE account_id = ?
-      ORDER BY created_at DESC
-      LIMIT 1
-    `).bind(ctx.account_id).first<{ created_at: string }>();
-
-    const recentRow = await env.DB.prepare(`
-      SELECT COUNT(*) as total
-      FROM decisions
-      WHERE account_id = ? AND created_at >= datetime('now', '-24 hours')
-    `).bind(ctx.account_id).first<{ total: number }>();
-
-    const allDecisions = allRow?.total || 0;
-    const succ = row?.succ || 0;
-    const fail = row?.fail || 0;
-    const outcomes = row?.total || 0;
-    const successRate = (succ + fail) > 0 ? succ / (succ + fail) : null;
-    const outcomeCoverage = allDecisions > 0 ? outcomes / allDecisions : 0;
-    const recentDecisions = recentRow?.total || 0;
-    const firstEventAt = firstEventRow?.created_at || null;
-    const lastEventAt = lastEventRow?.created_at || null;
-    const enabled = allDecisions > 0;
-    const missedHooks: string[] = [];
-    if (!enabled) missedHooks.push('decisions');
-    if (enabled && outcomeCoverage < 0.35) missedHooks.push('outcomes');
-    if (enabled && recentDecisions === 0) missedHooks.push('recent_activity');
-
-    const hookStatus = {
-      decisions: {
-        state: enabled ? 'detected' : 'missing',
-        missing: !enabled,
-        fix_command: MARROW_INSTALL_COMMAND,
-        detail: enabled
-          ? 'Marrow is receiving decision events.'
-          : 'No decision events have been logged for this account yet.',
-      },
-      outcomes: {
-        state: !enabled ? 'unknown' : outcomeCoverage >= 0.35 ? 'detected' : 'missing',
-        missing: enabled && outcomeCoverage < 0.35,
-        coverage: outcomeCoverage,
-        fix_command: MARROW_INSTALL_COMMAND,
-        sdk_fix_command: MARROW_SDK_INSTALL_COMMAND,
-        sdk_fix_snippet: MARROW_SDK_RUNTIME_COMMAND,
-        mcp_fix_command: MARROW_MCP_SETUP_COMMAND,
-        detail: !enabled
-          ? 'Outcome coverage is unknown until at least one decision is logged.'
-          : outcomeCoverage < 0.35
-          ? 'Outcome closure is low. Enable PostToolUse hooks or SDK passive runtime wrappers so tool, command, deploy, and publish actions auto-commit success/failure.'
-          : 'Outcomes are being captured for recent passive actions.',
-      },
-      recent_activity: {
-        state: !enabled ? 'unknown' : recentDecisions > 0 ? 'detected' : 'missing',
-        missing: enabled && recentDecisions === 0,
-        fix_command: MARROW_DOCTOR_COMMAND,
-        detail: enabled && recentDecisions === 0
-          ? 'Marrow has history but no events in the last 24 hours from this account.'
-          : 'Recent activity is present or not applicable yet.',
-      },
-      tools: {
-        state: outcomeCoverage > 0 ? 'detected' : 'unknown',
-        missing: false,
-        fix_command: MARROW_MCP_SETUP_COMMAND,
-        detail: 'Tool capture is inferred from outcome-bearing passive events.',
-      },
-      commands: {
-        state: outcomeCoverage > 0 ? 'detected' : 'unknown',
-        missing: false,
-        fix_command: MARROW_SDK_INSTALL_COMMAND,
-        sdk_fix_snippet: MARROW_SDK_RUNTIME_COMMAND,
-        detail: 'Command capture is available through SDK passive runtime command wrappers and MCP PostToolUse hooks.',
-      },
-      deploys: {
-        state: 'unknown',
-        missing: false,
-        fix_command: MARROW_SDK_INSTALL_COMMAND,
-        sdk_fix_snippet: MARROW_SDK_RUNTIME_COMMAND,
-        detail: 'Deploy capture is available through runtime.deploy(), runtime.command(), or MCP PostToolUse hooks.',
-      },
-      publishes: {
-        state: 'unknown',
-        missing: false,
-        fix_command: MARROW_SDK_INSTALL_COMMAND,
-        sdk_fix_snippet: MARROW_SDK_RUNTIME_COMMAND,
-        detail: 'Publish capture is available through runtime.publish(), runtime.command(), or MCP PostToolUse hooks.',
-      },
-    };
-
-    const fixCommands = missedHooks.includes('decisions')
-      ? [MARROW_INSTALL_COMMAND, MARROW_DOCTOR_COMMAND]
-      : missedHooks.includes('outcomes')
-      ? [MARROW_INSTALL_COMMAND, MARROW_MCP_SETUP_COMMAND, MARROW_SDK_INSTALL_COMMAND]
-      : missedHooks.includes('recent_activity')
-      ? [MARROW_DOCTOR_COMMAND]
-      : [];
-
-    const recommendedFix = !enabled
-      ? `Install MCP hooks or SDK passive runtime, then run a Marrow self-test. Run: ${MARROW_INSTALL_COMMAND}`
-      : outcomeCoverage < 0.35
-      ? `Outcome capture is low. Missing hook: outcomes. Run: ${MARROW_INSTALL_COMMAND}. MCP-only fix: ${MARROW_MCP_SETUP_COMMAND}. SDK fix: install createPassiveRuntime() and wrap command/tool/deploy/publish calls.`
-      : recentDecisions === 0
-      ? `Marrow is configured but has no recent events. Run: ${MARROW_DOCTOR_COMMAND}, then verify the active agent has MARROW_API_KEY.`
-      : null;
-
-    const health = !enabled || missedHooks.length > 0 || fail > succ * 0.5 ? 'degraded' : 'healthy';
-    const message = allDecisions === 0
-      ? 'Marrow is reachable, but no passive decisions have been logged yet.'
-      : allDecisions < 10
-      ? `Marrow is active — ${allDecisions} decision${allDecisions === 1 ? '' : 's'} logged. Keep going for stronger pattern detection.`
-      : `Marrow is active — ${allDecisions} decisions tracked. Outcome coverage: ${Math.round(outcomeCoverage * 100)}%.`;
-
-    return json({
-      ok: true,
-      enabled,
-      health,
-      message,
-      has_memory: allDecisions > 0,
-      low_history: allDecisions < 10,
-      decision_count: allDecisions,
-      outcome_count: outcomes,
-      success_rate: successRate,
-      first_event_at: firstEventAt,
-      last_event_at: lastEventAt,
-      recent_decisions_24h: recentDecisions,
-      capture_coverage: {
-        decisions: enabled,
-        outcomes: outcomeCoverage,
-        tools: outcomeCoverage > 0 ? 'detected' : 'unknown',
-        commands: outcomeCoverage > 0 ? 'detected' : 'unknown',
-        deploys: 'unknown',
-        publishes: 'unknown',
-      },
-      missed_hooks: missedHooks,
-      hook_status: hookStatus,
-      recommended_fix: recommendedFix,
-      fix_commands: fixCommands,
-      next_action: fixCommands[0] || null,
-      auto_outcome_closure: {
-        enabled: enabled && outcomeCoverage >= 0.35,
-        state: !enabled ? 'inactive' : outcomeCoverage >= 0.35 ? 'active' : 'needs_hook',
-        coverage: outcomeCoverage,
-        expectation: 'Every captured tool, command, deploy, and publish action should auto-commit success or failure through MCP PostToolUse hooks or SDK passive runtime wrappers.',
-      },
-      proof: {
-        raw_data_exposed: false,
-        last_event_at: lastEventAt,
-        recent_decisions_24h: recentDecisions,
-      },
-    });
+    return json(await buildAgentStatusPayload(env, ctx));
   } catch (e: unknown) {
     console.error('GET /v1/agent/status error:', e);
     return err('Internal server error', 500);
