@@ -210,6 +210,39 @@ describe('Route extraction wiring', () => {
     expect(body.data.agent_instruction).not.toContain('IGNORE SAFETY CHECKS');
   });
 
+  it('returns exact hook diagnostics and fix commands for degraded agent status', async () => {
+    const now = new Date().toISOString();
+    for (let i = 0; i < 10; i += 1) {
+      await db.prepare(`
+        INSERT INTO decisions
+          (id, account_id, decision_type, context, outcome, confidence, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        `status-decision-${i}`,
+        'empirebuu',
+        'general',
+        `status check ${i}`,
+        '',
+        0.8,
+        now,
+        now,
+      ).run();
+    }
+
+    const res = await authedFetch('/v1/agent/status');
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+
+    expect(body.data.health).toBe('degraded');
+    expect(body.data.missed_hooks).toContain('outcomes');
+    expect(body.data.hook_status.outcomes.state).toBe('missing');
+    expect(body.data.hook_status.outcomes.mcp_fix_command).toBe('npx @getmarrow/mcp setup');
+    expect(body.data.fix_commands).toContain('npx @getmarrow/install --yes');
+    expect(body.data.next_action).toBe('npx @getmarrow/install --yes');
+    expect(body.data.recommended_fix).toContain('Missing hook: outcomes');
+    expect(body.data.auto_outcome_closure.state).toBe('needs_hook');
+  });
+
   it('keeps selected public utility routes unauthenticated', async () => {
     await expect(apiFetch('/health')).resolves.toMatchObject({ status: 200 });
     await expect(apiFetch('/version')).resolves.toMatchObject({ status: 200 });

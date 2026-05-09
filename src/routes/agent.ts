@@ -22,8 +22,13 @@ import { safely } from '../utils/safely';
 import { getServices, type Services } from '../lib/services';
 
 const MARROW_API_VERSION = '2026.03.29';
-const MARROW_SDK_LATEST = '3.7.18';
-const MARROW_MCP_LATEST = '3.9.19';
+const MARROW_SDK_LATEST = '3.7.19';
+const MARROW_MCP_LATEST = '3.9.20';
+const MARROW_INSTALL_COMMAND = 'npx @getmarrow/install --yes';
+const MARROW_DOCTOR_COMMAND = 'npx @getmarrow/install doctor';
+const MARROW_MCP_SETUP_COMMAND = 'npx @getmarrow/mcp setup';
+const MARROW_SDK_INSTALL_COMMAND = 'npm install @getmarrow/sdk';
+const MARROW_SDK_RUNTIME_COMMAND = "const marrow = new MarrowClient(process.env.MARROW_API_KEY); const runtime = marrow.createPassiveRuntime(); runtime.install();";
 
 function json<T>(data: T, status = 200, headers?: Record<string, string>): Response {
   return new Response(JSON.stringify({ data }), {
@@ -1182,12 +1187,80 @@ router.get('/v1/agent/status', async (request: IRequest, env: Env) => {
     if (enabled && outcomeCoverage < 0.35) missedHooks.push('outcomes');
     if (enabled && recentDecisions === 0) missedHooks.push('recent_activity');
 
+    const hookStatus = {
+      decisions: {
+        state: enabled ? 'detected' : 'missing',
+        missing: !enabled,
+        fix_command: MARROW_INSTALL_COMMAND,
+        detail: enabled
+          ? 'Marrow is receiving decision events.'
+          : 'No decision events have been logged for this account yet.',
+      },
+      outcomes: {
+        state: !enabled ? 'unknown' : outcomeCoverage >= 0.35 ? 'detected' : 'missing',
+        missing: enabled && outcomeCoverage < 0.35,
+        coverage: outcomeCoverage,
+        fix_command: MARROW_INSTALL_COMMAND,
+        sdk_fix_command: MARROW_SDK_INSTALL_COMMAND,
+        sdk_fix_snippet: MARROW_SDK_RUNTIME_COMMAND,
+        mcp_fix_command: MARROW_MCP_SETUP_COMMAND,
+        detail: !enabled
+          ? 'Outcome coverage is unknown until at least one decision is logged.'
+          : outcomeCoverage < 0.35
+          ? 'Outcome closure is low. Enable PostToolUse hooks or SDK passive runtime wrappers so tool, command, deploy, and publish actions auto-commit success/failure.'
+          : 'Outcomes are being captured for recent passive actions.',
+      },
+      recent_activity: {
+        state: !enabled ? 'unknown' : recentDecisions > 0 ? 'detected' : 'missing',
+        missing: enabled && recentDecisions === 0,
+        fix_command: MARROW_DOCTOR_COMMAND,
+        detail: enabled && recentDecisions === 0
+          ? 'Marrow has history but no events in the last 24 hours from this account.'
+          : 'Recent activity is present or not applicable yet.',
+      },
+      tools: {
+        state: outcomeCoverage > 0 ? 'detected' : 'unknown',
+        missing: false,
+        fix_command: MARROW_MCP_SETUP_COMMAND,
+        detail: 'Tool capture is inferred from outcome-bearing passive events.',
+      },
+      commands: {
+        state: outcomeCoverage > 0 ? 'detected' : 'unknown',
+        missing: false,
+        fix_command: MARROW_SDK_INSTALL_COMMAND,
+        sdk_fix_snippet: MARROW_SDK_RUNTIME_COMMAND,
+        detail: 'Command capture is available through SDK passive runtime command wrappers and MCP PostToolUse hooks.',
+      },
+      deploys: {
+        state: 'unknown',
+        missing: false,
+        fix_command: MARROW_SDK_INSTALL_COMMAND,
+        sdk_fix_snippet: MARROW_SDK_RUNTIME_COMMAND,
+        detail: 'Deploy capture is available through runtime.deploy(), runtime.command(), or MCP PostToolUse hooks.',
+      },
+      publishes: {
+        state: 'unknown',
+        missing: false,
+        fix_command: MARROW_SDK_INSTALL_COMMAND,
+        sdk_fix_snippet: MARROW_SDK_RUNTIME_COMMAND,
+        detail: 'Publish capture is available through runtime.publish(), runtime.command(), or MCP PostToolUse hooks.',
+      },
+    };
+
+    const fixCommands = missedHooks.includes('decisions')
+      ? [MARROW_INSTALL_COMMAND, MARROW_DOCTOR_COMMAND]
+      : missedHooks.includes('outcomes')
+      ? [MARROW_INSTALL_COMMAND, MARROW_MCP_SETUP_COMMAND, MARROW_SDK_INSTALL_COMMAND]
+      : missedHooks.includes('recent_activity')
+      ? [MARROW_DOCTOR_COMMAND]
+      : [];
+
     const recommendedFix = !enabled
-      ? 'Install MCP hooks or SDK passive runtime, then run a Marrow self-test.'
+      ? `Install MCP hooks or SDK passive runtime, then run a Marrow self-test. Run: ${MARROW_INSTALL_COMMAND}`
       : outcomeCoverage < 0.35
-      ? 'Outcome capture is low. Ensure PostToolUse hooks or SDK guarded command/tool wrappers are enabled.'
+      ? `Outcome capture is low. Missing hook: outcomes. Run: ${MARROW_INSTALL_COMMAND}. MCP-only fix: ${MARROW_MCP_SETUP_COMMAND}. SDK fix: install createPassiveRuntime() and wrap command/tool/deploy/publish calls.`
       : recentDecisions === 0
-      ? 'Marrow is configured but has no recent events. Run the installer self-test or verify the active agent has MARROW_API_KEY.'
+      ? `Marrow is configured but has no recent events. Run: ${MARROW_DOCTOR_COMMAND}, then verify the active agent has MARROW_API_KEY.`
       : null;
 
     const health = !enabled || missedHooks.length > 0 || fail > succ * 0.5 ? 'degraded' : 'healthy';
@@ -1219,7 +1292,16 @@ router.get('/v1/agent/status', async (request: IRequest, env: Env) => {
         publishes: 'unknown',
       },
       missed_hooks: missedHooks,
+      hook_status: hookStatus,
       recommended_fix: recommendedFix,
+      fix_commands: fixCommands,
+      next_action: fixCommands[0] || null,
+      auto_outcome_closure: {
+        enabled: enabled && outcomeCoverage >= 0.35,
+        state: !enabled ? 'inactive' : outcomeCoverage >= 0.35 ? 'active' : 'needs_hook',
+        coverage: outcomeCoverage,
+        expectation: 'Every captured tool, command, deploy, and publish action should auto-commit success or failure through MCP PostToolUse hooks or SDK passive runtime wrappers.',
+      },
       proof: {
         raw_data_exposed: false,
         last_event_at: lastEventAt,
