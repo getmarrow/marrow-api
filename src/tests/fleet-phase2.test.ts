@@ -212,6 +212,13 @@ describe('Fleet moat phase 2', () => {
     expect(permissionsBody.data.count).toBe(1);
     expect(permissionsBody.data.permissions[0].permission).toBe('shared');
 
+    const gate = await authedFetch('/v1/workflow/gate', {
+      method: 'POST',
+      headers: { 'X-Marrow-Agent-Id': 'jarvis' },
+      body: JSON.stringify({ action: 'deploy production worker with smoke test proof missing', risk_tolerance: 'medium' }),
+    });
+    expect(gate.status).toBe(200);
+
     const perf = await authedFetch('/v1/analytics/agent-performance?period=7');
     const perfBody = await perf.json() as any;
     expect(perf.status).toBe(200);
@@ -219,6 +226,14 @@ describe('Fleet moat phase 2', () => {
     expect(perfBody.data.agent_reliability_score).toBeGreaterThan(0);
     expect(perfBody.data.avoided_repeated_mistakes).toBeGreaterThanOrEqual(0);
     expect(perfBody.data.prevented_bad_actions).toBeGreaterThan(0);
+    expect(perfBody.data.blocked_risky_actions).toBeGreaterThan(0);
+    expect(perfBody.data.blocked_risky_action_examples[0]).toMatchObject({
+      action_type: 'deploy',
+      risk_level: 'high',
+      decision: 'review_required',
+      proof_safe: true,
+    });
+    expect(JSON.stringify(perfBody.data.blocked_risky_action_examples)).not.toContain('smoke test proof missing');
     expect(perfBody.data.token_time_saved_estimate.estimated_tokens_saved).toBeGreaterThan(0);
     expect(perfBody.data.reliability_trend.direction).toMatch(/improving|declining|flat/);
     expect(perfBody.data.proof_summary.owner_summary).toContain('Reliability');

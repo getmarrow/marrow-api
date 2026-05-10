@@ -9,8 +9,8 @@
  */
 
 const MARROW_API_VERSION = '2026.03.29';
-const MARROW_SDK_LATEST  = '3.7.23';
-const MARROW_MCP_LATEST  = '3.9.23';
+const MARROW_SDK_LATEST  = '3.7.25';
+const MARROW_MCP_LATEST  = '3.9.25';
 
 export function ok<T>(data: T, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify({ data }), {
