@@ -1223,7 +1223,8 @@ function scopedDecisionWhere(ctx: RequestContext): { clause: string; params: str
 
 async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
   const scope = scopedDecisionWhere(ctx);
-  const [row, allRow, firstEventRow, lastEventRow, recentRow] = await Promise.all([
+  const cutoff24h = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const [row, allRow, firstEventRow, lastEventRow, recentRow, recentOutcomeRow] = await Promise.all([
     env.DB.prepare(`
       SELECT COUNT(*) as total,
              SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) as succ,
@@ -1234,7 +1235,12 @@ async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
     env.DB.prepare(`SELECT COUNT(*) as total FROM decisions WHERE account_id = ?${scope.clause}`).bind(ctx.account_id, ...scope.params).first<{ total: number }>(),
     env.DB.prepare(`SELECT created_at FROM decisions WHERE account_id = ?${scope.clause} ORDER BY created_at ASC LIMIT 1`).bind(ctx.account_id, ...scope.params).first<{ created_at: string }>(),
     env.DB.prepare(`SELECT created_at FROM decisions WHERE account_id = ?${scope.clause} ORDER BY created_at DESC LIMIT 1`).bind(ctx.account_id, ...scope.params).first<{ created_at: string }>(),
-    env.DB.prepare(`SELECT COUNT(*) as total FROM decisions WHERE account_id = ? AND created_at >= datetime('now', '-24 hours')${scope.clause}`).bind(ctx.account_id, ...scope.params).first<{ total: number }>(),
+    env.DB.prepare(`SELECT COUNT(*) as total FROM decisions WHERE account_id = ? AND created_at >= ?${scope.clause}`).bind(ctx.account_id, cutoff24h, ...scope.params).first<{ total: number }>(),
+    env.DB.prepare(`
+      SELECT COUNT(*) as total
+      FROM decisions
+      WHERE account_id = ? AND outcome_success IS NOT NULL AND created_at >= ?${scope.clause}
+    `).bind(ctx.account_id, cutoff24h, ...scope.params).first<{ total: number }>(),
   ]);
 
   const allDecisions = allRow?.total || 0;
@@ -1244,12 +1250,15 @@ async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
   const successRate = (succ + fail) > 0 ? succ / (succ + fail) : null;
   const outcomeCoverage = allDecisions > 0 ? outcomes / allDecisions : 0;
   const recentDecisions = recentRow?.total || 0;
+  const recentOutcomeCount = recentOutcomeRow?.total || 0;
+  const recentOutcomeCoverage = recentDecisions > 0 ? recentOutcomeCount / recentDecisions : 0;
+  const outcomeClosureCoverage = recentDecisions > 0 ? recentOutcomeCoverage : outcomeCoverage;
   const firstEventAt = firstEventRow?.created_at || null;
   const lastEventAt = lastEventRow?.created_at || null;
   const enabled = allDecisions > 0;
   const missedHooks: string[] = [];
   if (!enabled) missedHooks.push('decisions');
-  if (enabled && outcomeCoverage < 0.35) missedHooks.push('outcomes');
+  if (enabled && outcomeClosureCoverage < 0.35) missedHooks.push('outcomes');
   if (enabled && recentDecisions === 0) missedHooks.push('recent_activity');
 
   const fixCommands = missedHooks.includes('decisions')
@@ -1261,7 +1270,7 @@ async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
     : [];
   const recommendedFix = !enabled
     ? `Install MCP hooks or SDK passive runtime, then run a Marrow self-test. Run: ${MARROW_INSTALL_COMMAND}`
-    : outcomeCoverage < 0.35
+    : outcomeClosureCoverage < 0.35
     ? `Outcome capture is low. Missing hook: outcomes. Run: ${MARROW_INSTALL_COMMAND}. MCP-only fix: ${MARROW_MCP_SETUP_COMMAND}. SDK fix: install createPassiveRuntime() and wrap command/tool/deploy/publish calls.`
     : recentDecisions === 0
     ? `Marrow is configured but has no recent events. Run: ${MARROW_DOCTOR_COMMAND}, then verify the active agent has MARROW_API_KEY.`
@@ -1277,16 +1286,18 @@ async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
         : 'No decision events have been logged for this account or agent scope yet.',
     },
     outcomes: {
-      state: !enabled ? 'unknown' : outcomeCoverage >= 0.35 ? 'detected' : 'missing',
-      missing: enabled && outcomeCoverage < 0.35,
-      coverage: outcomeCoverage,
+      state: !enabled ? 'unknown' : outcomeClosureCoverage >= 0.35 ? 'detected' : 'missing',
+      missing: enabled && outcomeClosureCoverage < 0.35,
+      coverage: outcomeClosureCoverage,
+      historical_coverage: outcomeCoverage,
+      recent_coverage_24h: recentOutcomeCoverage,
       fix_command: MARROW_INSTALL_COMMAND,
       sdk_fix_command: MARROW_SDK_INSTALL_COMMAND,
       sdk_fix_snippet: MARROW_SDK_RUNTIME_COMMAND,
       mcp_fix_command: MARROW_MCP_SETUP_COMMAND,
       detail: !enabled
         ? 'Outcome coverage is unknown until at least one decision is logged.'
-        : outcomeCoverage < 0.35
+        : outcomeClosureCoverage < 0.35
         ? 'Outcome closure is low. Enable PostToolUse hooks or SDK passive runtime wrappers so tool, command, deploy, and publish actions auto-commit success/failure.'
         : 'Outcomes are being captured for recent passive actions.',
     },
@@ -1345,9 +1356,12 @@ async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
     first_event_at: firstEventAt,
     last_event_at: lastEventAt,
     recent_decisions_24h: recentDecisions,
+    recent_outcome_count_24h: recentOutcomeCount,
+    recent_outcome_coverage_24h: recentOutcomeCoverage,
     capture_coverage: {
       decisions: enabled,
       outcomes: outcomeCoverage,
+      recent_outcomes: recentOutcomeCoverage,
       tools: outcomeCoverage > 0 ? 'detected' : 'unknown',
       commands: outcomeCoverage > 0 ? 'detected' : 'unknown',
       deploys: 'unknown',
@@ -1359,9 +1373,14 @@ async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
     fix_commands: fixCommands,
     next_action: fixCommands[0] || null,
     auto_outcome_closure: {
-      enabled: enabled && outcomeCoverage >= 0.35,
-      state: !enabled ? 'inactive' : outcomeCoverage >= 0.35 ? 'active' : 'needs_hook',
-      coverage: outcomeCoverage,
+      enabled: enabled && outcomeClosureCoverage >= 0.35,
+      required: true,
+      state: !enabled ? 'inactive' : outcomeClosureCoverage >= 0.35 ? 'active' : 'needs_hook',
+      coverage: outcomeClosureCoverage,
+      historical_coverage: outcomeCoverage,
+      recent_coverage_24h: recentOutcomeCoverage,
+      recent_outcomes_24h: recentOutcomeCount,
+      repair_command: MARROW_INSTALL_COMMAND,
       expectation: 'Every captured tool, command, deploy, and publish action should auto-commit success or failure through MCP PostToolUse hooks or SDK passive runtime wrappers.',
     },
     proof: {
@@ -1468,15 +1487,33 @@ router.post('/v1/agent/runtime', async (request: IRequest, env: Env) => {
         side_effects: 'metadata_log_only',
       },
     };
-    const beforeYouAct = lessons.length > 0
-      ? `Before continuing, use prior lesson: ${lessons[0].lesson || lessons[0].action_pattern || lessons[0].id}`
-      : deploymentMemory.length > 0
-      ? `Before continuing, use deployment playbook: ${deploymentMemory[0].release_id || deploymentMemory[0].id}`
+    const topLesson = lessons[0] || null;
+    const topPlaybook = deploymentMemory[0] || null;
+    const beforeYouAct = topLesson
+      ? `Before continuing, use prior lesson: ${topLesson.summary || topLesson.action_pattern || topLesson.id}`
+      : topPlaybook
+      ? `Before continuing, use deployment playbook: ${topPlaybook.release_id || topPlaybook.id}`
       : decisionBrief.next_actions[0] || null;
+    const beforeYouActInjection = {
+      required: Boolean(topLesson || topPlaybook || riskLevel !== 'low' || proofIncomplete),
+      source: topLesson ? 'fleet_lesson' : topPlaybook ? 'deployment_memory' : proofIncomplete ? 'proof_pack' : riskLevel !== 'low' ? 'risk_gate' : 'decision_brief',
+      message: beforeYouAct,
+      must_use_before_action: Boolean(topLesson && topLesson.score >= 0.55) || riskLevel !== 'low' || proofIncomplete,
+      lesson_id: topLesson?.id || null,
+      lesson_score: topLesson?.score ?? null,
+      action_pattern: topLesson?.action_pattern || null,
+      outcome_success: topLesson?.outcome_success ?? null,
+      playbook_id: topPlaybook?.id || null,
+      risk_level: riskLevel,
+    };
     const exactNextAction = (proofIncomplete ? `Collect proof fields: ${proofPack.missing.join(', ')}` : null)
       || status.next_action
       || beforeYouAct
       || 'Proceed, then commit the outcome.';
+
+    if (topLesson) {
+      services.fleetLearning.markLessonReused(ctx.account_id, topLesson.id, bound || undefined).catch(() => {});
+    }
 
     autoLogDecision({
       db: env.DB,
@@ -1501,6 +1538,7 @@ router.post('/v1/agent/runtime', async (request: IRequest, env: Env) => {
       template_suggestion: templateSuggestion,
       proof_pack: proofPack,
       before_you_act: beforeYouAct,
+      before_you_act_injection: beforeYouActInjection,
       exact_next_action: exactNextAction,
       auto_outcome_closure: status.auto_outcome_closure,
     });
