@@ -254,6 +254,91 @@ describe('Route extraction wiring', () => {
     expect(body.data.auto_outcome_closure.state).toBe('needs_hook');
   });
 
+  it('does not degrade outcome coverage from status or runtime guidance calls', async () => {
+    const now = new Date().toISOString();
+    for (let i = 0; i < 20; i += 1) {
+      await db.prepare(`
+        INSERT INTO decisions
+          (id, account_id, decision_type, context, outcome, confidence, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        `guidance-call-${i}`,
+        'empirebuu',
+        i % 2 === 0 ? 'get_agent_status' : 'post_agent_runtime',
+        `guidance call ${i}`,
+        '',
+        0.8,
+        now,
+        now,
+      ).run();
+    }
+    for (let i = 0; i < 4; i += 1) {
+      await db.prepare(`
+        INSERT INTO decisions
+          (id, account_id, decision_type, context, outcome, confidence, outcome_success, outcome_recorded_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        `closed-command-${i}`,
+        'empirebuu',
+        'command',
+        `closed command ${i}`,
+        'completed',
+        0.9,
+        1,
+        now,
+        now,
+        now,
+      ).run();
+    }
+
+    const before = await db.prepare('SELECT COUNT(*) as total FROM decisions WHERE account_id = ?').bind('empirebuu').first<{ total: number }>();
+    const res = await authedFetch('/v1/agent/status');
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    const after = await db.prepare('SELECT COUNT(*) as total FROM decisions WHERE account_id = ?').bind('empirebuu').first<{ total: number }>();
+
+    expect(after?.total).toBe(before?.total);
+    expect(body.data.health).toBe('healthy');
+    expect(body.data.missed_hooks).not.toContain('outcomes');
+    expect(body.data.decision_count).toBe(24);
+    expect(body.data.outcome_eligible_decision_count).toBe(4);
+    expect(body.data.recent_outcome_eligible_decisions_24h).toBe(4);
+    expect(body.data.recent_outcome_coverage_24h).toBe(1);
+    expect(body.data.auto_outcome_closure.state).toBe('active');
+  });
+
+  it('does not report missing outcome hooks before any outcome-eligible action exists', async () => {
+    const now = new Date().toISOString();
+    for (let i = 0; i < 6; i += 1) {
+      await db.prepare(`
+        INSERT INTO decisions
+          (id, account_id, decision_type, context, outcome, confidence, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        `guidance-only-${i}`,
+        'empirebuu',
+        i % 2 === 0 ? 'get_agent_status' : 'post_agent_runtime',
+        `guidance only ${i}`,
+        '',
+        0.8,
+        now,
+        now,
+      ).run();
+    }
+
+    const res = await authedFetch('/v1/agent/status');
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+
+    expect(body.data.health).toBe('healthy');
+    expect(body.data.missed_hooks).not.toContain('outcomes');
+    expect(body.data.outcome_eligible_decision_count).toBe(0);
+    expect(body.data.recent_outcome_eligible_decisions_24h).toBe(0);
+    expect(body.data.hook_status.outcomes.state).toBe('waiting_for_eligible_actions');
+    expect(body.data.hook_status.outcomes.missing).toBe(false);
+    expect(body.data.auto_outcome_closure.state).toBe('waiting_for_eligible_actions');
+  });
+
   it('treats recent automatic outcome closure as active even with older uncovered history', async () => {
     const boundKey = 'mrw_123e4567-e89b-12d3-a456-426614174000_cccccccccccccccccccccccccccccccc';
     const oldTs = new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString();
