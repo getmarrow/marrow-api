@@ -535,38 +535,79 @@ export class FleetLearningService {
   async buildAgentPerformance(accountId: string, options: { periodDays?: number | null; agentId?: string | null } = {}) {
     const days = this.clampInt(options.periodDays, 7, 90);
     const start = new Date(Date.now() - days * 86400000).toISOString();
+    const previousStart = new Date(Date.now() - days * 2 * 86400000).toISOString();
     const agentId = this.sanitizeOptional(options.agentId, 128);
-    const rows = await this.db.prepare(`
+    const [rows, previousRows] = await Promise.all([
+      this.db.prepare(`
       SELECT decision_type, outcome_success, agent_id, session_id, created_at
       FROM decisions
       WHERE account_id = ? AND created_at > ?
       ORDER BY created_at DESC
       LIMIT 500
-    `).bind(accountId, start).all<{ decision_type: string; outcome_success: number | null; agent_id: string | null; session_id: string | null; created_at: string }>();
+      `).bind(accountId, start).all<{ decision_type: string; outcome_success: number | null; agent_id: string | null; session_id: string | null; created_at: string }>(),
+      this.db.prepare(`
+      SELECT decision_type, outcome_success, agent_id, session_id, created_at
+      FROM decisions
+      WHERE account_id = ? AND created_at > ? AND created_at <= ?
+      ORDER BY created_at DESC
+      LIMIT 500
+      `).bind(accountId, previousStart, start).all<{ decision_type: string; outcome_success: number | null; agent_id: string | null; session_id: string | null; created_at: string }>(),
+    ]);
     const decisions = (rows.results || []).filter((row) => !agentId || row.agent_id === agentId || row.session_id === agentId);
+    const previousDecisions = (previousRows.results || []).filter((row) => !agentId || row.agent_id === agentId || row.session_id === agentId);
     const recorded = decisions.filter((row) => row.outcome_success !== null && row.outcome_success !== undefined);
+    const previousRecorded = previousDecisions.filter((row) => row.outcome_success !== null && row.outcome_success !== undefined);
     const successful = recorded.filter((row) => Number(row.outcome_success) === 1).length;
     const failed = recorded.filter((row) => Number(row.outcome_success) === 0).length;
     const successRate = recorded.length > 0 ? successful / recorded.length : 0;
+    const previousSuccessful = previousRecorded.filter((row) => Number(row.outcome_success) === 1).length;
+    const previousSuccessRate = previousRecorded.length > 0 ? previousSuccessful / previousRecorded.length : 0;
     const lessons = await this.listLessons(accountId, { agent_id: agentId, limit: 25 });
-    const reusedWinning = lessons.filter((lesson) => lesson.outcome_success === true && lesson.reuse_count > 0).length;
-    const avoidedMistakes = lessons.filter((lesson) => lesson.outcome_success === false && lesson.reuse_count > 0).length;
+    const reusedThisPeriod = (lesson: FleetLesson) => this.timestampInRange(lesson.last_reused_at, start, null);
+    const reusedPreviousPeriod = (lesson: FleetLesson) => this.timestampInRange(lesson.last_reused_at, previousStart, start);
+    const reusedWinning = lessons.filter((lesson) => lesson.outcome_success === true && lesson.reuse_count > 0 && reusedThisPeriod(lesson)).length;
+    const avoidedMistakes = lessons.filter((lesson) => lesson.outcome_success === false && lesson.reuse_count > 0 && reusedThisPeriod(lesson)).length;
+    const previousReusedWinning = lessons.filter((lesson) => lesson.outcome_success === true && lesson.reuse_count > 0 && reusedPreviousPeriod(lesson)).length;
     const failedPatterns = this.failedPatterns(decisions);
     const reliability = this.round(Math.min(1, (successRate * 0.65) + (Math.min(recorded.length / 20, 1) * 0.2) + (Math.min(reusedWinning / 5, 1) * 0.15)));
+    const previousReliability = this.round(Math.min(1, (previousSuccessRate * 0.65) + (Math.min(previousRecorded.length / 20, 1) * 0.2) + (Math.min(previousReusedWinning / 5, 1) * 0.15)));
+    const preventedBadActions = avoidedMistakes + failedPatterns.reduce((sum, pattern) => sum + Math.min(pattern.failures, 3), 0);
+    const estimatedTokensSaved = (reusedWinning * 1200) + (avoidedMistakes * 1800) + (preventedBadActions * 2400);
+    const estimatedMinutesSaved = (reusedWinning * 8) + (avoidedMistakes * 12) + (preventedBadActions * 18);
 
     return {
       period: { days, start, end: now() },
       scope: { agent_id: agentId },
       avoided_mistakes: avoidedMistakes,
+      avoided_repeated_mistakes: avoidedMistakes,
+      prevented_bad_actions: preventedBadActions,
+      prevented_bad_action_types: failedPatterns.slice(0, 5).map((pattern) => pattern.decision_type),
       reused_winning_decisions: reusedWinning,
       failed_patterns: failedPatterns,
       token_time_saved_estimate: {
         decisions_reused: reusedWinning + avoidedMistakes,
-        estimated_tokens_saved: (reusedWinning + avoidedMistakes) * 1200,
-        estimated_minutes_saved: (reusedWinning + avoidedMistakes) * 8,
+        prevented_bad_actions: preventedBadActions,
+        estimated_tokens_saved: estimatedTokensSaved,
+        estimated_minutes_saved: estimatedMinutesSaved,
+        method: 'Heuristic estimate from reused winning lessons, reused failure lessons, and repeated failed action patterns.',
       },
       agent_reliability_score: reliability,
+      reliability_trend: {
+        current: reliability,
+        previous: previousReliability,
+        delta: this.round(reliability - previousReliability),
+        direction: reliability > previousReliability ? 'improving' : reliability < previousReliability ? 'declining' : 'flat',
+      },
       outcome_coverage: this.round(decisions.length > 0 ? recorded.length / decisions.length : 0),
+      proof_summary: {
+        headline: preventedBadActions > 0
+          ? `Marrow has evidence of ${preventedBadActions} avoided or preventable risky action(s) in this period.`
+          : reusedWinning > 0
+          ? `Marrow reused ${reusedWinning} winning decision(s) in this period.`
+          : 'Marrow is collecting outcome proof; more closed outcomes will strengthen value estimates.',
+        investor_ready: recorded.length >= 10 || preventedBadActions > 0 || reusedWinning > 0,
+        owner_summary: `Reliability ${Math.round(reliability * 100)}%, outcome coverage ${Math.round((decisions.length > 0 ? recorded.length / decisions.length : 0) * 100)}%, estimated ${estimatedMinutesSaved} minutes saved.`,
+      },
       top_reusable_lessons: lessons.slice(0, 5),
       recommended_next_improvements: this.performanceRecommendations({ decisions: decisions.length, recorded: recorded.length, failed, reusedWinning, avoidedMistakes }),
     };
@@ -678,6 +719,14 @@ export class FleetLearningService {
       }))
       .sort((a, b) => b.failures - a.failures)
       .slice(0, 5);
+  }
+
+  private timestampInRange(value: string | null | undefined, start: string, end: string | null): boolean {
+    if (!value) return false;
+    const time = Date.parse(value);
+    const startTime = Date.parse(start);
+    const endTime = end ? Date.parse(end) : Number.POSITIVE_INFINITY;
+    return Number.isFinite(time) && Number.isFinite(startTime) && time >= startTime && time < endTime;
   }
 
   private performanceRecommendations(input: { decisions: number; recorded: number; failed: number; reusedWinning: number; avoidedMistakes: number }): string[] {
