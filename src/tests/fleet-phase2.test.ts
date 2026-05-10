@@ -217,6 +217,11 @@ describe('Fleet moat phase 2', () => {
     expect(perf.status).toBe(200);
     expect(perfBody.data.failed_patterns[0].decision_type).toBe('audit');
     expect(perfBody.data.agent_reliability_score).toBeGreaterThan(0);
+    expect(perfBody.data.avoided_repeated_mistakes).toBeGreaterThanOrEqual(0);
+    expect(perfBody.data.prevented_bad_actions).toBeGreaterThan(0);
+    expect(perfBody.data.token_time_saved_estimate.estimated_tokens_saved).toBeGreaterThan(0);
+    expect(perfBody.data.reliability_trend.direction).toMatch(/improving|declining|flat/);
+    expect(perfBody.data.proof_summary.owner_summary).toContain('Reliability');
   });
 
   it('enforces agent-bound keys and redacts sensitive fleet content', async () => {
