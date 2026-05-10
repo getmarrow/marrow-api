@@ -81,6 +81,16 @@ interface PermissionRow {
   updated_at: string;
 }
 
+interface RiskGateProofRow {
+  action: string;
+  risk_level: string;
+  decision: string;
+  allow: number;
+  agent_id: string | null;
+  session_id: string | null;
+  created_at: string;
+}
+
 export interface FleetLesson {
   id: string;
   source_decision_id: string | null;
@@ -537,7 +547,7 @@ export class FleetLearningService {
     const start = new Date(Date.now() - days * 86400000).toISOString();
     const previousStart = new Date(Date.now() - days * 2 * 86400000).toISOString();
     const agentId = this.sanitizeOptional(options.agentId, 128);
-    const [rows, previousRows] = await Promise.all([
+    const [rows, previousRows, riskRows] = await Promise.all([
       this.db.prepare(`
       SELECT decision_type, outcome_success, agent_id, session_id, created_at
       FROM decisions
@@ -552,6 +562,13 @@ export class FleetLearningService {
       ORDER BY created_at DESC
       LIMIT 500
       `).bind(accountId, previousStart, start).all<{ decision_type: string; outcome_success: number | null; agent_id: string | null; session_id: string | null; created_at: string }>(),
+      this.db.prepare(`
+      SELECT action, risk_level, decision, allow, agent_id, session_id, created_at
+      FROM risk_gate_events
+      WHERE account_id = ? AND created_at > ?
+      ORDER BY created_at DESC
+      LIMIT 200
+      `).bind(accountId, start).all<RiskGateProofRow>(),
     ]);
     const decisions = (rows.results || []).filter((row) => !agentId || row.agent_id === agentId || row.session_id === agentId);
     const previousDecisions = (previousRows.results || []).filter((row) => !agentId || row.agent_id === agentId || row.session_id === agentId);
@@ -569,11 +586,12 @@ export class FleetLearningService {
     const avoidedMistakes = lessons.filter((lesson) => lesson.outcome_success === false && lesson.reuse_count > 0 && reusedThisPeriod(lesson)).length;
     const previousReusedWinning = lessons.filter((lesson) => lesson.outcome_success === true && lesson.reuse_count > 0 && reusedPreviousPeriod(lesson)).length;
     const failedPatterns = this.failedPatterns(decisions);
+    const riskGateProof = this.blockedRiskGateProof((riskRows.results || []).filter((row) => !agentId || row.agent_id === agentId || row.session_id === agentId));
     const reliability = this.round(Math.min(1, (successRate * 0.65) + (Math.min(recorded.length / 20, 1) * 0.2) + (Math.min(reusedWinning / 5, 1) * 0.15)));
     const previousReliability = this.round(Math.min(1, (previousSuccessRate * 0.65) + (Math.min(previousRecorded.length / 20, 1) * 0.2) + (Math.min(previousReusedWinning / 5, 1) * 0.15)));
-    const preventedBadActions = avoidedMistakes + failedPatterns.reduce((sum, pattern) => sum + Math.min(pattern.failures, 3), 0);
-    const estimatedTokensSaved = (reusedWinning * 1200) + (avoidedMistakes * 1800) + (preventedBadActions * 2400);
-    const estimatedMinutesSaved = (reusedWinning * 8) + (avoidedMistakes * 12) + (preventedBadActions * 18);
+    const preventedBadActions = avoidedMistakes + riskGateProof.blocked_count + failedPatterns.reduce((sum, pattern) => sum + Math.min(pattern.failures, 3), 0);
+    const estimatedTokensSaved = (reusedWinning * 1200) + (avoidedMistakes * 1800) + (riskGateProof.blocked_count * 3200) + (preventedBadActions * 2400);
+    const estimatedMinutesSaved = (reusedWinning * 8) + (avoidedMistakes * 12) + (riskGateProof.blocked_count * 24) + (preventedBadActions * 18);
 
     return {
       period: { days, start, end: now() },
@@ -581,7 +599,12 @@ export class FleetLearningService {
       avoided_mistakes: avoidedMistakes,
       avoided_repeated_mistakes: avoidedMistakes,
       prevented_bad_actions: preventedBadActions,
-      prevented_bad_action_types: failedPatterns.slice(0, 5).map((pattern) => pattern.decision_type),
+      prevented_bad_action_types: this.uniqueStrings([
+        ...riskGateProof.action_types,
+        ...failedPatterns.slice(0, 5).map((pattern) => pattern.decision_type),
+      ]).slice(0, 5),
+      blocked_risky_actions: riskGateProof.blocked_count,
+      blocked_risky_action_examples: riskGateProof.examples,
       reused_winning_decisions: reusedWinning,
       failed_patterns: failedPatterns,
       token_time_saved_estimate: {
@@ -589,7 +612,7 @@ export class FleetLearningService {
         prevented_bad_actions: preventedBadActions,
         estimated_tokens_saved: estimatedTokensSaved,
         estimated_minutes_saved: estimatedMinutesSaved,
-        method: 'Heuristic estimate from reused winning lessons, reused failure lessons, and repeated failed action patterns.',
+        method: 'Heuristic estimate from reused winning lessons, reused failure lessons, blocked risk-gate events, and repeated failed action patterns.',
       },
       agent_reliability_score: reliability,
       reliability_trend: {
@@ -600,13 +623,15 @@ export class FleetLearningService {
       },
       outcome_coverage: this.round(decisions.length > 0 ? recorded.length / decisions.length : 0),
       proof_summary: {
-        headline: preventedBadActions > 0
+        headline: riskGateProof.blocked_count > 0
+          ? `Marrow blocked or required review for ${riskGateProof.blocked_count} risky action(s) in this period.`
+          : preventedBadActions > 0
           ? `Marrow has evidence of ${preventedBadActions} avoided or preventable risky action(s) in this period.`
           : reusedWinning > 0
           ? `Marrow reused ${reusedWinning} winning decision(s) in this period.`
           : 'Marrow is collecting outcome proof; more closed outcomes will strengthen value estimates.',
         investor_ready: recorded.length >= 10 || preventedBadActions > 0 || reusedWinning > 0,
-        owner_summary: `Reliability ${Math.round(reliability * 100)}%, outcome coverage ${Math.round((decisions.length > 0 ? recorded.length / decisions.length : 0) * 100)}%, estimated ${estimatedMinutesSaved} minutes saved.`,
+        owner_summary: `Reliability ${Math.round(reliability * 100)}%, outcome coverage ${Math.round((decisions.length > 0 ? recorded.length / decisions.length : 0) * 100)}%, ${riskGateProof.blocked_count} risky action(s) blocked/reviewed, estimated ${estimatedMinutesSaved} minutes saved.`,
       },
       top_reusable_lessons: lessons.slice(0, 5),
       recommended_next_improvements: this.performanceRecommendations({ decisions: decisions.length, recorded: recorded.length, failed, reusedWinning, avoidedMistakes }),
@@ -719,6 +744,40 @@ export class FleetLearningService {
       }))
       .sort((a, b) => b.failures - a.failures)
       .slice(0, 5);
+  }
+
+  private blockedRiskGateProof(rows: RiskGateProofRow[]) {
+    const blocked = rows.filter((row) => {
+      const decision = String(row.decision || '').toLowerCase();
+      return Number(row.allow) === 0 || decision === 'block' || decision === 'review_required';
+    });
+    const examples = blocked.slice(0, 5).map((row) => ({
+      action_type: this.riskActionType(row.action),
+      risk_level: this.safeChoice(row.risk_level, ['low', 'medium', 'high'], 'low'),
+      decision: this.safeChoice(row.decision, ['allow', 'warn', 'review_required', 'block'], 'review_required'),
+      created_at: row.created_at,
+      proof_safe: true,
+    }));
+    return {
+      blocked_count: blocked.length,
+      action_types: this.uniqueStrings(examples.map((example) => example.action_type)),
+      examples,
+    };
+  }
+
+  private riskActionType(action: string | null | undefined): string {
+    const lower = String(action || '').toLowerCase();
+    if (/\bdeploy|worker|production|prod|release\b/.test(lower)) return 'deploy';
+    if (/\bpublish|npm|package\b/.test(lower)) return 'publish';
+    if (/\bmerge|pull request|pr\b/.test(lower)) return 'merge';
+    if (/\bmigration|database|d1|sql\b/.test(lower)) return 'database';
+    if (/\bsecret|token|credential|key|permission|auth\b/.test(lower)) return 'security';
+    if (/\brollback|incident\b/.test(lower)) return 'incident';
+    return 'risky_action';
+  }
+
+  private uniqueStrings(values: string[]): string[] {
+    return Array.from(new Set(values.filter(Boolean)));
   }
 
   private timestampInRange(value: string | null | undefined, start: string, end: string | null): boolean {
