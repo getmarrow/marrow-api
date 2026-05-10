@@ -247,10 +247,54 @@ describe('Route extraction wiring', () => {
     expect(body.data.missed_hooks).toContain('outcomes');
     expect(body.data.hook_status.outcomes.state).toBe('missing');
     expect(body.data.hook_status.outcomes.mcp_fix_command).toBe('npx @getmarrow/mcp setup');
+    expect(body.data.hook_status.outcomes.recent_coverage_24h).toBe(0);
     expect(body.data.fix_commands).toContain('npx @getmarrow/install --yes');
     expect(body.data.next_action).toBe('npx @getmarrow/install --yes');
     expect(body.data.recommended_fix).toContain('Missing hook: outcomes');
     expect(body.data.auto_outcome_closure.state).toBe('needs_hook');
+  });
+
+  it('treats recent automatic outcome closure as active even with older uncovered history', async () => {
+    const boundKey = 'mrw_123e4567-e89b-12d3-a456-426614174000_cccccccccccccccccccccccccccccccc';
+    const oldTs = new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString();
+    const now = new Date().toISOString();
+    await db.prepare(`
+      INSERT INTO api_keys
+        (id, account_id, key_hash, status, created_at, scopes, key_type, agent_ids)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      'key-recent-closure',
+      'empirebuu',
+      await sha256(boundKey),
+      'active',
+      now,
+      JSON.stringify(['decisions:read', 'decisions:write']),
+      'live',
+      JSON.stringify(['recent-closure-agent']),
+    ).run();
+    for (let i = 0; i < 20; i += 1) {
+      await db.prepare(`
+        INSERT INTO decisions
+          (id, account_id, agent_id, decision_type, context, outcome, confidence, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(`old-unclosed-${i}`, 'empirebuu', 'recent-closure-agent', 'general', 'old passive event', '', 0.6, oldTs, oldTs).run();
+    }
+    for (let i = 0; i < 3; i += 1) {
+      await db.prepare(`
+        INSERT INTO decisions
+          (id, account_id, agent_id, decision_type, context, outcome, confidence, outcome_success, outcome_recorded_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(`recent-closed-${i}`, 'empirebuu', 'recent-closure-agent', 'command', 'recent passive event', 'closed automatically', 0.9, 1, now, now, now).run();
+    }
+
+    const res = await authedFetchWithKey('/v1/agent/status', boundKey);
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.data.missed_hooks).not.toContain('outcomes');
+    expect(body.data.hook_status.outcomes.state).toBe('detected');
+    expect(body.data.auto_outcome_closure.state).toBe('active');
+    expect(body.data.auto_outcome_closure.recent_coverage_24h).toBe(1);
+    expect(body.data.auto_outcome_closure.historical_coverage).toBeLessThan(0.35);
   });
 
   it('returns one-call runtime guidance with proof-pack enforcement', async () => {
@@ -294,6 +338,45 @@ describe('Route extraction wiring', () => {
     expect(body.data.proof_pack.missing).toContain('rollback_target');
     expect(body.data.exact_next_action).toContain('Collect proof fields');
     expect(body.data.template_suggestion.matched).toBe(true);
+  });
+
+  it('injects top fleet lessons before action and marks reuse', async () => {
+    const ts = new Date().toISOString();
+    await db.prepare(`
+      INSERT INTO fleet_lessons
+        (id, account_id, lesson_type, title, summary, action_pattern, outcome_success, confidence, score, reuse_count, visibility, tags, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      'lesson-runtime-deploy',
+      'empirebuu',
+      'success',
+      'Use dry-run before deploy',
+      'Dry-run, smoke test, and rollback proof prevented a bad deploy.',
+      'deploy production api',
+      1,
+      0.95,
+      0.9,
+      0,
+      'shared',
+      JSON.stringify(['deploy', 'production']),
+      ts,
+      ts,
+    ).run();
+
+    const res = await authedFetch('/v1/agent/runtime', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'Deploy production API with smoke test',
+        type: 'deploy',
+        surfaces: ['production'],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.data.before_you_act).toContain('Dry-run');
+    expect(body.data.before_you_act_injection.required).toBe(true);
+    expect(body.data.before_you_act_injection.lesson_id).toBe('lesson-runtime-deploy');
+    expect(body.data.before_you_act_injection.must_use_before_action).toBe(true);
   });
 
   it('redacts legacy uuid-format Marrow keys from runtime responses', async () => {
