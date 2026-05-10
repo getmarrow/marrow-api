@@ -584,6 +584,14 @@ function matchesWhere(row: Record<string, unknown>, where: string, params: unkno
 function evalCondition(row: Record<string, unknown>, cond: string, params: unknown[], startIdx: number): boolean {
   const trimCond = cond.trim().replace(/^\(|\)$/g, '');
 
+  // Handle NOT IN clause
+  const notInMatch = trimCond.match(/(\w+(?:\.\w+)?)\s+NOT\s+IN\s*\(([^)]+)\)/i);
+  if (notInMatch) {
+    const col = notInMatch[1].split('.').pop()!;
+    const vals = notInMatch[2].split(',').map(v => v.trim().replace(/'/g, ''));
+    return !vals.includes(String(row[col]));
+  }
+
   // Handle IN clause
   const inMatch = trimCond.match(/(\w+(?:\.\w+)?)\s+IN\s*\(([^)]+)\)/i);
   if (inMatch) {
@@ -611,6 +619,14 @@ function evalCondition(row: Record<string, unknown>, cond: string, params: unkno
     const pattern = String(params[startIdx] || '');
     const regex = new RegExp('^' + pattern.replace(/%/g, '.*').replace(/_/g, '.') + '$', 'i');
     return regex.test(String(row[col] || ''));
+  }
+
+  // Handle NOT LIKE with a literal pattern
+  const notLikeLiteralMatch = trimCond.match(/(\w+(?:\.\w+)?)\s+NOT\s+LIKE\s+'([^']+)'/i);
+  if (notLikeLiteralMatch) {
+    const col = notLikeLiteralMatch[1].split('.').pop()!;
+    const regex = new RegExp('^' + notLikeLiteralMatch[2].replace(/%/g, '.*').replace(/_/g, '.') + '$', 'i');
+    return !regex.test(String(row[col] || ''));
   }
 
   // Handle datetime comparisons  

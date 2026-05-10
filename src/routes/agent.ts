@@ -22,8 +22,8 @@ import { safely } from '../utils/safely';
 import { getServices, type Services } from '../lib/services';
 
 const MARROW_API_VERSION = '2026.03.29';
-const MARROW_SDK_LATEST = '3.7.20';
-const MARROW_MCP_LATEST = '3.9.21';
+const MARROW_SDK_LATEST = '3.7.22';
+const MARROW_MCP_LATEST = '3.9.22';
 const MARROW_INSTALL_COMMAND = 'npx @getmarrow/install --yes';
 const MARROW_DOCTOR_COMMAND = 'npx @getmarrow/install doctor';
 const MARROW_MCP_SETUP_COMMAND = 'npx @getmarrow/mcp setup';
@@ -1221,10 +1221,24 @@ function scopedDecisionWhere(ctx: RequestContext): { clause: string; params: str
   return { clause: ` AND (${parts.join(' OR ')})`, params };
 }
 
+const OUTCOME_ELIGIBLE_DECISION_FILTER = `
+  AND decision_type NOT LIKE 'get_%'
+  AND decision_type != 'post_agent_status'
+  AND decision_type != 'post_agent_runtime'
+  AND decision_type != 'post_agent_commit'
+  AND decision_type != 'post_agent_nudge'
+  AND decision_type != 'post_agent_suggestions'
+  AND decision_type != 'post_agent_session_end'
+  AND decision_type != 'post_analytics_decision-brief'
+  AND decision_type != 'post_workflow_gate'
+  AND decision_type != 'post_workflows_gate'
+  AND decision_type != 'post_templates_detect'
+`;
+
 async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
   const scope = scopedDecisionWhere(ctx);
   const cutoff24h = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-  const [row, allRow, firstEventRow, lastEventRow, recentRow, recentOutcomeRow] = await Promise.all([
+  const [row, allRow, eligibleRow, eligibleOutcomeRow, firstEventRow, lastEventRow, recentRow, recentEligibleRow, recentOutcomeRow, recentEligibleOutcomeRow] = await Promise.all([
     env.DB.prepare(`
       SELECT COUNT(*) as total,
              SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) as succ,
@@ -1233,32 +1247,45 @@ async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
       WHERE account_id = ? AND outcome_success IS NOT NULL${scope.clause}
     `).bind(ctx.account_id, ...scope.params).first<{ total: number; succ: number; fail: number }>(),
     env.DB.prepare(`SELECT COUNT(*) as total FROM decisions WHERE account_id = ?${scope.clause}`).bind(ctx.account_id, ...scope.params).first<{ total: number }>(),
+    env.DB.prepare(`SELECT COUNT(*) as total FROM decisions WHERE account_id = ?${scope.clause}${OUTCOME_ELIGIBLE_DECISION_FILTER}`).bind(ctx.account_id, ...scope.params).first<{ total: number }>(),
+    env.DB.prepare(`SELECT COUNT(*) as total FROM decisions WHERE account_id = ? AND outcome_success IS NOT NULL${scope.clause}${OUTCOME_ELIGIBLE_DECISION_FILTER}`).bind(ctx.account_id, ...scope.params).first<{ total: number }>(),
     env.DB.prepare(`SELECT created_at FROM decisions WHERE account_id = ?${scope.clause} ORDER BY created_at ASC LIMIT 1`).bind(ctx.account_id, ...scope.params).first<{ created_at: string }>(),
     env.DB.prepare(`SELECT created_at FROM decisions WHERE account_id = ?${scope.clause} ORDER BY created_at DESC LIMIT 1`).bind(ctx.account_id, ...scope.params).first<{ created_at: string }>(),
     env.DB.prepare(`SELECT COUNT(*) as total FROM decisions WHERE account_id = ? AND created_at >= ?${scope.clause}`).bind(ctx.account_id, cutoff24h, ...scope.params).first<{ total: number }>(),
+    env.DB.prepare(`SELECT COUNT(*) as total FROM decisions WHERE account_id = ? AND created_at >= ?${scope.clause}${OUTCOME_ELIGIBLE_DECISION_FILTER}`).bind(ctx.account_id, cutoff24h, ...scope.params).first<{ total: number }>(),
     env.DB.prepare(`
       SELECT COUNT(*) as total
       FROM decisions
       WHERE account_id = ? AND outcome_success IS NOT NULL AND created_at >= ?${scope.clause}
     `).bind(ctx.account_id, cutoff24h, ...scope.params).first<{ total: number }>(),
+    env.DB.prepare(`
+      SELECT COUNT(*) as total
+      FROM decisions
+      WHERE account_id = ? AND outcome_success IS NOT NULL AND created_at >= ?${scope.clause}${OUTCOME_ELIGIBLE_DECISION_FILTER}
+    `).bind(ctx.account_id, cutoff24h, ...scope.params).first<{ total: number }>(),
   ]);
 
   const allDecisions = allRow?.total || 0;
+  const outcomeEligibleDecisions = eligibleRow?.total || 0;
   const succ = row?.succ || 0;
   const fail = row?.fail || 0;
   const outcomes = row?.total || 0;
+  const outcomeEligibleOutcomes = eligibleOutcomeRow?.total || 0;
   const successRate = (succ + fail) > 0 ? succ / (succ + fail) : null;
-  const outcomeCoverage = allDecisions > 0 ? outcomes / allDecisions : 0;
+  const outcomeCoverage = outcomeEligibleDecisions > 0 ? outcomeEligibleOutcomes / outcomeEligibleDecisions : 0;
   const recentDecisions = recentRow?.total || 0;
+  const recentOutcomeEligibleDecisions = recentEligibleRow?.total || 0;
   const recentOutcomeCount = recentOutcomeRow?.total || 0;
-  const recentOutcomeCoverage = recentDecisions > 0 ? recentOutcomeCount / recentDecisions : 0;
-  const outcomeClosureCoverage = recentDecisions > 0 ? recentOutcomeCoverage : outcomeCoverage;
+  const recentOutcomeEligibleCount = recentEligibleOutcomeRow?.total || 0;
+  const recentOutcomeCoverage = recentOutcomeEligibleDecisions > 0 ? recentOutcomeEligibleCount / recentOutcomeEligibleDecisions : 0;
+  const outcomeClosureCoverage = recentOutcomeEligibleDecisions > 0 ? recentOutcomeCoverage : outcomeCoverage;
+  const hasOutcomeEligibleActions = outcomeEligibleDecisions > 0;
   const firstEventAt = firstEventRow?.created_at || null;
   const lastEventAt = lastEventRow?.created_at || null;
   const enabled = allDecisions > 0;
   const missedHooks: string[] = [];
   if (!enabled) missedHooks.push('decisions');
-  if (enabled && outcomeClosureCoverage < 0.35) missedHooks.push('outcomes');
+  if (enabled && hasOutcomeEligibleActions && outcomeClosureCoverage < 0.35) missedHooks.push('outcomes');
   if (enabled && recentDecisions === 0) missedHooks.push('recent_activity');
 
   const fixCommands = missedHooks.includes('decisions')
@@ -1270,8 +1297,8 @@ async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
     : [];
   const recommendedFix = !enabled
     ? `Install MCP hooks or SDK passive runtime, then run a Marrow self-test. Run: ${MARROW_INSTALL_COMMAND}`
-    : outcomeClosureCoverage < 0.35
-    ? `Outcome capture is low. Missing hook: outcomes. Run: ${MARROW_INSTALL_COMMAND}. MCP-only fix: ${MARROW_MCP_SETUP_COMMAND}. SDK fix: install createPassiveRuntime() and wrap command/tool/deploy/publish calls.`
+    : hasOutcomeEligibleActions && outcomeClosureCoverage < 0.35
+    ? `Outcome capture is low for outcome-eligible actions. Missing hook: outcomes. Run: ${MARROW_INSTALL_COMMAND}. MCP-only fix: ${MARROW_MCP_SETUP_COMMAND}. SDK fix: install createPassiveRuntime() and wrap command/tool/deploy/publish calls.`
     : recentDecisions === 0
     ? `Marrow is configured but has no recent events. Run: ${MARROW_DOCTOR_COMMAND}, then verify the active agent has MARROW_API_KEY.`
     : null;
@@ -1286,8 +1313,8 @@ async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
         : 'No decision events have been logged for this account or agent scope yet.',
     },
     outcomes: {
-      state: !enabled ? 'unknown' : outcomeClosureCoverage >= 0.35 ? 'detected' : 'missing',
-      missing: enabled && outcomeClosureCoverage < 0.35,
+      state: !enabled ? 'unknown' : !hasOutcomeEligibleActions ? 'waiting_for_eligible_actions' : outcomeClosureCoverage >= 0.35 ? 'detected' : 'missing',
+      missing: enabled && hasOutcomeEligibleActions && outcomeClosureCoverage < 0.35,
       coverage: outcomeClosureCoverage,
       historical_coverage: outcomeCoverage,
       recent_coverage_24h: recentOutcomeCoverage,
@@ -1297,9 +1324,11 @@ async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
       mcp_fix_command: MARROW_MCP_SETUP_COMMAND,
       detail: !enabled
         ? 'Outcome coverage is unknown until at least one decision is logged.'
+        : !hasOutcomeEligibleActions
+        ? 'Marrow has activity, but no outcome-eligible tool, command, deploy, publish, or explicit decision actions have been recorded yet.'
         : outcomeClosureCoverage < 0.35
-        ? 'Outcome closure is low. Enable PostToolUse hooks or SDK passive runtime wrappers so tool, command, deploy, and publish actions auto-commit success/failure.'
-        : 'Outcomes are being captured for recent passive actions.',
+        ? 'Outcome closure is low for actions that require outcomes. Enable PostToolUse hooks or SDK passive runtime wrappers so tool, command, deploy, and publish actions auto-commit success/failure.'
+        : 'Outcomes are being captured for recent outcome-eligible passive actions.',
     },
     recent_activity: {
       state: !enabled ? 'unknown' : recentDecisions > 0 ? 'detected' : 'missing',
@@ -1341,7 +1370,7 @@ async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
     ? 'Marrow is reachable, but no passive decisions have been logged yet.'
     : allDecisions < 10
     ? `Marrow is active — ${allDecisions} decision${allDecisions === 1 ? '' : 's'} logged. Keep going for stronger pattern detection.`
-    : `Marrow is active — ${allDecisions} decisions tracked. Outcome coverage: ${Math.round(outcomeCoverage * 100)}%.`;
+    : `Marrow is active — ${allDecisions} decisions tracked. Outcome-eligible coverage: ${Math.round(outcomeCoverage * 100)}%.`;
 
   return {
     ok: true,
@@ -1351,11 +1380,13 @@ async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
     has_memory: allDecisions > 0,
     low_history: allDecisions < 10,
     decision_count: allDecisions,
+    outcome_eligible_decision_count: outcomeEligibleDecisions,
     outcome_count: outcomes,
     success_rate: successRate,
     first_event_at: firstEventAt,
     last_event_at: lastEventAt,
     recent_decisions_24h: recentDecisions,
+    recent_outcome_eligible_decisions_24h: recentOutcomeEligibleDecisions,
     recent_outcome_count_24h: recentOutcomeCount,
     recent_outcome_coverage_24h: recentOutcomeCoverage,
     capture_coverage: {
@@ -1373,15 +1404,17 @@ async function buildAgentStatusPayload(env: Env, ctx: RequestContext) {
     fix_commands: fixCommands,
     next_action: fixCommands[0] || null,
     auto_outcome_closure: {
-      enabled: enabled && outcomeClosureCoverage >= 0.35,
+      enabled: enabled && hasOutcomeEligibleActions && outcomeClosureCoverage >= 0.35,
       required: true,
-      state: !enabled ? 'inactive' : outcomeClosureCoverage >= 0.35 ? 'active' : 'needs_hook',
+      state: !enabled ? 'inactive' : !hasOutcomeEligibleActions ? 'waiting_for_eligible_actions' : outcomeClosureCoverage >= 0.35 ? 'active' : 'needs_hook',
       coverage: outcomeClosureCoverage,
       historical_coverage: outcomeCoverage,
       recent_coverage_24h: recentOutcomeCoverage,
       recent_outcomes_24h: recentOutcomeCount,
+      outcome_eligible_decisions: outcomeEligibleDecisions,
+      recent_outcome_eligible_decisions_24h: recentOutcomeEligibleDecisions,
       repair_command: MARROW_INSTALL_COMMAND,
-      expectation: 'Every captured tool, command, deploy, and publish action should auto-commit success or failure through MCP PostToolUse hooks or SDK passive runtime wrappers.',
+      expectation: 'Every captured tool, command, deploy, and publish action should auto-commit success or failure through MCP PostToolUse hooks or SDK passive runtime wrappers. Read-only status, runtime guidance, and brief calls are not counted as outcome-eligible actions.',
     },
     proof: {
       raw_data_exposed: false,
@@ -1556,12 +1589,6 @@ router.get('/v1/agent/status', async (request: IRequest, env: Env) => {
 
     const rlAllowed = await checkRateLimit(env.DB, `agent_status:${ctx.account_id}`, 60, 60 * 1000);
     if (!rlAllowed) return err('Rate limited', 429);
-
-    autoLogDecision({
-      db: env.DB, accountId: ctx.account_id, method: request.method,
-      endpoint: '/v1/agent/status', statusCode: 200, tier: ctx.tier,
-      sessionId: request.headers.get('X-Marrow-Session-Id') || request.headers.get('X-Session-Id') || null,
-    }).catch(() => {});
 
     return json(await buildAgentStatusPayload(env, ctx));
   } catch (e: unknown) {
